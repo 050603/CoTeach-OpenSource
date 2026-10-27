@@ -103,7 +103,7 @@ export default function TeachSetupWorkspace({ activityId, offeringId, templateVe
       const response = await fetch(`/api/platform/activities/${activityId}/instance`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ templateVersionId }) });
       const data = await response.json();
       if (!response.ok) throw new Error(data.message ?? "无法创建新场次");
-      window.location.assign(`/teacher/teach/${data.instance.id}/setup`);
+      window.location.assign(new URL(`/teacher/teach/${data.instance.id}/setup`, window.location.origin).href);
     } catch (error) { setStartError(error instanceof Error ? error.message : "无法创建新场次"); }
     finally { setRestarting(false); }
   }

@@ -126,12 +126,13 @@ describe("original classroom setup integration", () => {
   it("creates a separate scheduled run for repeat teaching and leaves the finished run intact", async () => {
     course.status = "finished";
     const assign = vi.fn();
-    vi.stubGlobal("window", new Proxy(window, { get: (target, key) => key === "location" ? { assign } : Reflect.get(target, key, target) }));
+    const origin = window.location.origin;
+    vi.stubGlobal("window", new Proxy(window, { get: (target, key) => key === "location" ? { assign, origin } : Reflect.get(target, key, target) }));
     const fetcher = vi.fn(async () => Response.json({ instance: { id: "run-2", status: "scheduled" } })); vi.stubGlobal("fetch", fetcher);
     render(<TeachSetupWorkspace {...props} />);
     expect(screen.getByLabelText("班级总人数")).toBeDisabled();
     fireEvent.click(screen.getByRole("button", { name: "再次授课" }));
-    await waitFor(() => expect(assign).toHaveBeenCalledWith("/teacher/teach/run-2/setup"));
+    await waitFor(() => expect(assign).toHaveBeenCalledWith(`${origin}/teacher/teach/run-2/setup`));
     expect(fetcher).toHaveBeenCalledWith("/api/platform/activities/activity/instance", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ templateVersionId: "published-version" }) });
     expect(course.status).toBe("finished");
     expect(mocks.start).not.toHaveBeenCalled(); expect(mocks.update).not.toHaveBeenCalled();

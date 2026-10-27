@@ -280,11 +280,11 @@ function redirectAfterUnauthorized(role: "teacher" | "student" | undefined) {
   if (role === "teacher") {
     const redirect = `${window.location.pathname}${window.location.search}`;
     window.location.assign(
-      `/teacher/login?redirect=${encodeURIComponent(redirect)}`,
+      new URL(`/teacher/login?redirect=${encodeURIComponent(redirect)}`, window.location.origin).href,
     );
     return;
   }
-  window.location.assign("/student");
+  window.location.assign(new URL("/student", window.location.origin).href);
 }
 
 function studentClassroomForPath(

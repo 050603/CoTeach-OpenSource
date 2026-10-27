@@ -66,7 +66,7 @@ export default function NotFound() {
             if (typeof window !== "undefined" && window.history.length > 1) {
               window.history.back();
             } else {
-              window.location.href = "/";
+              window.location.href = new URL("/", window.location.origin).href;
             }
           }}
           className="mt-8 inline-flex items-center gap-1.5 text-sm text-[var(--pbl-text-subtle)] transition hover:text-[var(--pbl-text-muted)]"

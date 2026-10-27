@@ -11,15 +11,36 @@ import { transcribeAudio } from '@openmaic/lib/audio/asr-providers';
 import { ASR_PROVIDERS } from '@openmaic/lib/audio/constants';
 import type { ASRProviderId } from '@openmaic/lib/audio/types';
 import { parsePDF } from '@openmaic/lib/pdf/pdf-providers';
-import { PDF_PROVIDERS } from '@openmaic/lib/pdf/constants';
+import { MINERU_CLOUD_DEFAULT_BASE, PDF_PROVIDERS } from '@openmaic/lib/pdf/constants';
 import type { PDFProviderId } from '@openmaic/lib/pdf/types';
 import { getProviderEntry, type ProviderSection } from '@/lib/openmaic-bridge/provider-config-editor';
 import { validateUrlForSSRF } from '@openmaic/lib/server/ssrf-guard';
 import { isLocalOllamaEmbeddingEndpoint } from '@/lib/textbook/embedding';
+import { authenticateRequest, requireSameOrigin } from '@/lib/auth/request-guards';
+import { z } from 'zod';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 export const maxDuration = 60;
+
+const TestSchema = z.object({
+  section: z.enum(['asr', 'pdf', 'image', 'video', 'web-search', 'embedding']),
+  providerId: z.string().trim().min(1).max(80).regex(/^[a-z0-9][a-z0-9_-]*$/i),
+  apiKey: z.string().max(8_192).optional(),
+  baseUrl: z.string().url().max(2_048).optional(),
+  model: z.string().trim().max(200).optional(),
+});
+
+const PROVIDER_REGISTRIES: Partial<Record<ProviderSection, Record<string, { defaultBaseUrl?: string }>>> = {
+  asr: ASR_PROVIDERS, pdf: { 'mineru-cloud': { defaultBaseUrl: MINERU_CLOUD_DEFAULT_BASE } }, image: IMAGE_PROVIDERS,
+  video: VIDEO_PROVIDERS, 'web-search': WEB_SEARCH_PROVIDERS,
+};
+
+function normalizedEndpoint(value: string): string {
+  let endpoint = new URL(value).href;
+  while (endpoint.endsWith('/')) endpoint = endpoint.slice(0, -1);
+  return endpoint;
+}
 
 function classifyFailure(message: string): { status: number; hint: string } {
   const value = message.toLowerCase();
@@ -87,21 +108,30 @@ function createPdfTestDocument(): Buffer {
 }
 
 export async function POST(request: NextRequest) {
+  const csrfError = requireSameOrigin(request);
+  if (csrfError) return csrfError;
+  const auth = await authenticateRequest(request, 'teacher');
+  if ('response' in auth) return auth.response;
   try {
-    const body = await request.json() as {
-      section?: ProviderSection;
-      providerId?: string;
-      apiKey?: string;
-      baseUrl?: string;
-      model?: string;
-    };
-    if (!body.section || !body.providerId) {
-      return apiError('MISSING_REQUIRED_FIELD', 400, 'section and providerId are required');
-    }
+    const parsed = TestSchema.safeParse(await request.json().catch(() => null));
+    if (!parsed.success) return apiError('INVALID_REQUEST', 400, 'Provider test configuration is invalid');
+    const body = parsed.data;
     const saved = await getProviderEntry(body.section, body.providerId);
     const apiKey = body.apiKey?.trim() || saved?.apiKey || '';
     const baseUrl = body.baseUrl?.trim() || saved?.baseUrl;
     const model = body.model?.trim() || saved?.defaultModel || saved?.models?.[0];
+
+    // A retained shared credential belongs to its saved endpoint. Testing a
+    // different endpoint requires an explicitly supplied key or a prior save.
+    if (!body.apiKey?.trim() && saved?.apiKey && body.baseUrl) {
+      const registry = PROVIDER_REGISTRIES[body.section];
+      const defaultBaseUrl = registry && Object.hasOwn(registry, body.providerId)
+        ? registry[body.providerId].defaultBaseUrl : undefined;
+      const savedEndpoint = saved.baseUrl || defaultBaseUrl;
+      if (!savedEndpoint || normalizedEndpoint(body.baseUrl) !== normalizedEndpoint(savedEndpoint)) {
+        return apiError('INVALID_REQUEST', 400, '更改服务地址时，请重新填写密钥或先保存配置后再测试。');
+      }
+    }
 
     const allowedLocalEmbedding = body.section === 'embedding'
       && baseUrl

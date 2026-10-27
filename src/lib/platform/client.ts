@@ -16,7 +16,7 @@ export async function readPlatformResponse(response: Response) {
 export function redirectExpiredTeacherSession(reason: unknown): boolean {
   if (!(reason instanceof PlatformSessionExpiredError)) return false;
   const target = `/teacher/login?reason=session-expired&redirect=${encodeURIComponent(location.pathname)}`;
-  location.assign(target);
+  location.assign(new URL(target, location.origin).href);
   return true;
 }
 
