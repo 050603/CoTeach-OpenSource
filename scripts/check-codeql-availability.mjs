@@ -16,11 +16,26 @@ export async function checkCodeScanningAvailability({ repository, token, apiUrl 
   if (!/^[\w.-]+\/[\w.-]+$/.test(repository ?? '') || !token) {
     throw new Error('GITHUB_REPOSITORY and GITHUB_TOKEN are required for the Code Scanning availability check.');
   }
-  const response = await fetcher(`${apiUrl.replace(/\/$/, '')}/repos/${repository}/code-scanning/analyses?per_page=1`, {
-    headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28' },
+  const apiBase = apiUrl.replace(/\/$/, '');
+  const repositoryUrl = `${apiBase}/repos/${repository}`;
+  const headers = { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28' };
+  const response = await fetcher(`${repositoryUrl}/code-scanning/analyses?per_page=1`, {
+    headers,
     signal: AbortSignal.timeout(15_000),
   });
   const body = await response.json().catch(() => null);
+  // GitHub returns this exact 404 before a repository's first analysis. Public
+  // repositories may run CodeQL, but still verify their identity and visibility
+  // through an authenticated API call; a private or inaccessible repository
+  // must not obtain authorization from this response alone.
+  if (apiBase === 'https://api.github.com' && response.status === 404 && body?.message === 'no analysis found') {
+    const metadataResponse = await fetcher(repositoryUrl, { headers, signal: AbortSignal.timeout(15_000) });
+    const metadata = await metadataResponse.json().catch(() => null);
+    if (metadataResponse.status === 200 && metadata?.private === false && metadata.visibility === 'public'
+      && typeof metadata.full_name === 'string' && metadata.full_name.toLowerCase() === repository.toLowerCase()) {
+      return { enabled: true, reason: 'public-first-analysis' };
+    }
+  }
   return codeScanningDecision(response.status, body);
 }
 

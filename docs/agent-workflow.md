@@ -65,7 +65,7 @@
 
 CI 保留完整检查，不用路径跳过掩盖依赖影响；本地验证按上表缩小范围。修复一个失败后只重跑必要检查。发布前核对实际部署入口、环境与当前提交，完整要求见 [部署说明](../deploy/README.md)。
 
-[CodeQL 工作流](../.github/workflows/codeql.yml)先通过只读 API 确认功能可用性。GitHub 明确返回功能未启用的 `403` 时，摘要标记“不适用”，整个分析 job 跳过，不初始化或运行 CodeQL；不能通过关闭上传绕过私有仓库的许可条件。鉴权失败、普通 `403`、`404` 或网络故障仍使适用性检查失败。功能可用时正常执行分析和 Security 页面上传，另保留已生成的 SARIF artifact（7 天），上传失败也不丢弃该产物。分析或上传失败不被忽略，SARIF 保存成功也不等于没有漏洞。其他 CI、依赖审计与公开内容检查独立运行。此流程不启用付费功能或修改仓库设置；使用条件见 [CodeQL Action 许可说明](https://github.com/github/codeql-action#license)及 [GitHub 功能说明](https://docs.github.com/en/code-security/reference/code-scanning/troubleshoot-analysis-errors/advanced-security-must-be-enabled)。
+[CodeQL 工作流](../.github/workflows/codeql.yml)先通过只读 API 确认功能可用性。GitHub 明确返回功能未启用的 `403` 时，摘要标记“不适用”，整个分析 job 跳过，不初始化或运行 CodeQL；不能通过关闭上传绕过私有仓库的许可条件。GitHub.com 首次分析前的精确 `404`／`no analysis found` 响应，仅在另一项带认证的仓库 API 成功核实仓库身份及公开可见性后才允许启动。私有仓库和其他 GitHub Enterprise 端点不能据此获得授权；鉴权失败、普通 `403`／`404`、元数据异常或网络故障仍使适用性检查失败。功能可用时正常执行分析和 Security 页面上传，另保留已生成的 SARIF artifact（7 天），上传失败也不丢弃该产物。分析或上传失败不被忽略，SARIF 保存成功也不等于没有漏洞。其他 CI、依赖审计与公开内容检查独立运行。此流程不启用付费功能或修改仓库设置；使用条件见 [CodeQL Action 许可说明](https://github.com/github/codeql-action#license)及 [GitHub 功能说明](https://docs.github.com/en/code-security/reference/code-scanning/troubleshoot-analysis-errors/advanced-security-must-be-enabled)。
 
 交付说明实现结果、执行过的检查和仍存在的阻塞。不要用结构校验通过代替真实 CI、页面或生产验证。
 
