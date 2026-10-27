@@ -1,0 +1,50 @@
+'use client';
+
+import { useMemo } from 'react';
+import type { Scene, StageMode } from '@openmaic/lib/types/stage';
+import { SlideEditor as SlideRenderer } from '../slide-renderer/Editor';
+import { QuizView } from '../scene-renderers/quiz-view';
+import { InteractiveRenderer } from '../scene-renderers/interactive-renderer';
+import { PBLRenderer } from '../scene-renderers/pbl-renderer';
+
+interface SceneRendererProps {
+  readonly scene: Scene;
+  readonly mode: StageMode;
+  readonly fitToContainer?: boolean;
+}
+
+/**
+ * Playback scene dispatcher. In Pro (edit) mode, Stage renders EditShell
+ * directly as a top-level takeover — SceneRenderer is only on the playback
+ * path, so it does not branch on `mode === 'edit'`.
+ */
+export function SceneRenderer({ scene, mode, fitToContainer = false }: SceneRendererProps) {
+  const renderer = useMemo(() => {
+    switch (scene.type) {
+      case 'slide':
+        if (scene.content.type !== 'slide') return <div>Invalid slide content</div>;
+        return <SlideRenderer mode={mode} fitToContainer={fitToContainer} />;
+      case 'quiz':
+        if (scene.content.type !== 'quiz') return <div>Invalid quiz content</div>;
+        return <QuizView
+          key={scene.id}
+          questions={scene.content.questions}
+          courseTotalPoints={scene.content.scoring?.courseTotal}
+          quizOutlineId={scene.outlineId}
+          sceneId={scene.id}
+          stagedPlayback={scene.actions?.some((action) => action.type === 'speech'
+            && (action as typeof action & { activityPausePurpose?: string }).activityPausePurpose === 'quiz-submit') ?? false}
+        />;
+      case 'interactive':
+        if (scene.content.type !== 'interactive') return <div>Invalid interactive content</div>;
+        return <InteractiveRenderer content={scene.content} sceneId={scene.id} />;
+      case 'pbl':
+        if (scene.content.type !== 'pbl') return <div>Invalid PBL content</div>;
+        return <PBLRenderer content={scene.content} mode={mode} sceneId={scene.id} />;
+      default:
+        return <div>Unknown scene type</div>;
+    }
+  }, [scene, mode, fitToContainer]);
+
+  return <div className="w-full h-full">{renderer}</div>;
+}

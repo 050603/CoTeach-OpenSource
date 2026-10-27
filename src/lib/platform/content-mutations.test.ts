@@ -1,0 +1,467 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { AuthClaims } from "@/lib/auth/session";
+import { createCoTeachPostTestTemplate } from "./posttest";
+import { createPblTemplateCourse, encodePblTemplate } from "./pbl-template";
+
+const mocks = vi.hoisted(() => {
+  const model = () => ({ findUnique: vi.fn(), findUniqueOrThrow: vi.fn(), findFirst: vi.fn(), findMany: vi.fn(), aggregate: vi.fn(), count: vi.fn(), create: vi.fn(), update: vi.fn(), updateMany: vi.fn(), upsert: vi.fn() });
+  const tx = { $queryRaw: vi.fn(), courseTeacher: model(), courseOffering: model(), chapter: model(), activity: model(), activitySubmission: model(), resource: model(), classroomTemplate: model(), classroomTemplateVersion: model(), classroomInstance: model(), activityProgress: model(), courseInvitation: model(), generationJob: model() };
+  return { tx, transaction: vi.fn(), teacher: vi.fn(), student: vi.fn(), activity: vi.fn(), enrollment: vi.fn(), offerings: vi.fn(), experiments: vi.fn(), assignments: vi.fn(), participations: vi.fn(), events: vi.fn(), ensureAssignment: vi.fn() };
+});
+vi.mock("@/lib/db/client", () => ({ prisma: { classroomParticipation: { findMany: mocks.participations }, activity: { findUnique: mocks.activity }, enrollment: { findUnique: mocks.enrollment }, courseOffering: { findMany: mocks.offerings }, classroomTemplate: mocks.tx.classroomTemplate, generationJob: mocks.tx.generationJob, experimentAssessmentSubmission: { findMany: mocks.experiments }, experimentAssessmentAssignment: { findMany: mocks.assignments } } }));
+vi.mock("@/lib/db/transaction-retry", () => ({ runMutationTransaction: mocks.transaction }));
+vi.mock("./learning-events", () => ({ appendValidatedLearningEvents: mocks.events }));
+vi.mock("./experiment-service", () => ({ ensureExperimentAssignment: mocks.ensureAssignment }));
+vi.mock("./access", () => ({ requireTeacherUser: mocks.teacher, requireStudentUser: mocks.student, normalizeUsername: (value: string) => value }));
+
+import { createActivity, createChapter, createClassroomInstance, createTemplateVersion, deleteArchivedPrivateTemplate, getStudentActivity, listPrivateTemplates, listTeacherOfferings, resetOfferingInvitation, restorePrivateTemplate, updateActivity, updateChapter, updateOffering } from "./repository";
+const teacherClaims = { sub: "teacher", role: "teacher" } as AuthClaims;
+const studentClaims = { sub: "student", role: "student" } as AuthClaims;
+const release = { isOpen: true, opensAt: null, archivedAt: null };
+
+beforeEach(() => {
+  vi.resetAllMocks();
+  mocks.experiments.mockResolvedValue([]);
+  mocks.assignments.mockResolvedValue([]);
+  mocks.participations.mockResolvedValue([]);
+  mocks.transaction.mockImplementation((operation) => operation(mocks.tx));
+  mocks.teacher.mockResolvedValue({ id: "teacher" });
+  mocks.student.mockResolvedValue({ id: "student" });
+  mocks.tx.courseTeacher.findFirst.mockResolvedValue({ userId: "teacher" });
+});
+
+function expectLockedBefore(read: ReturnType<typeof vi.fn>, table: string) {
+  expect(mocks.tx.$queryRaw.mock.calls[0][0].join("")).toContain(`FROM "${table}"`);
+  expect(mocks.tx.$queryRaw.mock.calls[0][0].join("")).toContain("FOR UPDATE");
+  expect(mocks.tx.$queryRaw.mock.invocationCallOrder[0]).toBeLessThan(read.mock.invocationCallOrder[0]);
+}
+
+describe("serialized content changes", () => {
+  it("creates standalone posttests with the complete template and rejects empty configurations", async () => {
+    mocks.tx.chapter.findFirst.mockResolvedValue({ id: "chapter" });
+    mocks.tx.activity.aggregate.mockResolvedValue({ _max: { position: null } });
+    mocks.tx.activity.create.mockResolvedValue({ id: "activity" });
+    await expect(createActivity(teacherClaims, "offering", "chapter", { type: "PostTest", title: "后测" })).rejects.toMatchObject({ code: "INVALID_ACTIVITY_CONFIG" });
+    await createActivity(teacherClaims, "offering", "chapter", { type: "PostTest", title: "后测", config: createCoTeachPostTestTemplate() });
+    expect(mocks.tx.activity.create).toHaveBeenCalledWith({ data: expect.objectContaining({ type: "POSTTEST", config: expect.objectContaining({ questions: expect.arrayContaining([expect.objectContaining({ id: "K01" }), expect.objectContaining({ id: "S10" })]) }) }) });
+    expect(mocks.tx.classroomInstance.create).not.toHaveBeenCalled();
+  });
+
+  it("locks submitted posttest questions while allowing the teacher to edit instructions", async () => {
+    const config = createCoTeachPostTestTemplate();
+    mocks.tx.activity.findUnique.mockResolvedValue({ id: "activity", chapterId: "chapter", type: "POSTTEST", version: 2, config, chapter: { offeringId: "offering", isOpen: true } });
+    mocks.tx.activitySubmission.count.mockResolvedValue(1);
+    mocks.tx.activityProgress.findFirst.mockResolvedValue(null);
+    await expect(updateActivity(teacherClaims, "activity", { config: { ...config, questions: config.questions.slice(1) } })).rejects.toMatchObject({ code: "POSTTEST_CONFIG_LOCKED" });
+    await updateActivity(teacherClaims, "activity", { title: "新的后测标题", config: { ...config, content: "新的说明" } });
+    expect(mocks.tx.activity.update).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ title: "新的后测标题", config: expect.objectContaining({ content: "新的说明" }) }) }));
+  });
+
+  it("allocates chapter position after locking its offering", async () => {
+    mocks.tx.chapter.aggregate.mockResolvedValue({ _max: { position: 7 } });
+    await createChapter(teacherClaims, "offering", { title: "Chapter" });
+    expectLockedBefore(mocks.tx.chapter.aggregate, "CourseOffering");
+    expect(mocks.tx.chapter.create).toHaveBeenCalledWith({ data: expect.objectContaining({ position: 8 }) });
+  });
+
+  it("creates classroom activity and its first run in the same transaction", async () => {
+    mocks.tx.chapter.findFirst.mockResolvedValue({ id: "chapter" });
+    mocks.tx.activity.aggregate.mockResolvedValue({ _max: { position: null } });
+    mocks.tx.classroomTemplateVersion.findFirst.mockResolvedValue({ id: "version" });
+    mocks.tx.activity.create.mockResolvedValue({ id: "activity" });
+    await createActivity(teacherClaims, "offering", "chapter", { type: "Classroom", title: "Class", templateVersionId: "version" });
+    expectLockedBefore(mocks.tx.activity.aggregate, "Chapter");
+    expect(mocks.tx.classroomTemplateVersion.findFirst).toHaveBeenCalledWith({ where: { id: "version", status: { in: ["PUBLISHED", "published"] }, template: { ownerId: "teacher", status: { in: ["ACTIVE", "active"] } } } });
+    expect(mocks.tx.classroomInstance.create).toHaveBeenCalledWith({ data: { activityId: "activity", templateVersionId: "version", runNo: 1, status: "SCHEDULED", runtimeConfig: { evaluationContractVersion: 2, posttestAccess: { status: "closed", version: 0 }, documentPasteMonitoringEnabled: false } } });
+    expect(mocks.transaction).toHaveBeenCalledOnce();
+  });
+
+  it.each(["create-activity", "replace-version", "new-run"])("copies the selected published monitoring default through %s", async (entry) => {
+    const course = createPblTemplateCourse("template");
+    course.pblConfig!.documentPasteMonitoringEnabled = true;
+    const version = { id: "version", status: "PUBLISHED", snapshot: encodePblTemplate(course), template: { ownerId: "teacher", status: "ACTIVE" } };
+    mocks.tx.chapter.findFirst.mockResolvedValue({ id: "chapter" });
+    mocks.tx.activity.aggregate.mockResolvedValue({ _max: { position: null } });
+    mocks.tx.activity.create.mockResolvedValue({ id: "activity" });
+    mocks.tx.activity.findUnique.mockResolvedValue({ id: "activity", chapterId: "chapter", type: "CLASSROOM", version: 1, chapter: { offeringId: "offering" } });
+    mocks.tx.classroomTemplateVersion.findFirst.mockResolvedValue(version);
+    mocks.tx.classroomTemplateVersion.findUnique.mockResolvedValue(version);
+    mocks.tx.classroomInstance.findFirst.mockResolvedValue(null);
+    mocks.tx.classroomInstance.aggregate.mockResolvedValue({ _max: { runNo: 1 } });
+    if (entry === "create-activity") await createActivity(teacherClaims, "offering", "chapter", { type: "Classroom", title: "Class", templateVersionId: "version" });
+    else if (entry === "replace-version") await updateActivity(teacherClaims, "activity", { templateVersionId: "version" });
+    else await createClassroomInstance(teacherClaims, "activity", "version");
+    expect(mocks.tx.classroomInstance.create).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({
+      templateVersionId: "version", runtimeConfig: expect.objectContaining({ documentPasteMonitoringEnabled: true }),
+    }) }));
+  });
+
+  it("rejects a classroom activity without an exact course version", async () => {
+    mocks.tx.chapter.findFirst.mockResolvedValue({ id: "chapter" });
+
+    await expect(createActivity(teacherClaims, "offering", "chapter", { type: "Classroom", title: "Class" })).rejects.toMatchObject({ code: "TEMPLATE_REQUIRED" });
+
+    expect(mocks.tx.activity.create).not.toHaveBeenCalled();
+    expect(mocks.tx.classroomInstance.create).not.toHaveBeenCalled();
+  });
+
+  it("binds an uploaded PDF to the reference activity", async () => {
+    mocks.tx.chapter.findFirst.mockResolvedValue({ id: "chapter" });
+    mocks.tx.activity.aggregate.mockResolvedValue({ _max: { position: null } });
+    mocks.tx.activity.create.mockResolvedValue({ id: "activity" });
+    mocks.tx.resource.findFirst.mockResolvedValue({ id: "file", fileAsset: { deletedAt: null, mimeType: "application/pdf" } });
+    await createActivity(teacherClaims, "offering", "chapter", { type: "Resource", title: "Reference", config: { schemaVersion: 1, resourceKind: "file", fileId: "file", url: "/api/uploads/file" } });
+    expect(mocks.tx.resource.findFirst).toHaveBeenCalledWith(expect.objectContaining({ where: expect.objectContaining({ id: "file", offeringId: "offering", createdById: "teacher" }) }));
+    expect(mocks.tx.resource.update).toHaveBeenCalledWith({ where: { id: "file" }, data: { activityId: "activity" } });
+  });
+
+  it("rejects stale offering and chapter versions inside the locked transaction", async () => {
+    mocks.tx.courseOffering.findUnique.mockResolvedValue({ version: 2 });
+    await expect(updateOffering(teacherClaims, "offering", { name: "Changed", version: 1 })).rejects.toMatchObject({ code: "VERSION_CONFLICT" });
+    expectLockedBefore(mocks.tx.courseOffering.findUnique, "CourseOffering");
+    expect(mocks.tx.courseOffering.update).not.toHaveBeenCalled();
+    mocks.tx.$queryRaw.mockClear();
+    mocks.tx.chapter.findUnique.mockResolvedValue({ version: 2, offeringId: "offering" });
+    await expect(updateChapter(teacherClaims, "chapter", { title: "Changed", version: 1 })).rejects.toMatchObject({ code: "VERSION_CONFLICT" });
+    expectLockedBefore(mocks.tx.chapter.findUnique, "Chapter");
+    expect(mocks.tx.chapter.update).not.toHaveBeenCalled();
+  });
+
+  it("rejects stale activity versions without creating replacement runs", async () => {
+    mocks.tx.activity.findUnique.mockResolvedValue({ chapterId: "chapter", version: 2, chapter: { offeringId: "offering" } });
+    await expect(updateActivity(teacherClaims, "activity", { version: 1, templateVersionId: "version" })).rejects.toMatchObject({ code: "VERSION_CONFLICT" });
+    expect(mocks.tx.$queryRaw.mock.calls[0][0].join("")).toContain('FROM "Chapter"');
+    expect(mocks.tx.$queryRaw.mock.calls[1][0].join("")).toContain('FROM "Activity"');
+    expect(mocks.tx.activity.update).not.toHaveBeenCalled();
+    expect(mocks.tx.classroomInstance.create).not.toHaveBeenCalled();
+  });
+
+  it("locks every active activity when its chapter is locked", async () => {
+    mocks.tx.chapter.findUnique.mockResolvedValue({ id: "chapter", offeringId: "offering", version: 2 });
+    mocks.tx.chapter.update.mockResolvedValue({ id: "chapter", isOpen: false, version: 3 });
+
+    await updateChapter(teacherClaims, "chapter", { isOpen: false, version: 2 });
+
+    expect(mocks.tx.activity.updateMany).toHaveBeenCalledWith({
+      where: { chapterId: "chapter", archivedAt: null, isOpen: true },
+      data: { isOpen: false, version: { increment: 1 } },
+    });
+    expect(mocks.tx.chapter.update).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: "chapter" },
+      data: expect.objectContaining({ isOpen: false }),
+    }));
+  });
+
+  it("unlocks the parent chapter when an activity is unlocked", async () => {
+    mocks.tx.activity.findUnique.mockResolvedValue({
+      id: "activity",
+      chapterId: "chapter",
+      type: "RESOURCE",
+      version: 4,
+      chapter: { id: "chapter", offeringId: "offering", isOpen: false },
+    });
+    mocks.tx.activity.update.mockResolvedValue({ id: "activity", isOpen: true, version: 5 });
+
+    await updateActivity(teacherClaims, "activity", { isOpen: true, version: 4 });
+
+    expect(mocks.tx.chapter.update).toHaveBeenCalledWith({
+      where: { id: "chapter" },
+      data: { isOpen: true, version: { increment: 1 } },
+    });
+    expect(mocks.tx.activity.update).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: "activity" },
+      data: expect.objectContaining({ isOpen: true }),
+    }));
+  });
+
+  it("keeps an answered survey's questions fixed while allowing metadata changes", async () => {
+    const config = { schemaVersion: 1, content: "", questions: [{ id: "q1", title: "第一题", type: "single-choice", required: true, options: [{ id: "a", label: "甲" }, { id: "b", label: "乙" }] }] };
+    mocks.tx.activity.findUnique.mockResolvedValue({ id: "activity", chapterId: "chapter", type: "FORM", version: 2, config, chapter: { offeringId: "offering", isOpen: true } });
+    mocks.tx.activitySubmission.count.mockResolvedValue(1);
+    mocks.tx.activityProgress.findFirst.mockResolvedValue(null);
+    mocks.tx.activity.update.mockResolvedValue({ id: "activity", version: 3 });
+
+    await expect(updateActivity(teacherClaims, "activity", { version: 2, config: { ...config, questions: [{ ...config.questions[0], options: [{ id: "a", label: "新甲" }, { id: "b", label: "乙" }] }] } })).rejects.toMatchObject({ code: "SURVEY_CONFIG_LOCKED" });
+    expect(mocks.tx.activity.update).not.toHaveBeenCalled();
+    expect(mocks.tx.activitySubmission.count).toHaveBeenCalledWith({ where: { activityId: "activity" } });
+
+    await updateActivity(teacherClaims, "activity", { version: 2, title: "新标题", description: "新说明", isOpen: false, config });
+    expect(mocks.tx.activity.update).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ title: "新标题", description: "新说明", isOpen: false }) }));
+    expect(mocks.tx.activitySubmission.count).toHaveBeenCalledTimes(1);
+
+    await updateActivity(teacherClaims, "activity", { version: 2, config: { ...config, content: "修改后的问卷说明" } });
+    expect(mocks.tx.activity.update).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ config: expect.objectContaining({ content: "修改后的问卷说明" }) }) }));
+    expect(mocks.tx.activitySubmission.count).toHaveBeenCalledTimes(1);
+  });
+
+  it("protects legacy survey answers even without immutable submission rows", async () => {
+    const config = { schemaVersion: 1, content: "", questions: [{ id: "q1", title: "第一题", type: "short-text", options: [] }] };
+    mocks.tx.activity.findUnique.mockResolvedValue({ id: "activity", chapterId: "chapter", type: "FORM", version: 1, config, chapter: { offeringId: "offering", isOpen: true } });
+    mocks.tx.activitySubmission.count.mockResolvedValue(0);
+    mocks.tx.activityProgress.findFirst.mockResolvedValue({ id: "legacy-answer" });
+    await expect(updateActivity(teacherClaims, "activity", { version: 1, config: { ...config, questions: [{ ...config.questions[0], title: "改后题干" }] } })).rejects.toMatchObject({ code: "SURVEY_CONFIG_LOCKED" });
+    expect(mocks.tx.activity.update).not.toHaveBeenCalled();
+  });
+
+  it("allocates template revisions and classroom run numbers under their parent locks", async () => {
+    mocks.tx.classroomTemplate.findFirst.mockResolvedValue({ versions: [{ version: 5 }] });
+    mocks.tx.classroomTemplateVersion.create.mockResolvedValue({ id: "version-6", version: 6 });
+    await createTemplateVersion(teacherClaims, "template", { snapshot: {} });
+    expectLockedBefore(mocks.tx.classroomTemplate.findFirst, "ClassroomTemplate");
+    expect(mocks.tx.classroomTemplateVersion.create).toHaveBeenCalledWith({ data: expect.objectContaining({ version: 6 }) });
+    expect(mocks.tx.classroomTemplate.update).toHaveBeenCalledWith({ where: { id: "template" }, data: { updatedAt: expect.any(Date) } });
+    mocks.tx.$queryRaw.mockClear();
+    mocks.tx.activity.findUnique.mockResolvedValue({ id: "activity", chapter: { offeringId: "offering" } });
+    mocks.tx.classroomTemplateVersion.findUnique.mockResolvedValue({ status: "PUBLISHED", template: { ownerId: "teacher", status: "ACTIVE" } });
+    mocks.tx.classroomInstance.aggregate.mockResolvedValue({ _max: { runNo: 4 } });
+    await createClassroomInstance(teacherClaims, "activity", "version");
+    expectLockedBefore(mocks.tx.classroomInstance.aggregate, "Activity");
+    expect(mocks.tx.classroomInstance.create).toHaveBeenCalledWith({ data: expect.objectContaining({ runNo: 5, runtimeConfig: { evaluationContractVersion: 2, posttestAccess: { status: "closed", version: 0 }, documentPasteMonitoringEnabled: false } }), include: { templateVersion: true } });
+  });
+
+  it.each(["SCHEDULED", "TEACHING"])("reuses an existing %s run on repeated entry", async (status) => {
+    mocks.tx.activity.findUnique.mockResolvedValue({ id: "activity", chapter: { offeringId: "offering" } });
+    mocks.tx.classroomTemplateVersion.findUnique.mockResolvedValue({ status: "PUBLISHED", template: { ownerId: "teacher", status: "ACTIVE" } });
+    const active = { id: "existing", status, runNo: 2, runtimeConfig: { documentPasteMonitoringEnabled: false } };
+    mocks.tx.classroomInstance.findFirst.mockResolvedValue(active);
+    await expect(createClassroomInstance(teacherClaims, "activity", "version")).resolves.toEqual(active);
+    expectLockedBefore(mocks.tx.classroomInstance.findFirst, "Activity");
+    expect(mocks.tx.classroomInstance.create).not.toHaveBeenCalled();
+    expect(mocks.tx.classroomInstance.update).not.toHaveBeenCalled();
+  });
+
+  it("never reuses an active run from a different selected course version", async () => {
+    mocks.tx.activity.findUnique.mockResolvedValue({ id: "activity", chapter: { offeringId: "offering" } });
+    mocks.tx.classroomTemplateVersion.findUnique.mockResolvedValue({ status: "PUBLISHED", snapshot: {}, template: { ownerId: "teacher", status: "ACTIVE" } });
+    mocks.tx.classroomInstance.findFirst.mockResolvedValue(null);
+    mocks.tx.classroomInstance.aggregate.mockResolvedValue({ _max: { runNo: 3 } });
+    mocks.tx.classroomInstance.create.mockResolvedValue({ id: "new-run", templateVersionId: "selected-version" });
+
+    await createClassroomInstance(teacherClaims, "activity", "selected-version");
+
+    expect(mocks.tx.classroomInstance.findFirst).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ activityId: "activity", templateVersionId: "selected-version" }),
+    }));
+    expect(mocks.tx.classroomInstance.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ templateVersionId: "selected-version", runNo: 4 }),
+    }));
+  });
+
+  it("rejects versions whose course has already been deleted", async () => {
+    mocks.tx.activity.findUnique.mockResolvedValue({ id: "activity", chapter: { offeringId: "offering" } });
+    mocks.tx.classroomTemplateVersion.findUnique.mockResolvedValue({ status: "PUBLISHED", template: { ownerId: "teacher", status: "DELETED" } });
+
+    await expect(createClassroomInstance(teacherClaims, "activity", "deleted-version")).rejects.toMatchObject({ code: "NOT_FOUND" });
+
+    expect(mocks.tx.classroomInstance.findFirst).not.toHaveBeenCalled();
+    expect(mocks.tx.classroomInstance.create).not.toHaveBeenCalled();
+  });
+
+  it("serializes invitation replacement before deactivating previous invitations", async () => {
+    await resetOfferingInvitation(teacherClaims, "offering", {});
+    expectLockedBefore(mocks.tx.courseInvitation.updateMany, "CourseOffering");
+    expect(mocks.tx.courseInvitation.create).toHaveBeenCalledWith({ data: expect.objectContaining({ offeringId: "offering", status: "ACTIVE" }) });
+  });
+});
+
+describe("course library lifecycle", () => {
+  it("excludes deleted templates from the teacher library", async () => {
+    mocks.tx.classroomTemplate.findMany.mockResolvedValue([]);
+    await listPrivateTemplates(teacherClaims);
+    expect(mocks.tx.classroomTemplate.findMany).toHaveBeenCalledWith(expect.objectContaining({ where: { ownerId: "teacher", status: { notIn: ["DELETED", "deleted"] } } }));
+  });
+
+  it("includes the latest active generation status for each course", async () => {
+    mocks.tx.classroomTemplate.findMany.mockResolvedValue([{ id: "template", versions: [] }]);
+    mocks.tx.generationJob.findMany.mockResolvedValue([
+      { targetId: "template", status: "RUNNING" },
+      { targetId: "template", status: "QUEUED" },
+    ]);
+
+    await expect(listPrivateTemplates(teacherClaims)).resolves.toEqual([
+      expect.objectContaining({ id: "template", generationStatus: "running" }),
+    ]);
+    expect(mocks.tx.generationJob.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ targetId: { in: ["template"] } }),
+      orderBy: { updatedAt: "desc" },
+    }));
+  });
+
+  it("restores archived templates and logically deletes only archived templates", async () => {
+    mocks.tx.classroomTemplate.findFirst.mockResolvedValueOnce({ id: "template", status: "ARCHIVED" });
+    await restorePrivateTemplate(teacherClaims, "template");
+    expect(mocks.tx.classroomTemplate.update).toHaveBeenLastCalledWith({ where: { id: "template" }, data: { status: "ACTIVE" } });
+
+    mocks.tx.classroomTemplate.findFirst.mockResolvedValueOnce({ id: "template", status: "ARCHIVED" });
+    await deleteArchivedPrivateTemplate(teacherClaims, "template");
+    expect(mocks.tx.classroomTemplate.update).toHaveBeenLastCalledWith({ where: { id: "template" }, data: { status: "DELETED" } });
+
+    mocks.tx.classroomTemplate.findFirst.mockResolvedValueOnce({ id: "active", status: "ACTIVE" });
+    await expect(deleteArchivedPrivateTemplate(teacherClaims, "active")).rejects.toMatchObject({ code: "TEMPLATE_NOT_ARCHIVED" });
+  });
+});
+
+describe("activity access concurrent with completion", () => {
+  it("preserves activity timestamps and events when reviewing a finished classroom in an open course", async () => {
+    const savedProgress = { status: "COMPLETED", startedAt: new Date("2026-09-01T00:00:00Z"), completedAt: new Date("2026-09-01T01:00:00Z"), lastAccessedAt: new Date("2026-09-01T00:30:00Z") };
+    mocks.activity.mockResolvedValue({
+      id: "activity", type: "CLASSROOM", ...release, chapterId: "chapter",
+      chapter: { id: "chapter", ...release, offering: { id: "offering", status: "OPEN" } },
+      classroomInstances: [{ id: "instance", status: "FINISHED", templateVersion: { snapshot: { schemaVersion: 2, kind: "pbl-course" } } }],
+    });
+    mocks.enrollment.mockResolvedValue({ id: "enrollment", status: "ACTIVE", activityProgress: [savedProgress] });
+    const result = await getStudentActivity(studentClaims, "activity");
+    expect(result.progress).toMatchObject({ ...savedProgress, status: "completed" });
+    expect(result.instance?.canWrite).toBe(false);
+    expect(mocks.transaction).not.toHaveBeenCalled();
+    expect(mocks.events).not.toHaveBeenCalled();
+    expect(mocks.ensureAssignment).not.toHaveBeenCalled();
+  });
+  it("refreshes state without touching progress or appending another visit, while retaining experiment initialization", async () => {
+    mocks.activity.mockResolvedValue({ id: "activity", type: "CLASSROOM", config: { schemaVersion: 1, experiment: { enabled: true, pretest: [{ id: "q", type: "short-answer", prompt: "想法" }], posttest: [{ id: "after", type: "short-answer", prompt: "收获" }] } }, ...release,
+      chapterId: "chapter", chapter: { id: "chapter", ...release, offering: { id: "offering", status: "OPEN" } },
+      classroomInstances: [{ id: "run", runNo: 2, status: "TEACHING", templateVersion: { snapshot: {} } }] });
+    mocks.enrollment.mockResolvedValue({ id: "enrollment", status: "ACTIVE", activityProgress: [{ status: "COMPLETED", progressData: { answer: "saved" } }] });
+    const result = await getStudentActivity(studentClaims, "activity", { refresh: true });
+    expect(result.instance).toMatchObject({ id: "run", status: "teaching", canWrite: true });
+    expect(result.instances[0].runNo).toBe(2);
+    expect(result.progress).toMatchObject({ status: "completed", progressData: { answer: "saved" } });
+    expect(mocks.transaction).not.toHaveBeenCalled();
+    expect(mocks.tx.activityProgress.upsert).not.toHaveBeenCalled();
+    expect(mocks.events).not.toHaveBeenCalled();
+    expect(mocks.ensureAssignment).toHaveBeenCalledWith("run", "enrollment");
+  });
+
+  it("still checks enrollment during a background refresh", async () => {
+    mocks.activity.mockResolvedValue({ id: "activity", ...release, chapter: { offering: { id: "offering", status: "OPEN" } } });
+    mocks.enrollment.mockResolvedValue(null);
+    await expect(getStudentActivity(studentClaims, "activity", { refresh: true })).rejects.toMatchObject({ code: "ENROLLMENT_REQUIRED" });
+    expect(mocks.events).not.toHaveBeenCalled();
+  });
+
+  it("preserves the committed completion even when the initial enrollment snapshot was not started", async () => {
+    mocks.activity.mockResolvedValue({ id: "activity", type: "ASSIGNMENT", ...release, chapterId: "chapter", chapter: { id: "chapter", ...release, offering: { id: "offering", status: "OPEN" } }, classroomInstances: [] });
+    mocks.enrollment.mockResolvedValue({ id: "enrollment", status: "ACTIVE", activityProgress: [{ status: "NOT_STARTED", startedAt: null }] });
+    mocks.tx.activityProgress.findUniqueOrThrow.mockResolvedValue({ status: "COMPLETED", progressData: { answer: "saved" } });
+    const result = await getStudentActivity(studentClaims, "activity");
+    expect(mocks.tx.activityProgress.upsert).toHaveBeenCalledWith(expect.objectContaining({ update: { lastAccessedAt: expect.any(Date) } }));
+    expect(mocks.tx.activityProgress.updateMany).toHaveBeenCalledWith(expect.objectContaining({ where: { enrollmentId: "enrollment", activityId: "activity", status: { in: ["NOT_STARTED", "not_started"] } } }));
+    expect(result.progress.status).toBe("completed");
+    expect(result.progress.progressData).toEqual({ answer: "saved" });
+    expect(mocks.events).toHaveBeenCalledOnce();
+  });
+
+  it("projects the preparation cover onto student classroom instances", async () => {
+    const snapshot = { schemaVersion: 2, kind: "pbl-course", design: { coverImageUrl: "/classroom-cover.webp" } };
+    mocks.activity.mockResolvedValue({
+      id: "activity",
+      type: "CLASSROOM",
+      ...release,
+      chapterId: "chapter",
+      chapter: { id: "chapter", title: "第一章", position: 0, ...release, offering: { id: "offering", name: "课程", status: "FINISHED" } },
+      classroomInstances: [{ id: "instance", status: "FINISHED", startedAt: new Date(), endedAt: new Date(), templateVersion: { id: "version", version: 1, snapshot, mediaRefs: null } }],
+    });
+    mocks.enrollment.mockResolvedValue({ id: "enrollment", status: "COMPLETED", activityProgress: [] });
+    const result = await getStudentActivity(studentClaims, "activity");
+    expect(result.instances[0]).toMatchObject({ id: "instance", coverImageUrl: "/classroom-cover.webp" });
+    expect(result.instance).toMatchObject({ id: "instance", coverImageUrl: "/classroom-cover.webp" });
+  });
+
+  it.each([
+    ["TEACHING", true, true, false],
+    ["FINISHED", false, true, false],
+    ["FINISHED", true, false, false],
+    ["FINISHED", true, true, true],
+  ])("projects posttest permission for %s / completed=%s / entered=%s", async (status, completed, entered, available) => {
+    const form = [{ id: "post", type: "short-answer", prompt: "学习之后" }];
+    const run = { id: "run", status, runtimeConfig: { evaluationContractVersion: 2, posttestAccess: { status: "open", version: 1 } }, templateVersion: { snapshot: {} } };
+    mocks.activity.mockResolvedValue({ id: "activity", type: "CLASSROOM", ...release, chapter: { ...release, offering: { id: "offering", status: "OPEN" } }, classroomInstances: [run] });
+    mocks.enrollment.mockResolvedValue({ id: "enrollment", status: "ACTIVE", activityProgress: [] });
+    mocks.experiments.mockResolvedValue([{ instanceId: "run", phase: "pretest" }]);
+    mocks.assignments.mockResolvedValue([{ instanceId: "run", pretestForm: form, posttestForm: form }]);
+    mocks.participations.mockResolvedValue([
+      { instanceId: "old-run", firstEnteredAt: new Date(), completedAt: new Date() },
+      { instanceId: "run", firstEnteredAt: entered ? new Date() : null, completedAt: completed ? new Date() : null },
+    ]);
+    const result = await getStudentActivity(studentClaims, "activity", { refresh: true });
+    expect(result.instance?.posttestAvailable).toBe(available);
+    expect(result.instances[0].posttestAvailable).toBe(available);
+    expect(result.experiment?.posttest).toHaveLength(available ? 1 : 0);
+    expect(mocks.participations).toHaveBeenCalledWith(expect.objectContaining({ where: { instanceId: { in: ["run"] }, enrollmentId: "enrollment" } }));
+  });
+
+  it("uses each classroom run's saved experiment questions without exposing answer keys", async () => {
+    const savedExperiment = { enabled: true, pretest: [{ id: "old", type: "true-false", prompt: "原题", correctAnswer: "true" }], posttest: [{ id: "after", type: "short-answer", prompt: "反思" }] };
+    const currentExperiment = { enabled: true, pretest: [{ id: "new", type: "true-false", prompt: "新题", correctAnswer: "false" }], posttest: [{ id: "after", type: "short-answer", prompt: "反思" }] };
+    const snapshot = { schemaVersion: 2, kind: "pbl-course" };
+    mocks.activity.mockResolvedValue({
+      id: "activity", type: "CLASSROOM", config: { schemaVersion: 1, experiment: currentExperiment }, ...release,
+      chapterId: "chapter", chapter: { id: "chapter", ...release, offering: { id: "offering", status: "FINISHED" } },
+      classroomInstances: [{ id: "old-run", status: "FINISHED", templateVersion: { snapshot } }],
+    });
+    mocks.enrollment.mockResolvedValue({ id: "enrollment", status: "COMPLETED", activityProgress: [] });
+    mocks.experiments.mockResolvedValue([{ instanceId: "old-run", phase: "pretest" }]);
+    mocks.assignments.mockResolvedValue([{ instanceId: "old-run", pretestForm: savedExperiment.pretest, posttestForm: savedExperiment.posttest }]);
+    const result = await getStudentActivity(studentClaims, "activity");
+    expect(result.experiment?.pretest[0]).toMatchObject({ id: "old", prompt: "原题" });
+    expect(result.instance?.pretestSubmitted).toBe(true);
+    expect(result.config).toEqual({ schemaVersion: 1 });
+    expect(JSON.stringify(result)).not.toContain("correctAnswer");
+    expect(JSON.stringify(result)).not.toContain("新题");
+  });
+});
+
+describe("teacher offering classroom covers", () => {
+  it("projects each latest template snapshot cover onto the chapter activity instance", async () => {
+    const snapshot = { schemaVersion: 2, kind: "pbl-course", design: { coverImageUrl: "https://cdn.example.test/classroom.webp" } };
+    mocks.offerings.mockResolvedValue([{
+      id: "offering",
+      name: "课程",
+      status: "OPEN",
+      settings: { referenceLinks: [{ id: "reading", title: "延伸阅读", url: "https://example.test/reading" }] },
+      invitations: [],
+      resources: [{ title: "观察手册", fileAsset: { id: "8f31b270-b23d-4ec1-bd2b-8543210bcf88", originalName: "观察手册.pdf", size: BigInt(2048), mimeType: "application/pdf", deletedAt: null } }],
+      _count: { enrollments: 2 },
+      chapters: [{
+        id: "chapter",
+        activities: [{
+          id: "activity",
+          type: "CLASSROOM",
+          _count: { submissions: 1, progress: 0 },
+          classroomInstances: [{ id: "instance", status: "SCHEDULED", templateVersion: { id: "version", templateId: "template", version: 1, status: "PUBLISHED", snapshot } }],
+        }],
+      }],
+    }]);
+    const result = await listTeacherOfferings(teacherClaims);
+    expect(result[0].chapters[0].activities[0]).toMatchObject({
+      templateId: "template",
+      templateVersionId: "version",
+      hasResponses: true,
+    });
+    expect(result[0].chapters[0].activities[0].instances[0]).toMatchObject({
+      id: "instance",
+      templateVersionId: "version",
+      coverImageUrl: "https://cdn.example.test/classroom.webp",
+    });
+    expect(result[0].courseReferences).toEqual([
+      { id: "reading", kind: "link", title: "延伸阅读", url: "https://example.test/reading" },
+      expect.objectContaining({ id: "8f31b270-b23d-4ec1-bd2b-8543210bcf88", kind: "file", title: "观察手册", fileName: "观察手册.pdf", url: "/api/uploads/8f31b270-b23d-4ec1-bd2b-8543210bcf88" }),
+    ]);
+    expect(mocks.offerings).toHaveBeenCalledWith(expect.objectContaining({
+      include: expect.objectContaining({
+        _count: { select: { enrollments: { where: { status: { in: ["ACTIVE", "active", "COMPLETED", "completed"] } } } } },
+        chapters: expect.objectContaining({
+          include: expect.objectContaining({
+            activities: expect.objectContaining({
+              include: expect.objectContaining({
+                classroomInstances: expect.objectContaining({
+                  include: { templateVersion: { select: expect.objectContaining({ snapshot: true }) } },
+                }),
+              }),
+            }),
+          }),
+        }),
+      }),
+    }));
+  });
+});

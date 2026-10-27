@@ -1,0 +1,210 @@
+.shell { height: 100%; min-height: 0; display: flex; flex-direction: column; background: #f4f6f8; color: #1f2933; --presentation-font: clamp(20px, 1.35vw, 28px); }
+.heading { display: flex; align-items: center; gap: clamp(12px, 1.5vw, 28px); flex: none; padding: 8px clamp(16px, 2.5vw, 48px); background: #fcfbf8; border-bottom: 1px solid #d8d6d0; }
+.identity { flex: 1; min-width: 0; display: flex; align-items: center; gap: clamp(16px, 1.5vw, 28px); }
+.identity h1 { flex: 0 1 auto; max-width: min(32vw, 520px); min-width: 0; margin: 0; color: #344a6a; font-size: clamp(16px, 1vw, 20px); line-height: 1.4; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.stageProgress { position: relative; flex: 1; min-width: 180px; max-width: 420px; height: 44px; }
+.stageName { position: absolute; top: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: clamp(14px, .9vw, 18px); font-weight: 600; line-height: 1.5; transition: left 240ms ease, transform 240ms ease; }
+.progress { position: absolute; inset: auto 0 4px; display: flex; align-items: center; gap: 4px; height: 6px; }
+.progress i { height: 4px; border-radius: 6px; background: #d8d6d0; flex: 1; transition: background-color 240ms ease, height 240ms ease; }
+.progress i[data-state="complete"] { background: #2f6f65; }
+.progress i[data-state="current"] { background: #344a6a; height: 6px; }
+.timing { flex: none; padding-left: clamp(12px, 1.5vw, 24px); border-left: 1px solid #d8d6d0; color: #5f6b76; }
+.timingTrigger { display: flex; align-items: center; gap: 8px; min-height: 44px; padding: 4px 6px; border: 0; border-radius: 6px; color: inherit; background: transparent; text-align: left; cursor: pointer; }
+.timingTrigger:hover, .timingTrigger[data-state="open"] { background: #e8edf3; }
+.timingTrigger > svg { flex: none; }
+.timingValues { display: flex; gap: clamp(12px, 1.25vw, 24px); }
+.timingValues > span { display: flex; flex-direction: column; }
+.timingValues > span > span { font-size: 12px; line-height: 1.5; white-space: nowrap; }
+.timingValues strong { color: #344a6a; font-size: clamp(16px, 1vw, 20px); font-weight: 600; line-height: 1.3; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.timing [data-overtime="true"] :is(span, strong), .timingState { color: #8a6422; }
+.timingState { font-size: 12px; line-height: 1.4; white-space: nowrap; }
+.timerPopover { z-index: 100; width: 290px; max-width: calc(100vw - 24px); max-height: var(--radix-popover-content-available-height); overflow: auto; padding: 12px; border: 1px solid #d8d6d0; border-radius: 8px; background: #fcfbf8; color: #1f2933; box-shadow: 0 8px 28px #1f29331a; }
+.timerPopoverHeading { display: flex; align-items: center; justify-content: space-between; }
+.timerPopoverHeading > strong { font-size: 15px; }
+.timerPopover button { min-height: 44px; min-width: 44px; display: inline-flex; align-items: center; justify-content: center; gap: 6px; border: 1px solid #c7cfd8; border-radius: 6px; color: #344a6a; background: transparent; font-size: 14px; cursor: pointer; }
+.timerPopoverHeading button { border: 0; }
+.timerPopover button:hover { background: #e8edf3; }
+.timerPopover button:disabled { opacity: .4; cursor: default; }
+.timerPopover :focus-visible { outline: 2px solid #344a6a; outline-offset: -2px; }
+.timerPopover p { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 8px 0; color: #5f6b76; font-size: 13px; }
+.timerPopover p strong { color: #344a6a; font-variant-numeric: tabular-nums; }
+.timerActions { display: grid; grid-template-columns: 1fr 1.3fr; gap: 8px; margin-top: 12px; }
+.status { flex: none; display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
+.status p { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 8px; color: #5f6b76; font-size: 16px; margin: 0; }
+.status em { color: #8a6422; font-style: normal; }
+.exit, .controls button, .controls select { min-height: 44px; min-width: 44px; display: inline-flex; align-items: center; justify-content: center; gap: 8px; padding: 8px 12px; border: 1px solid #c7cfd8; border-radius: 6px; background: #fcfbf8; color: #344a6a; font-size: clamp(16px, 1vw, 22px); font-weight: 600; cursor: pointer; }
+.exit:hover, .controls button:hover { background: #e8edf3; }
+.shell :is(button,select,a):focus-visible { outline: 2px solid #344a6a; outline-offset: -2px; }
+.controls button:disabled { opacity: .4; cursor: default; }
+.body { flex: 1; min-height: 0; overflow: auto; padding: clamp(12px, 1.5vw, 32px) clamp(16px, 2.5vw, 64px); }
+.studentWorkBody { padding: 12px 16px; }
+.showcaseBody { padding: 8px 12px; }
+.content { height: 100%; min-height: 0; min-width: 0; }
+.stage { height: 100%; min-height: 0; min-width: 0; border: 0; border-radius: 0; background: transparent; box-shadow: none; padding: 0; overflow: auto; }
+/* The operation pages keep their normal document flow. A fixed-height inner
+   workspace and enlarged controls can overflow the compact rows they own. */
+.stage[data-details="true"] { height: auto; min-height: 100%; overflow: visible; }
+.stage[data-details="true"] > :global(.classroom-stage),
+.stage[data-details="true"] :global(.teacher-presentation-content) { height: auto; min-height: 0; overflow: visible; }
+.stage[data-details="true"] :global(.classroom-stage-header) { flex-wrap: wrap; align-items: flex-start; }
+.stage[data-details="true"] :global(.classroom-stage-header) > div { max-width: 100%; }
+.stage[data-details="true"] :global(.classroom-stage-title),
+.stage[data-details="true"] :global(.classroom-stage-description) { overflow-wrap: anywhere; }
+.shell [hidden] { display: none !important; }
+.stage:not([data-details="true"]) :is(button,select,input) { min-height: 44px; }
+.stage:not([data-details="true"]) button { min-width: 44px; }
+.stage :global(.teacher-presentation-content) { min-height: 0; height: 100%; }
+.stage :global(.teacher-stage-resources) { min-height: 0; }
+.stage :global(.teacher-resource-preview) :global(.min-h-72) { min-height: 0; }
+.stage :global(.teacher-presentation-showcase) :global(.min-h-72) { min-height: 0; }
+/* Reset Tailwind's translate variables too: CSS compatibility transforms may
+   rewrite translate:none without cancelling its separate translate utility. */
+.stage :global(.teacher-resource-preview) :global(.resource-pdf-controls) { --tw-translate-x: 0px; --tw-translate-y: 0px; position: static; order: 2; transform: none; translate: none; width: 100%; max-width: none; opacity: 1; pointer-events: auto; padding: 4px 8px; border-radius: 0; box-shadow: none; }
+.stage :global(.teacher-resource-preview) :global(.resource-pdf-controls) > div { justify-content: center; }
+.stage :global(.teacher-resource-preview) :global(.resource-pdf-controls) label { min-height: 44px; height: auto; }
+.stage :global(.teacher-resource-preview) :global(.resource-pdf-viewport) { order: 1; min-height: 0; padding: 8px; }
+.stage :global(.teacher-resource-video-container),
+.stage :global(.teacher-resource-video) { min-height: 0; }
+.stage[data-details="true"] :global(.teacher-resource-video-container) { height: clamp(16rem, calc(100dvh - 20rem), 32rem); }
+.stage :global(.teacher-presentation-task) { padding: clamp(24px, 3vw, 64px); font-size: var(--presentation-font); line-height: 1.7; }
+.stage :global(.teacher-presentation-task) :is(h2,h3) { font-size: clamp(26px, 2vw, 40px); line-height: 1.35; font-weight: 600; margin-bottom: 18px; }
+.stage :global(.teacher-presentation-task) :global(.project-driving-question) h3 { font-size: clamp(16px, 1.1vw, 20px); line-height: 1.35; font-weight: 700; margin-bottom: 0; }
+.stage :global(.teacher-presentation-task) p { white-space: pre-wrap; overflow-wrap: anywhere; }
+.stage :global(.teacher-presentation-task) button { min-height: 44px; font-size: 18px; }
+.stage :global(.teacher-presentation-task) :global(.project-timer-trigger) { font-size: clamp(13px, .85vw, 16px); }
+.stage :global(.teacher-presentation-task) :global(.project-timer-controls) button { font-size: clamp(12px, .8vw, 14px); }
+.controls { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 8px; flex: none; max-height: none; overflow: visible; padding: 8px clamp(8px, 1vw, 20px); border-top: 1px solid #d8d6d0; background: #fcfbf8; box-shadow: 0 -4px 18px #1f29330a; scrollbar-width: thin; }
+.controlsLeft,
+.controlsRight { display: flex; flex: 0 1 auto; min-width: 0; max-width: 100%; align-items: center; flex-wrap: wrap; gap: 6px; }
+.controlsLeft { justify-content: flex-start; }
+.controlsRight { justify-content: flex-end; margin-left: auto; }
+.controls button,
+.controls select { min-height: 44px; min-width: 44px; gap: 6px; padding: 6px 8px; font-size: clamp(13px, .82vw, 16px); white-space: nowrap; }
+.controls .stageActions select { width: min(180px, 16vw); max-width: min(180px, 16vw); }
+.controls .stageControls select { width: min(160px, 14vw); max-width: min(160px, 14vw); }
+.views { display: flex; flex: 0 1 auto; min-width: 0; flex-wrap: wrap; gap: 4px; }
+.views button { min-height: 44px; }
+.views button[aria-pressed="true"] { color: #fff; background: #344a6a; border-color: #344a6a; }
+.stageActions { display: flex; flex: 0 1 auto; align-items: center; min-width: 0; max-width: 100%; flex-wrap: wrap; gap: 4px; }
+.stageActions:empty { display: none; }
+.stageActions > [role="alert"] { max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.controls .stageActions button[data-tone="primary"] { color: #fff; background: #344a6a; border-color: #344a6a; }
+.controls .stageActions button[data-tone="primary"]:hover { background: #263c5a; }
+.controls .stageActions button[data-tone="danger"] { color: #8a3e3e; background: #fff7f7; border-color: #8a3e3e; }
+.controls .stageActions button[data-tone="danger"]:hover { background: #f8e8e8; }
+.stageControls { position: relative; display: flex; flex: none; align-items: center; gap: 4px; margin-inline-start: 8px; padding-inline-start: 16px; }
+.stageControls::before { content: ""; position: absolute; inset-inline-start: 0; top: 50%; width: 1px; height: 28px; background: #c7cfd8; transform: translateY(-50%); }
+.stageHint { z-index: 100; max-width: min(300px, calc(100vw - 24px)); padding: 8px 12px; border-radius: 6px; background: #344a6a; color: #fff; font-size: 14px; line-height: 1.5; box-shadow: 0 4px 16px #1f293322; }
+.stageHint svg { fill: #344a6a; }
+/* Text hints must not block controls in the row above a wrapped stage picker. */
+:global([data-radix-popper-content-wrapper]):has(> .stageHint) { pointer-events: none; }
+.stageControls select { max-width: min(240px, 35vw); }
+.save { min-height: 20px; font-size: 12px; }
+.controls .end { color: #8a3e3e; }
+.dialog { width: min(860px, calc(100vw - 32px)); max-width: none; max-height: 85dvh; overflow: auto; }
+.tools > :is(button, a) { min-height: 44px; font: inherit; }
+.advice { font-size: 20px; }
+.advice :is(p, strong, h3, button) { font-size: inherit; line-height: 1.6; }
+.advice button { min-height: 44px; min-width: 44px; }
+@media (max-width: 1200px) { .status p { font-size: 13px; gap: 4px; } }
+@media (max-width: 900px) { .heading { flex-wrap: wrap; gap: 8px 12px; padding: 8px 16px; } .identity { flex-basis: calc(100% - 140px); } .identity h1 { max-width: 40%; } .headerActions { order: 1; margin-left: auto; } .timing { order: 2; padding-left: 0; border-left: 0; } .status { order: 3; margin-left: auto; } }
+@media (max-width: 700px) { .identity { flex-direction: column; align-items: stretch; gap: 4px; } .identity h1 { max-width: none; flex: none; } .stageProgress { flex: none; min-width: 0; width: 100%; height: 36px; } .status { flex-direction: row; flex-wrap: wrap; gap: 4px 16px; align-items: center; justify-content: space-between; width: 100%; margin-left: 0; } .controls { padding: 8px; } .controls button, .controls select { font-size: 14px; padding: 6px 8px; } }
+@media (max-height: 650px) { .heading { padding-top: 6px; padding-bottom: 6px; } .controls { padding-top: 6px; padding-bottom: 6px; } .body { padding-top: 10px; padding-bottom: 10px; } }
+/* Native desktop zoom can leave only about 340 CSS pixels in height. Keep all
+   classroom status in two rows and reserve content space before flex children
+   can collapse the PDF controls inside an overflow-hidden preview. */
+@media (max-height: 420px) and (min-width: 560px) {
+  .heading { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 12px; padding: 4px 12px; }
+  .identity { grid-column: 1; grid-row: 1; flex-direction: row; align-items: center; gap: 12px; }
+  .identity h1 { flex: 0 1 auto; max-width: 45%; }
+  .stageProgress { flex: 1; width: auto; min-width: 0; height: 36px; }
+  .headerActions { grid-column: 2; grid-row: 1; margin-left: 0; }
+  .timing { grid-column: 1; grid-row: 2; padding-left: 0; border-left: 0; }
+  .status { grid-column: 2; grid-row: 2; width: auto; max-width: 280px; margin-left: 0; flex-direction: column; align-items: flex-end; gap: 0; }
+  .status p { font-size: 12px; gap: 4px; }
+  .body { padding: 4px 8px; }
+  .stage:not([data-details="true"]) :global(.teacher-stage-resources) { min-height: 160px; gap: 4px; }
+  .stage:not([data-details="true"]) :global(.teacher-resource-preview) { padding: 4px; }
+}
+@media (max-height: 650px), (max-width: 1100px) { .stage[data-details="true"] :global(.classroom-split-aside) { position: static; } }
+@media (prefers-reduced-motion: reduce) { .shell *, .shell *::before, .shell *::after { animation: none !important; transition: none !important; } }
+
+/* One classroom surface in both browser window and native fullscreen. */
+.shell, .dialog {
+  --pbl-teacher: #344a6a;
+  --pbl-teacher-hover: #263c5a;
+  --pbl-teacher-soft: #e8edf3;
+  --pbl-teacher-border: #c7cfd8;
+  --pbl-bg: #f4f6f8;
+  --pbl-surface: #fcfbf8;
+  --pbl-border: #d8dfe6;
+  --pbl-text: #1f2933;
+  --pbl-text-muted: #5f6b76;
+}
+.headerActions { display: flex; flex: none; align-items: center; gap: 6px; }
+.headerActions a { text-decoration: none; }
+.headerActions button { white-space: nowrap; }
+.status small { max-width: 280px; color: #5f6b76; font-size: 12px; }
+.dialog { background: #fcfbf8; color: #1f2933; }
+.dialog :is(button,a,input,select) { min-height: 44px; }
+.dialog :global([data-slot="dialog-close"]) { min-width: 44px; display: grid; place-items: center; top: 8px; right: 8px; }
+.dialog > h2 { padding-right: 40px; }
+.stage[data-details="true"] :global(.classroom-stage-header) { border-bottom: 1px solid #d8dfe6; padding-bottom: 16px; }
+@media (max-width: 900px) {
+  .controls .stageActions select { width: auto; max-width: min(220px, 55vw); }
+  .controls .stageControls select { width: auto; max-width: 38vw; }
+  .identity { flex-basis: calc(100% - 190px); }
+}
+@media (max-width: 500px) {
+  .shell { --presentation-font: 18px; }
+  .heading { padding: 8px; }
+  .body { padding: 10px; }
+  .body.showcaseBody { padding: 4px 8px; }
+  .controls { padding: 6px; gap: 4px; }
+  .controlsRight, .controlsLeft { gap: 4px; }
+  .headerActions { gap: 4px; }
+  .headerActions .exit { padding: 8px; font-size: 14px; }
+  .identity { flex-basis: calc(100% - 166px); }
+  .status { gap: 4px; }
+}
+@media (max-height: 420px) {
+  .controls { max-height: 42dvh; overflow-y: auto; }
+}
+/* Reserve reading space in short showcase windows; auxiliary classroom
+   controls remain reachable in one horizontally scrollable row. */
+@media (max-height: 500px) and (min-width: 700px) {
+  .shell[data-stage="showcase"] .heading { display: flex; flex-wrap: nowrap; gap: 12px; padding: 4px 8px; }
+  .shell[data-stage="showcase"] .identity { flex: 1; flex-basis: auto; }
+  .shell[data-stage="showcase"] .identity h1 { display: none; }
+  .shell[data-stage="showcase"] .stageProgress { min-width: 72px; max-width: 140px; height: 36px; }
+  .shell[data-stage="showcase"] .timing { order: 0; padding-left: 0; border-left: 0; }
+  .shell[data-stage="showcase"] .timingValues { gap: 12px; }
+  .shell[data-stage="showcase"] .status { order: 0; width: auto; margin-left: 0; }
+  .shell[data-stage="showcase"] .status p { display: none; }
+  .shell[data-stage="showcase"] .headerActions { order: 0; }
+  .shell[data-stage="showcase"] .controls { flex-wrap: nowrap; gap: 8px; padding: 4px 8px; overflow-x: auto; }
+  .shell[data-stage="showcase"] :is(.controlsLeft, .controlsRight, .stageActions) { flex: none; flex-wrap: nowrap; }
+  .shell[data-stage="showcase"] .controlsRight { margin-left: auto; }
+  .shell[data-stage="showcase"] .body { padding: 4px 8px; }
+}
+
+/* Launch teaching keeps the document as the only content row. */
+.shell[data-stage="launch"] .heading { gap: 10px; padding: 6px 12px; }
+.shell[data-stage="launch"] .identity { gap: 12px; }
+.shell[data-stage="launch"] .stageProgress { min-width: 96px; }
+.shell[data-stage="launch"] .body { padding: 4px; }
+.shell[data-stage="launch"] .controls { padding: 4px 8px; gap: 4px 8px; }
+.shell[data-stage="launch"] .stage :global(.teacher-stage-resources) { gap: 0; min-height: 0; }
+.shell[data-stage="launch"] .stage :global(.teacher-resource-preview) { padding: 0; border: 0; border-radius: 0; box-shadow: none; }
+.shell[data-stage="launch"] .stage :global(.teacher-resource-preview) :global(.resource-pdf-viewport) { padding: 0; }
+.shell[data-stage="launch"] .stage :global(.resource-pdf-controls.launch-pdf-floating-controls) { position: absolute; inset: auto 8px 8px; display: flex; align-items: center; justify-content: center; flex-wrap: wrap; gap: 4px; width: fit-content; max-width: calc(100% - 120px); margin-inline: auto; padding: 4px; border: 1px solid #c7cfd8; border-radius: 10px; background: #fcfbf8; box-shadow: 0 4px 18px #1f293322; }
+.shell[data-stage="launch"] .stage :global(.launch-pdf-floating-controls) > div { min-width: 0; }
+.shell[data-stage="launch"] .stage :global(.launch-pdf-page-navigation) { position: absolute; inset: 0; z-index: 30; display: flex; align-items: center; justify-content: space-between; padding-inline: 8px; pointer-events: none; }
+.shell[data-stage="launch"] .stage :global(.launch-pdf-page-navigation) button { display: grid; place-items: center; width: 44px; height: 44px; padding: 0; border: 1px solid #c7cfd8; border-radius: 50%; color: #344a6a; background: #fcfbf8e6; box-shadow: 0 2px 8px #1f293314; pointer-events: auto; }
+.shell[data-stage="launch"] .stage :global(.launch-pdf-page-navigation) button:hover:not(:disabled) { background: #e8edf3; }
+.shell[data-stage="launch"] .stage :global(.launch-pdf-page-navigation) button:disabled { opacity: .35; cursor: default; }
+@media (max-width: 700px) {
+  .shell[data-stage="launch"] .identity { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 8px; }
+  .shell[data-stage="launch"] .identity h1 { grid-column: 1 / -1; }
+  .shell[data-stage="launch"] .stageProgress { min-width: 0; }
+}

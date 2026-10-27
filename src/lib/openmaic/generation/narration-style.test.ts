@@ -1,0 +1,157 @@
+import { describe, expect, it, vi } from 'vitest';
+import type { Action } from '@openmaic/lib/types/action';
+import type { SceneOutline } from '@openmaic/lib/types/generation';
+import {
+  NATURAL_NARRATION_VERSION,
+  narrationStyleIssues,
+  naturalizeKnowledgeNarration,
+  normalizeNarrationRewrite,
+} from './narration-style';
+
+const outline: SceneOutline = {
+  id: 'p1', type: 'slide', title: '流畅不等于真实', description: '解释生成机制', keyPoints: ['核验事实'], order: 0,
+  generationPurpose: 'knowledge-teaching',
+  teachingBrief: {
+    schemaVersion: 1,
+    explanation: '语言模式可以生成流畅表达，但不能验证事实。',
+    examples: ['核对校史年份。'],
+    conditions: ['多个转载页面不一定是独立来源。'],
+    evidence: [],
+    assessmentFocus: '说明核验步骤和理由。',
+  },
+};
+
+describe('natural teacher narration', () => {
+  it('rejects slide-production language and preserves segment identity', () => {
+    expect(narrationStyleIssues([{ id: 's1', text: '这一页的核心观点是流畅不等于真实。' }])).toEqual(expect.arrayContaining([
+      expect.stringContaining('页面制作视角'),
+      expect.stringContaining('讲稿提纲标签'),
+    ]));
+    const expected = [{ id: 's1', text: '原讲稿。' }, { id: 's2', text: '原讲稿二。' }];
+    expect(normalizeNarrationRewrite({ segments: [
+      { id: 's1', text: '大家先想一想，表达流畅能证明事实正确吗？' },
+      { id: 's2', text: '不能。我们还要回到独立来源核对姓名、年份和数据。' },
+    ] }, expected).map((item) => item.id)).toEqual(['s1', 's2']);
+    expect(() => normalizeNarrationRewrite({ segments: [...expected].reverse() }, expected)).toThrow(/保留 id/);
+  });
+
+  it('accepts an optimized rewrite even when it exceeds the original timing range', () => {
+    const timedOutline = {
+      ...outline,
+      timingPlan: {
+        unit: 'cjk-char', targetUnits: 100, minUnits: 90, maxUnits: 110,
+      } as NonNullable<SceneOutline['timingPlan']>,
+    };
+    expect(normalizeNarrationRewrite(
+      { segments: [{ id: 's1', text: `${'学'.repeat(70)}。${'习'.repeat(70)}。` }] },
+      [{ id: 's1', text: '原讲稿。' }],
+    )[0]?.text.length).toBeGreaterThan(timedOutline.timingPlan.maxUnits);
+  });
+
+  it('rewrites speech text without changing action order or non-speech actions', async () => {
+    const actions: Action[] = [
+      { id: 's1', type: 'speech', text: '这一页的核心观点是流畅不等于真实。' },
+      { id: 'laser', type: 'laser', elementId: 'claim' },
+      { id: 's2', type: 'speech', text: '相关指导文件要求我们核验关键信息。' },
+    ];
+    const ai = vi.fn().mockResolvedValue(JSON.stringify({ segments: [
+      { id: 's1', text: '大家先看这个回答。它说得很顺，但流畅只能说明表达自然。' },
+    ] }));
+    const rewritten = await naturalizeKnowledgeNarration({ outline, actions, aiCall: ai });
+    expect(ai.mock.calls[0]?.[0]).toContain('Teach adopted knowledge, reasoning, and cases directly');
+    expect(ai.mock.calls[0]?.[0]).toContain('“教材指出”“教材中提到”“书中说”“根据提供的资料”');
+    expect(ai.mock.calls[0]?.[0]).toContain('authoritative definitions, supported facts, quantities, negation, uncertainty, and necessary conditions');
+    expect(ai.mock.calls[0]?.[0]).toContain("comparing named authors' views, analyzing original wording, or explaining a particular standard's scope");
+    expect(rewritten.map((action) => action.id)).toEqual(['s1', 'laser', 's2']);
+    expect(rewritten[1]).toEqual(actions[1]);
+    expect(rewritten[2]).toEqual(actions[2]);
+    expect(narrationStyleIssues(rewritten.flatMap((action) => action.type === 'speech'
+      ? [{ id: action.id, text: action.text }]
+      : []))).toEqual([]);
+  });
+
+  it('fills a blueprint teaching narration with missing explanation instead of accepting a definition-length script', async () => {
+    const timedOutline: SceneOutline = {
+      ...outline,
+      plannedTiming: { narrationSec: 68, learnerActivitySec: 25, transitionSec: 7, role: 'teaching' },
+      timingPlan: {
+        unit: 'cjk-char', targetUnits: 110, minUnits: 100, maxUnits: 120,
+      } as NonNullable<SceneOutline['timingPlan']>,
+    };
+    const actions: Action[] = [{ id: 's1', type: 'speech', text: '语言模型会生成连贯文本，但连贯不等于事实正确。' }];
+    const expanded = "语言模型根据已有文本中的关联生成后续表达，所以句子可以很顺畅。核对事实时先回到独立来源检查人物与时间，再比对数据的定义和适用条件。最后用另一个来源复核关键结论，记录不一致之处，而不是通过放慢语速或重复定义来延长讲解。";
+    const ai = vi.fn().mockResolvedValue(JSON.stringify({ segments: [{ id: 's1', text: expanded }] }));
+    const rewritten = await naturalizeKnowledgeNarration({ outline: timedOutline, actions, aiCall: ai });
+    expect(ai.mock.calls[0]?.[1]).toContain('不放慢语速，不重复概念');
+    expect(ai.mock.calls[0]?.[1]).toContain('不得少于约 105');
+    expect(ai.mock.calls[0]?.[1]).toContain('真实 TTS 音频汇总审计');
+    expect(rewritten[0]).toMatchObject({ type: 'speech', text: expanded });
+  });
+
+  it('checks teaching depth across rewritten and unchanged speech segments', async () => {
+    const timedOutline: SceneOutline = {
+      ...outline,
+      plannedTiming: { narrationSec: 68, learnerActivitySec: 25, transitionSec: 7, role: 'teaching' },
+      timingPlan: {
+        unit: 'cjk-char', targetUnits: 110, minUnits: 100, maxUnits: 120,
+      } as NonNullable<SceneOutline['timingPlan']>,
+    };
+    const actions: Action[] = [
+      { id: 's1', type: 'speech', text: `这一页先分析：${'甲'.repeat(45)}` },
+      { id: 's2', type: 'speech', text: `接着说明具体条件和完整案例。${'乙'.repeat(45)}` },
+    ];
+    const revised = `先从问题本身分析。${'丙'.repeat(45)}`;
+    const ai = vi.fn().mockResolvedValue(JSON.stringify({ segments: [{ id: 's1', text: revised }] }));
+
+    const rewritten = await naturalizeKnowledgeNarration({ outline: timedOutline, actions, aiCall: ai });
+
+    expect(rewritten[0]).toMatchObject({ type: 'speech', text: revised });
+    expect(rewritten[1]).toEqual(actions[1]);
+    expect(ai).toHaveBeenCalledOnce();
+  });
+
+  it('retries an invalid rewrite and requires the corrected narration', async () => {
+    const actions: Action[] = [{ id: 's1', type: 'speech', text: '这一页先讲核验。' }];
+    const ai = vi.fn()
+      .mockResolvedValueOnce(JSON.stringify({ segments: [{ id: 's1', text: '这一页的核心观点是核验。' }] }))
+      .mockResolvedValueOnce(JSON.stringify({ segments: [{ id: 's1', text: '判断信息是否可靠，要回到独立来源核对事实。' }] }));
+    const rewritten = await naturalizeKnowledgeNarration({ outline, actions, aiCall: ai });
+    expect(ai).toHaveBeenCalledTimes(2);
+    expect(ai.mock.calls[1]?.[1]).toContain('上一次结果未通过验收');
+    expect(rewritten[0]).toMatchObject({ type: 'speech', text: expect.stringContaining('独立来源') });
+    expect(NATURAL_NARRATION_VERSION).toBe('natural-teacher-speech-v3');
+  });
+
+  it('stops generation after two invalid rewrites instead of returning the first draft', async () => {
+    const actions: Action[] = [{ id: 's1', type: 'speech', text: '这一页先讲核验。' }];
+    const ai = vi.fn().mockResolvedValue(JSON.stringify({
+      segments: [{ id: 's1', text: '这一页的核心观点仍然是核验。' }],
+    }));
+    await expect(naturalizeKnowledgeNarration({ outline, actions, aiCall: ai }))
+      .rejects.toThrow(/已停止课程生成/);
+    expect(ai).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps a conforming first draft without another model call', async () => {
+    const actions: Action[] = [{
+      id: 's1',
+      type: 'speech',
+      text: '判断信息是否可靠，要回到独立来源核对姓名、年份和数据。',
+    }];
+    const ai = vi.fn();
+    await expect(naturalizeKnowledgeNarration({ outline, actions, aiCall: ai }))
+      .resolves.toEqual(actions);
+    expect(ai).not.toHaveBeenCalled();
+  });
+
+  it('does not disguise a transport failure as a second content rewrite', async () => {
+    const actions: Action[] = [{ id: 's1', type: 'speech', text: '这一页先讲核验。' }];
+    const transportError = Object.assign(new Error('Receive batching backend response failed'), {
+      code: 'InternalError',
+    });
+    const ai = vi.fn().mockRejectedValue(transportError);
+    await expect(naturalizeKnowledgeNarration({ outline, actions, aiCall: ai }))
+      .rejects.toBe(transportError);
+    expect(ai).toHaveBeenCalledOnce();
+  });
+});

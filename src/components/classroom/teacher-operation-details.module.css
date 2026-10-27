@@ -1,0 +1,46 @@
+.root {
+  --pbl-bg: #f4f6f8;
+  --pbl-surface: #fcfbf8;
+  --pbl-surface-soft: #eef2f6;
+  --pbl-border: #d8dfe6;
+  --pbl-text: #1f2933;
+  --pbl-text-strong: #263c5a;
+  --pbl-text-muted: #5f6b76;
+  --pbl-teacher: #344a6a;
+  --pbl-teacher-hover: #263c5a;
+  --pbl-teacher-soft: #e8edf3;
+  --pbl-teacher-border: #b8c6d6;
+  min-width: 0;
+  color: var(--pbl-text);
+  font-size: 16px;
+  line-height: 1.6;
+}
+.root :is(button, select, input:not([type="file"]), summary), .root a[download], .root a:global(.inline-flex) { min-height: 44px; }
+.root button { min-width: 44px; }
+.root a[download] { display: inline-flex; align-items: center; }
+.root :is(button, a, input, select, summary):focus-visible { outline: 2px solid #344a6a; outline-offset: 2px; }
+.root :global(.classroom-stage-header) { padding-bottom: 12px; border-bottom: 1px solid var(--pbl-border); }
+.root :global(.classroom-stage-description) { max-width: 64rem; }
+.root :global(.classroom-panel) { box-shadow: none; border: 0; border-radius: 0; background: transparent; }
+.root :global(.text-xs), .root :global(.text-\[9px\]), .root :global(.text-\[10px\]), .root :global(.text-\[11px\]) { font-size: 14px; line-height: 1.6; }
+.root :global(.text-sm) { font-size: 16px; }
+.root :is(p, h2, h3, h4, strong) { overflow-wrap: anywhere; }
+.button { display: inline-flex; min-height: 44px; align-items: center; justify-content: center; gap: 8px; border: 1px solid #b8c6d6; border-radius: 6px; padding: 8px 12px; background: #fcfbf8; color: #344a6a; font-size: 16px; font-weight: 600; }
+.button:hover { background: #e8edf3; }
+.requirements { border-bottom: 1px solid var(--pbl-border); }
+.requirements > summary { display: flex; align-items: center; cursor: pointer; color: #344a6a; font-weight: 600; }
+.drawer { inset: 0 0 0 auto; width: min(480px, 100vw); max-width: none; height: 100dvh; max-height: 100dvh; transform: none; translate: none; display: flex; flex-direction: column; gap: 0; overflow: hidden; padding: 0; border: 0; border-radius: 0; background: #fcfbf8; }
+.drawerHeader { flex: none; border-bottom: 1px solid var(--pbl-border); padding: 20px 60px 16px 20px; }
+.drawerHeader h2 { color: #344a6a; font-size: 20px; }
+.drawerHeader p { margin-top: 6px; font-size: 14px; }
+.drawerBody { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 16px 20px; }
+.drawer > button[aria-label="关闭抽屉"] { top: 8px; right: 8px; display: grid; place-items: center; }
+.studentList { display: flex; flex-direction: column; gap: 8px; }
+.studentList button { width: 100%; padding: 12px; border: 1px solid var(--pbl-border); border-radius: 6px; text-align: left; background: white; }
+.studentList button[aria-pressed="true"] { border-color: #344a6a; background: #e8edf3; }
+.studentList :global(.truncate) { white-space: normal; overflow-wrap: anywhere; }
+.posttest header h2 { margin-top: 0; color: #344a6a; font-family: inherit; font-size: clamp(24px, 2vw, 32px); }
+@media (max-width: 700px) { .root :global(.classroom-stage-header) { align-items: flex-start; } .drawerBody { padding: 12px; } }
+
+.wideDrawer { width: min(960px, 100vw); }
+@media (max-width: 700px) { .wideDrawer { width: 100vw; } }

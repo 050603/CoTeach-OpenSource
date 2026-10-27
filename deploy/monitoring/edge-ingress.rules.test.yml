@@ -1,0 +1,273 @@
+rule_files:
+  - alerts.yml
+evaluation_interval: 15s
+tests:
+  - name: a completed short burst is visible outside the app despite fast handler samples
+    interval: 15s
+    input_series:
+      - series: 'openpbl_edge_request_duration_seconds_bucket{job="openpbl",instance="app",method="GET",route="/api/server-providers",operation="read",outcome="success",le="1"}'
+        values: '0+0x4'
+      - series: 'openpbl_edge_request_duration_seconds_bucket{job="openpbl",instance="app",method="GET",route="/api/server-providers",operation="read",outcome="success",le="2"}'
+        values: '0 0 30 30 30'
+      - series: 'openpbl_edge_request_duration_seconds_bucket{job="openpbl",instance="app",method="GET",route="/api/server-providers",operation="read",outcome="success",le="+Inf"}'
+        values: '0 0 30 30 30'
+      - series: 'openpbl_edge_request_duration_seconds_count{job="openpbl",instance="app",method="GET",route="/api/server-providers",operation="read",outcome="success"}'
+        values: '0 0 30 30 30'
+      - series: 'openpbl_http_operation_duration_seconds_bucket{method="GET",route="/api/server-providers",operation="read",le="0.05"}'
+        values: '0 0 30 30 30'
+      - series: 'openpbl_http_operation_duration_seconds_bucket{method="GET",route="/api/server-providers",operation="read",le="+Inf"}'
+        values: '0 0 30 30 30'
+    alert_rule_test:
+      - eval_time: 45s
+        alertname: OpenPblEdgeReadP95High
+        exp_alerts:
+          - exp_labels: &read_labels
+              job: openpbl
+              instance: app
+              method: GET
+              route: /api/server-providers
+              operation: read
+              severity: warning
+              measurement: nginx-first-bytes-to-response-complete
+            exp_annotations: &read_annotations
+              summary: CoTeach edge read p95 exceeds 1 second for /api/server-providers
+              description: Trusted Nginx complete-request duration includes pre-Node wait and response send. Known samples only; unknown collection and direct3000 remain separate, not green.
+      - eval_time: 45s
+        alertname: OpenPblClassroomReadP95High
+        exp_alerts: []
+  - name: fewer than twenty observed successful requests remain insufficient latency evidence
+    interval: 15s
+    input_series:
+      - series: 'openpbl_edge_request_duration_seconds_bucket{job="openpbl",instance="app",method="GET",route="/api/server-providers",operation="read",outcome="success",le="1"}'
+        values: '0+0x4'
+      - series: 'openpbl_edge_request_duration_seconds_bucket{job="openpbl",instance="app",method="GET",route="/api/server-providers",operation="read",outcome="success",le="2"}'
+        values: '0+1x4'
+      - series: 'openpbl_edge_request_duration_seconds_bucket{job="openpbl",instance="app",method="GET",route="/api/server-providers",operation="read",outcome="success",le="+Inf"}'
+        values: '0+1x4'
+      - series: 'openpbl_edge_request_duration_seconds_count{job="openpbl",instance="app",method="GET",route="/api/server-providers",operation="read",outcome="success"}'
+        values: '0+1x4'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: OpenPblEdgeReadP95High
+        exp_alerts: []
+  - name: unknown collection cannot mask known slow observations
+    interval: 15s
+    input_series:
+      - series: 'openpbl_edge_request_duration_seconds_bucket{job="openpbl",instance="app",method="GET",route="/api/server-providers",operation="read",outcome="success",le="1"}'
+        values: '0+0x12'
+      - series: 'openpbl_edge_request_duration_seconds_bucket{job="openpbl",instance="app",method="GET",route="/api/server-providers",operation="read",outcome="success",le="2"}'
+        values: '0+10x12'
+      - series: 'openpbl_edge_request_duration_seconds_bucket{job="openpbl",instance="app",method="GET",route="/api/server-providers",operation="read",outcome="success",le="+Inf"}'
+        values: '0+10x12'
+      - series: 'openpbl_edge_request_duration_seconds_count{job="openpbl",instance="app",method="GET",route="/api/server-providers",operation="read",outcome="success"}'
+        values: '0+10x12'
+      - series: 'up{job="openpbl",instance="app"}'
+        values: '1+0x12'
+      - series: 'openpbl_edge_log_configured{job="openpbl",instance="app"}'
+        values: '1+0x12'
+      - series: 'openpbl_edge_log_collection_available{job="openpbl",instance="app"}'
+        values: '0+0x12'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: OpenPblEdgeReadP95High
+        exp_alerts:
+          - exp_labels: *read_labels
+            exp_annotations: *read_annotations
+      - eval_time: 3m
+        alertname: OpenPblEdgeTelemetryUnknown
+        exp_alerts:
+          - exp_labels: &unknown_labels
+              job: openpbl
+              instance: app
+              severity: warning
+              measurement: nginx-log-collection
+            exp_annotations: &unknown_annotations
+              summary: CoTeach edge request telemetry is unknown or incomplete
+              description: Optional edge logging is off, inaccessible, behind, recently rotated/gapped, or maintenance is stale. This is not application readiness failure or zero latency. Direct3000 coverage is always outside this edge source.
+  - name: configured healthy idle collection has no invented zero or positive latency
+    interval: 15s
+    input_series:
+      - series: 'up{job="openpbl",instance="app"}'
+        values: '1+0x12'
+      - series: 'openpbl_edge_log_configured{job="openpbl",instance="app"}'
+        values: '1+0x12'
+      - series: 'openpbl_edge_log_collection_available{job="openpbl",instance="app"}'
+        values: '1+0x12'
+      - series: 'openpbl_edge_log_maintenance_available{job="openpbl",instance="app"}'
+        values: '1+0x12'
+      - series: 'openpbl_edge_log_last_refresh_seconds{job="openpbl",instance="app"}'
+        values: '0+15x12'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: OpenPblEdgeTelemetryUnknown
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: OpenPblEdgeReadP95High
+        exp_alerts: []
+    promql_expr_test:
+      - eval_time: 3m
+        expr: openpbl_edge_request_duration_seconds_count
+        exp_samples: []
+  - name: missing config or stale and NaN samples are unknown instead of green
+    interval: 15s
+    input_series:
+      - series: 'up{job="openpbl",instance="missing"}'
+        values: '1+0x20'
+      - series: 'up{job="openpbl",instance="stale"}'
+        values: '1+0x20'
+      - series: 'up{job="openpbl",instance="nan"}'
+        values: '1+0x20'
+      - series: 'up{job="openpbl",instance="off"}'
+        values: '1+0x20'
+      - series: 'openpbl_edge_log_configured{job="openpbl",instance="off"}'
+        values: '0+0x20'
+      - series: 'openpbl_edge_log_configured{job="openpbl",instance="stale"}'
+        values: '1+0x20'
+      - series: 'openpbl_edge_log_collection_available{job="openpbl",instance="stale"}'
+        values: '1+0x20'
+      - series: 'openpbl_edge_log_maintenance_available{job="openpbl",instance="stale"}'
+        values: '1+0x20'
+      - series: 'openpbl_edge_log_last_refresh_seconds{job="openpbl",instance="stale"}'
+        values: '0+0x20'
+      - series: 'openpbl_edge_log_configured{job="openpbl",instance="nan"}'
+        values: '1+0x20'
+      - series: 'openpbl_edge_log_collection_available{job="openpbl",instance="nan"}'
+        values: 'NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: OpenPblEdgeTelemetryUnknown
+        exp_alerts:
+          - exp_labels: { job: openpbl, instance: missing, severity: warning, measurement: nginx-log-collection }
+            exp_annotations: *unknown_annotations
+          - exp_labels: { job: openpbl, instance: stale, severity: warning, measurement: nginx-log-collection }
+            exp_annotations: *unknown_annotations
+          - exp_labels: { job: openpbl, instance: nan, severity: warning, measurement: nginx-log-collection }
+            exp_annotations: *unknown_annotations
+          - exp_labels: { job: openpbl, instance: off, severity: warning, measurement: nginx-log-collection }
+            exp_annotations: *unknown_annotations
+  - name: restarting fast counters never becomes slow latency
+    interval: 15s
+    input_series:
+      - series: 'openpbl_edge_request_duration_seconds_bucket{job="openpbl",instance="app",method="GET",route="/api/server-providers",operation="read",outcome="success",le="1"}'
+        values: '100 110 120 0 10 20 30 40'
+      - series: 'openpbl_edge_request_duration_seconds_bucket{job="openpbl",instance="app",method="GET",route="/api/server-providers",operation="read",outcome="success",le="+Inf"}'
+        values: '100 110 120 0 10 20 30 40'
+      - series: 'openpbl_edge_request_duration_seconds_count{job="openpbl",instance="app",method="GET",route="/api/server-providers",operation="read",outcome="success"}'
+        values: '100 110 120 0 10 20 30 40'
+    alert_rule_test:
+      - eval_time: 1m45s
+        alertname: OpenPblEdgeReadP95High
+        exp_alerts: []
+  - name: mixed AI and failed attempts cannot be counted as successful ordinary saves
+    interval: 15s
+    input_series:
+      - series: 'openpbl_edge_request_duration_seconds_bucket{job="openpbl",instance="app",method="POST",route="/api/ai-collaboration/document",operation="mixed-ai",outcome="success",le="10"}'
+        values: '0+20x20'
+      - series: 'openpbl_edge_request_duration_seconds_bucket{job="openpbl",instance="app",method="POST",route="/api/ai-collaboration/document",operation="mixed-ai",outcome="success",le="+Inf"}'
+        values: '0+20x20'
+      - series: 'openpbl_edge_request_duration_seconds_count{job="openpbl",instance="app",method="POST",route="/api/ai-collaboration/document",operation="mixed-ai",outcome="success"}'
+        values: '0+20x20'
+      - series: 'openpbl_edge_request_duration_seconds_count{job="openpbl",instance="app",method="POST",route="/api/openmaic/progress",operation="write",outcome="http-error"}'
+        values: '0+20x20'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: OpenPblEdgeWriteP95High
+        exp_alerts: []
+  - name: known save latency above the unchanged two second threshold alerts
+    interval: 15s
+    input_series:
+      - series: 'openpbl_edge_request_duration_seconds_bucket{job="openpbl",instance="app",method="POST",route="/api/openmaic/progress",operation="write",outcome="success",le="2"}'
+        values: '0+0x4'
+      - series: 'openpbl_edge_request_duration_seconds_bucket{job="openpbl",instance="app",method="POST",route="/api/openmaic/progress",operation="write",outcome="success",le="5"}'
+        values: '0+10x4'
+      - series: 'openpbl_edge_request_duration_seconds_bucket{job="openpbl",instance="app",method="POST",route="/api/openmaic/progress",operation="write",outcome="success",le="+Inf"}'
+        values: '0+10x4'
+      - series: 'openpbl_edge_request_duration_seconds_count{job="openpbl",instance="app",method="POST",route="/api/openmaic/progress",operation="write",outcome="success"}'
+        values: '0+10x4'
+    alert_rule_test:
+      - eval_time: 45s
+        alertname: OpenPblEdgeWriteP95High
+        exp_alerts:
+          - exp_labels:
+              job: openpbl
+              instance: app
+              method: POST
+              route: /api/openmaic/progress
+              operation: write
+              severity: warning
+              measurement: nginx-first-bytes-to-response-complete
+            exp_annotations:
+              summary: CoTeach edge save p95 exceeds 2 seconds for /api/openmaic/progress
+              description: Only explicitly classified writes. Mixed AI POST is excluded;202 never means model completion. Includes client upload/send, not browser render.
+  - name: entirely missing telemetry remains unknown
+    interval: 15s
+    input_series: []
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: OpenPblEdgeTelemetryUnknown
+        exp_alerts:
+          - exp_labels: { job: openpbl, severity: warning, measurement: nginx-log-collection }
+            exp_annotations: *unknown_annotations
+  - name: nineteen actual observations are insufficient even when increase extrapolates above twenty
+    interval: 15s
+    input_series:
+      - series: 'openpbl_edge_request_duration_seconds_bucket{job="openpbl",instance="app",method="GET",route="/api/server-providers",operation="read",outcome="success",le="1"}'
+        values: '0 0 _'
+      - series: 'openpbl_edge_request_duration_seconds_bucket{job="openpbl",instance="app",method="GET",route="/api/server-providers",operation="read",outcome="success",le="2"}'
+        values: '100 119 _'
+      - series: 'openpbl_edge_request_duration_seconds_bucket{job="openpbl",instance="app",method="GET",route="/api/server-providers",operation="read",outcome="success",le="+Inf"}'
+        values: '100 119 _'
+      - series: 'openpbl_edge_request_duration_seconds_count{job="openpbl",instance="app",method="GET",route="/api/server-providers",operation="read",outcome="success"}'
+        values: '100 119 _'
+    alert_rule_test:
+      - eval_time: 30s
+        alertname: OpenPblEdgeReadP95High
+        exp_alerts: []
+    promql_expr_test:
+      - eval_time: 30s
+        expr: increase(openpbl_edge_request_duration_seconds_count[1m])
+        exp_samples:
+          - labels: '{job="openpbl",instance="app",method="GET",route="/api/server-providers",operation="read",outcome="success"}'
+            value: 47.5
+  - name: slow counter restart is unknown within the short window despite max-minus-min above twenty
+    interval: 15s
+    input_series:
+      - series: 'openpbl_edge_request_duration_seconds_bucket{job="openpbl",instance="app",method="GET",route="/api/server-providers",operation="read",outcome="success",le="1"}'
+        values: '0+0x4'
+      - series: 'openpbl_edge_request_duration_seconds_bucket{job="openpbl",instance="app",method="GET",route="/api/server-providers",operation="read",outcome="success",le="2"}'
+        values: '100 110 0 20 40'
+      - series: 'openpbl_edge_request_duration_seconds_bucket{job="openpbl",instance="app",method="GET",route="/api/server-providers",operation="read",outcome="success",le="+Inf"}'
+        values: '100 110 0 20 40'
+      - series: 'openpbl_edge_request_duration_seconds_count{job="openpbl",instance="app",method="GET",route="/api/server-providers",operation="read",outcome="success"}'
+        values: '100 110 0 20 40'
+    alert_rule_test:
+      - eval_time: 45s
+        alertname: OpenPblEdgeReadP95High
+        exp_alerts: []
+  - name: first scrape already contains thirty slow completions without a previous zero
+    interval: 15s
+    input_series:
+      - series: 'openpbl_edge_request_duration_seconds_bucket{job="openpbl",instance="app",method="GET",route="/api/server-providers",operation="read",outcome="success",le="1"}'
+        values: '0+0x4'
+      - series: 'openpbl_edge_request_duration_seconds_bucket{job="openpbl",instance="app",method="GET",route="/api/server-providers",operation="read",outcome="success",le="2"}'
+        values: '30+0x4'
+      - series: 'openpbl_edge_request_duration_seconds_bucket{job="openpbl",instance="app",method="GET",route="/api/server-providers",operation="read",outcome="success",le="+Inf"}'
+        values: '30+0x4'
+      - series: 'openpbl_edge_request_duration_seconds_count{job="openpbl",instance="app",method="GET",route="/api/server-providers",operation="read",outcome="success"}'
+        values: '30+0x4'
+      - series: 'openpbl_edge_log_scope_started_seconds{job="openpbl",instance="app"}'
+        values: '0+0x4'
+    alert_rule_test:
+      - eval_time: 15s
+        alertname: OpenPblEdgeReadP95High
+        exp_alerts:
+          - exp_labels: *read_labels
+            exp_annotations: *read_annotations
+  - {"name":"startup absolute fallback does not manufacture twenty observations","interval":"15s","input_series":[{"series":"openpbl_edge_request_duration_seconds_bucket{job=\"openpbl\",instance=\"app\",method=\"GET\",route=\"/api/server-providers\",operation=\"read\",outcome=\"success\",le=\"1\"}","values":"0+0x12"},{"series":"openpbl_edge_request_duration_seconds_bucket{job=\"openpbl\",instance=\"app\",method=\"GET\",route=\"/api/server-providers\",operation=\"read\",outcome=\"success\",le=\"2\"}","values":"19+0x12"},{"series":"openpbl_edge_request_duration_seconds_bucket{job=\"openpbl\",instance=\"app\",method=\"GET\",route=\"/api/server-providers\",operation=\"read\",outcome=\"success\",le=\"+Inf\"}","values":"19+0x12"},{"series":"openpbl_edge_request_duration_seconds_count{job=\"openpbl\",instance=\"app\",method=\"GET\",route=\"/api/server-providers\",operation=\"read\",outcome=\"success\"}","values":"19+0x12"},{"series":"openpbl_edge_log_scope_started_seconds{job=\"openpbl\",instance=\"app\"}","values":"0+0x12"}],"alert_rule_test":[{"eval_time":"30s","alertname":"OpenPblEdgeReadP95High","exp_alerts":[]}]}
+  - {"name":"old lifetime totals are never treated as a new short burst","interval":"15s","input_series":[{"series":"openpbl_edge_request_duration_seconds_bucket{job=\"openpbl\",instance=\"app\",method=\"GET\",route=\"/api/server-providers\",operation=\"read\",outcome=\"success\",le=\"1\"}","values":"0+0x12"},{"series":"openpbl_edge_request_duration_seconds_bucket{job=\"openpbl\",instance=\"app\",method=\"GET\",route=\"/api/server-providers\",operation=\"read\",outcome=\"success\",le=\"2\"}","values":"30+0x12"},{"series":"openpbl_edge_request_duration_seconds_bucket{job=\"openpbl\",instance=\"app\",method=\"GET\",route=\"/api/server-providers\",operation=\"read\",outcome=\"success\",le=\"+Inf\"}","values":"30+0x12"},{"series":"openpbl_edge_request_duration_seconds_count{job=\"openpbl\",instance=\"app\",method=\"GET\",route=\"/api/server-providers\",operation=\"read\",outcome=\"success\"}","values":"30+0x12"},{"series":"openpbl_edge_log_scope_started_seconds{job=\"openpbl\",instance=\"app\"}","values":"0+0x12"}],"alert_rule_test":[{"eval_time":"2m","alertname":"OpenPblEdgeReadP95High","exp_alerts":[]}]}
+  - {"name":"unknown scope cannot certify an absolute first sample","interval":"15s","input_series":[{"series":"openpbl_edge_request_duration_seconds_bucket{job=\"openpbl\",instance=\"app\",method=\"GET\",route=\"/api/server-providers\",operation=\"read\",outcome=\"success\",le=\"1\"}","values":"0+0x12"},{"series":"openpbl_edge_request_duration_seconds_bucket{job=\"openpbl\",instance=\"app\",method=\"GET\",route=\"/api/server-providers\",operation=\"read\",outcome=\"success\",le=\"2\"}","values":"30+0x12"},{"series":"openpbl_edge_request_duration_seconds_bucket{job=\"openpbl\",instance=\"app\",method=\"GET\",route=\"/api/server-providers\",operation=\"read\",outcome=\"success\",le=\"+Inf\"}","values":"30+0x12"},{"series":"openpbl_edge_request_duration_seconds_count{job=\"openpbl\",instance=\"app\",method=\"GET\",route=\"/api/server-providers\",operation=\"read\",outcome=\"success\"}","values":"30+0x12"},{"series":"openpbl_edge_log_scope_started_seconds{job=\"openpbl\",instance=\"app\"}","values":"NaN NaN NaN NaN NaN"}],"alert_rule_test":[{"eval_time":"30s","alertname":"OpenPblEdgeReadP95High","exp_alerts":[]}]}
+  - {"name":"missing scope cannot certify an absolute first sample","interval":"15s","input_series":[{"series":"openpbl_edge_request_duration_seconds_bucket{job=\"openpbl\",instance=\"app\",method=\"GET\",route=\"/api/server-providers\",operation=\"read\",outcome=\"success\",le=\"1\"}","values":"0+0x12"},{"series":"openpbl_edge_request_duration_seconds_bucket{job=\"openpbl\",instance=\"app\",method=\"GET\",route=\"/api/server-providers\",operation=\"read\",outcome=\"success\",le=\"2\"}","values":"30+0x12"},{"series":"openpbl_edge_request_duration_seconds_bucket{job=\"openpbl\",instance=\"app\",method=\"GET\",route=\"/api/server-providers\",operation=\"read\",outcome=\"success\",le=\"+Inf\"}","values":"30+0x12"},{"series":"openpbl_edge_request_duration_seconds_count{job=\"openpbl\",instance=\"app\",method=\"GET\",route=\"/api/server-providers\",operation=\"read\",outcome=\"success\"}","values":"30+0x12"}],"alert_rule_test":[{"eval_time":"30s","alertname":"OpenPblEdgeReadP95High","exp_alerts":[]}]}
+  - {"name":"known idle zero counts do not fabricate zero latency or an alert","interval":"15s","input_series":[{"series":"openpbl_edge_request_duration_seconds_bucket{job=\"openpbl\",instance=\"app\",method=\"GET\",route=\"/api/server-providers\",operation=\"read\",outcome=\"success\",le=\"1\"}","values":"0+0x12"},{"series":"openpbl_edge_request_duration_seconds_bucket{job=\"openpbl\",instance=\"app\",method=\"GET\",route=\"/api/server-providers\",operation=\"read\",outcome=\"success\",le=\"2\"}","values":"0+0x12"},{"series":"openpbl_edge_request_duration_seconds_bucket{job=\"openpbl\",instance=\"app\",method=\"GET\",route=\"/api/server-providers\",operation=\"read\",outcome=\"success\",le=\"+Inf\"}","values":"0+0x12"},{"series":"openpbl_edge_request_duration_seconds_count{job=\"openpbl\",instance=\"app\",method=\"GET\",route=\"/api/server-providers\",operation=\"read\",outcome=\"success\"}","values":"0+0x12"},{"series":"openpbl_edge_log_scope_started_seconds{job=\"openpbl\",instance=\"app\"}","values":"0+0x12"}],"alert_rule_test":[{"eval_time":"30s","alertname":"OpenPblEdgeReadP95High","exp_alerts":[]}]}
+  - {"name":"new lifecycle zero after a restart does not reuse old thirty completions","interval":"15s","input_series":[{"series":"openpbl_edge_request_duration_seconds_bucket{job=\"openpbl\",instance=\"app\",method=\"GET\",route=\"/api/server-providers\",operation=\"read\",outcome=\"success\",le=\"1\"}","values":"0+0x12"},{"series":"openpbl_edge_request_duration_seconds_bucket{job=\"openpbl\",instance=\"app\",method=\"GET\",route=\"/api/server-providers\",operation=\"read\",outcome=\"success\",le=\"2\"}","values":"30 0 0 0 0"},{"series":"openpbl_edge_request_duration_seconds_bucket{job=\"openpbl\",instance=\"app\",method=\"GET\",route=\"/api/server-providers\",operation=\"read\",outcome=\"success\",le=\"+Inf\"}","values":"30 0 0 0 0"},{"series":"openpbl_edge_request_duration_seconds_count{job=\"openpbl\",instance=\"app\",method=\"GET\",route=\"/api/server-providers\",operation=\"read\",outcome=\"success\"}","values":"30 0 0 0 0"},{"series":"openpbl_edge_log_scope_started_seconds{job=\"openpbl\",instance=\"app\"}","values":"0 15 15 15 15"}],"alert_rule_test":[{"eval_time":"30s","alertname":"OpenPblEdgeReadP95High","exp_alerts":[]}]}
+  - {"name":"a real thirty request burst in the new lifecycle can alert after restart","interval":"15s","input_series":[{"series":"openpbl_edge_request_duration_seconds_bucket{job=\"openpbl\",instance=\"app\",method=\"GET\",route=\"/api/server-providers\",operation=\"read\",outcome=\"success\",le=\"1\"}","values":"0+0x12"},{"series":"openpbl_edge_request_duration_seconds_bucket{job=\"openpbl\",instance=\"app\",method=\"GET\",route=\"/api/server-providers\",operation=\"read\",outcome=\"success\",le=\"2\"}","values":"30 0 30 30 30"},{"series":"openpbl_edge_request_duration_seconds_bucket{job=\"openpbl\",instance=\"app\",method=\"GET\",route=\"/api/server-providers\",operation=\"read\",outcome=\"success\",le=\"+Inf\"}","values":"30 0 30 30 30"},{"series":"openpbl_edge_request_duration_seconds_count{job=\"openpbl\",instance=\"app\",method=\"GET\",route=\"/api/server-providers\",operation=\"read\",outcome=\"success\"}","values":"30 0 30 30 30"},{"series":"openpbl_edge_log_scope_started_seconds{job=\"openpbl\",instance=\"app\"}","values":"0 15 15 15 15"}],"alert_rule_test":[{"eval_time":"30s","alertname":"OpenPblEdgeReadP95High","exp_alerts":[{"exp_labels":{"job":"openpbl","instance":"app","method":"GET","route":"/api/server-providers","operation":"read","severity":"warning","measurement":"nginx-first-bytes-to-response-complete"},"exp_annotations":{"summary":"CoTeach edge read p95 exceeds 1 second for /api/server-providers","description":"Trusted Nginx complete-request duration includes pre-Node wait and response send. Known samples only; unknown collection and direct3000 remain separate, not green."}}]}]}
+  - {"name":"first scrape can already contain thirty real slow save completions","interval":"15s","input_series":[{"series":"openpbl_edge_request_duration_seconds_bucket{job=\"openpbl\",instance=\"app\",method=\"POST\",route=\"/api/openmaic/progress\",operation=\"write\",outcome=\"success\",le=\"2\"}","values":"0+0x4"},{"series":"openpbl_edge_request_duration_seconds_bucket{job=\"openpbl\",instance=\"app\",method=\"POST\",route=\"/api/openmaic/progress\",operation=\"write\",outcome=\"success\",le=\"5\"}","values":"30+0x4"},{"series":"openpbl_edge_request_duration_seconds_bucket{job=\"openpbl\",instance=\"app\",method=\"POST\",route=\"/api/openmaic/progress\",operation=\"write\",outcome=\"success\",le=\"+Inf\"}","values":"30+0x4"},{"series":"openpbl_edge_request_duration_seconds_count{job=\"openpbl\",instance=\"app\",method=\"POST\",route=\"/api/openmaic/progress\",operation=\"write\",outcome=\"success\"}","values":"30+0x4"},{"series":"openpbl_edge_log_scope_started_seconds{job=\"openpbl\",instance=\"app\"}","values":"0+0x4"}],"alert_rule_test":[{"eval_time":"15s","alertname":"OpenPblEdgeWriteP95High","exp_alerts":[{"exp_labels":{"job":"openpbl","instance":"app","method":"POST","route":"/api/openmaic/progress","operation":"write","severity":"warning","measurement":"nginx-first-bytes-to-response-complete"},"exp_annotations":{"summary":"CoTeach edge save p95 exceeds 2 seconds for /api/openmaic/progress","description":"Only explicitly classified writes. Mixed AI POST is excluded;202 never means model completion. Includes client upload/send, not browser render."}}]}]}

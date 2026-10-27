@@ -1,0 +1,385 @@
+import { describe, expect, it, vi } from "vitest";
+import { emptyResourcePackageDraft, stagePlanFromResourcePackage, type CourseResourcePackage } from "@/lib/resource-package/types";
+import { createPblTemplateCourse } from "@/lib/platform/pbl-template";
+import { knowledgeLectureBudgetBounds } from "@/lib/classroom/knowledge-lecture-budget";
+import { buildNewSystemAiDurationMessages, normalizeNewSystemAiDurationRecommendation } from "@/lib/classroom/new-system-ai-duration";
+import { buildNewSystemTimingPlan, isNewSystemAiTimingPlan } from "@/lib/classroom/new-system-course";
+import { createClassroomTimingState, deriveClassroomTimingSnapshot, pauseClassroomTiming, reconcileClassroomTimingState, resolveCourseTimingMinutes } from "@/lib/classroom/timing";
+import { canResumeCourseDesignWithPackageState, isSameCourseDesignRequest } from "./resume-policy";
+
+const { modelCall } = vi.hoisted(() => ({ modelCall: vi.fn() }));
+vi.mock("@/lib/llm/client", () => ({ callLLM: modelCall, parseLLMJson: JSON.parse }));
+vi.mock("@/lib/teaching-ai/support-engine", () => ({ generateProjectSkeleton: vi.fn() }));
+
+function confirmedPackage(): CourseResourcePackage {
+  const draft = emptyResourcePackageDraft();
+  const minutes = [10, 80, 35, 10, 5];
+  Object.assign(draft, {
+    courseName: "教师确认的 AI 项目", subject: "信息科技", grade: "七年级",
+    drivingQuestion: "如何用可靠的 AI 判断改善校园？", expectedOutcome: "个人研究报告",
+    learningObjectives: ["解释训练样本的作用", "用测试样本检查结果"], totalMinutes: 140,
+    knowledgePoints: [{ name: "训练与测试", description: "从数据理解分类", subPoints: ["训练样本", "测试样本"] }],
+  });
+  draft.stages = draft.stages.map((stage, index) => ({ ...stage, durationMin: minutes[index]!, requirements: `阶段任务 ${index + 1}` }));
+  return { schemaVersion: 1, id: "package-1", revision: 3, source: { id: "zip-1", fileName: "教学.zip", url: "/private/zip" }, documents: {}, draft, confirmedAt: "2026-09-12T00:00:00Z" };
+}
+
+describe("confirmed resource package generation", () => {
+  it("keeps textbook split mappings when the teacher confirms the knowledge structure", async () => {
+    const { reconcileReviewedKnowledgeScopePlan } = await import("./job-runner");
+    const plan = {
+      schemaVersion: 1 as const,
+      policyVersion: "textbook-evidence-mapping-v2",
+      planningDurationMin: 30,
+      durationRangeMin: 30,
+      durationRangeMax: 30,
+      durationSource: "resource-package" as const,
+      assessmentReserveMin: 4,
+      explanationAndActivityMin: 26,
+      sourcePointCount: 1,
+      targetPointCount: 1,
+      rationale: "按教材体系拆分。",
+      decisions: [{
+        sourceKnowledgePointId: "source-embodied",
+        sourceKnowledgePointName: "具身认知",
+        disposition: "mapped" as const,
+        targetKnowledgePointId: "old-target",
+        targetKnowledgePointIds: ["old-target"],
+        rationale: "教材分为两个角度。",
+      }],
+    };
+    const reconciled = reconcileReviewedKnowledgeScopePlan(plan, [
+      { id: "body", name: "身体参与认知", description: "身体经验", sourceKnowledgePointIds: ["source-embodied"] },
+      { id: "environment", name: "环境互动认知", description: "环境互动", sourceKnowledgePointIds: ["source-embodied"] },
+    ], true);
+    expect(reconciled?.targetPointCount).toBe(2);
+    expect(reconciled?.decisions[0]).toMatchObject({
+      disposition: "mapped",
+      targetKnowledgePointId: "body",
+      targetKnowledgePointIds: ["body", "environment"],
+    });
+  }, 15_000);
+
+  it("releases the design worker only for reviews without a deadline", async () => {
+    const { isPersistentCourseDesignReview } = await import("./job-runner");
+    expect(isPersistentCourseDesignReview(null)).toBe(true);
+    expect(isPersistentCourseDesignReview(20_000)).toBe(false);
+  }, 15_000);
+
+  it("requeues a confirmed capacity decision even when its review heartbeat is fresh", async () => {
+    const { resumeCourseDesignAfterOutlineReview } = await import("./job-runner");
+    const { designGenerationJobs } = await import("@/lib/course-generation/job-storage");
+    const job = {
+      id: "capacity-review",
+      courseId: "course-1",
+      status: "review_available",
+      step: "capacityReview",
+      request: { courseId: "course-1", teacherBrief: "", generationContractVersion: 3 },
+      lastHeartbeatAt: new Date(),
+    };
+    const find = vi.spyOn(designGenerationJobs, "findUnique").mockResolvedValue(job as never);
+    const update = vi.spyOn(designGenerationJobs, "update").mockImplementation(async (input) => ({
+      ...job,
+      ...input.data,
+    }) as never);
+    try {
+      await resumeCourseDesignAfterOutlineReview("course-1", {
+        reviewKind: "capacity",
+        actorId: "teacher-1",
+      });
+      expect(update).toHaveBeenCalledWith(expect.objectContaining({
+        where: { id: "capacity-review" },
+        data: expect.objectContaining({
+          status: "queued",
+          reviewStatus: "approved",
+          request: expect.objectContaining({
+            capacityDecisionAccepted: true,
+            resumeReviewKind: "capacity",
+            reviewActorId: "teacher-1",
+          }),
+        }),
+      }));
+    } finally {
+      find.mockRestore();
+      update.mockRestore();
+    }
+  });
+
+  it("persists the chosen test section and requeues a paused outline task", async () => {
+    const { resumeCourseDesignAfterOutlineReview, TestLessonSelectionError } = await import("./job-runner");
+    const { designGenerationJobs } = await import("@/lib/course-generation/job-storage");
+    const courseStore = await import("@/lib/session/server-store");
+    const job = {
+      id: "test-outline-review",
+      courseId: "course-1",
+      status: "paused",
+      step: "outlineReview",
+      executionId: null,
+      request: { courseId: "course-1", teacherBrief: "", generationScope: "test-lesson", generationContractVersion: 3 },
+      lastHeartbeatAt: new Date(),
+    };
+    const sceneOutlines = [
+      { id: "slide-a", title: "讲解", type: "slide", lectureSectionId: "section-a", targetDurationSec: 120 },
+      { id: "quiz-a", title: "检测", type: "quiz", lectureSectionId: "section-a", targetDurationSec: 60 },
+    ];
+    const find = vi.spyOn(designGenerationJobs, "findUnique").mockResolvedValue(job as never);
+    const update = vi.spyOn(designGenerationJobs, "update").mockImplementation(async (input) => ({ ...job, ...input.data }) as never);
+    const loadCourse = vi.spyOn(courseStore, "getCourse").mockResolvedValue(createPblTemplateCourse("course-1"));
+    const saveCourse = vi.spyOn(courseStore, "updateCourse").mockResolvedValue(undefined as never);
+    try {
+      await expect(resumeCourseDesignAfterOutlineReview("course-1", {
+        reviewKind: "outline", sceneOutlines: sceneOutlines as never, testSectionId: "missing",
+      })).rejects.toBeInstanceOf(TestLessonSelectionError);
+      expect(update).not.toHaveBeenCalled();
+      expect(loadCourse).not.toHaveBeenCalled();
+
+      await resumeCourseDesignAfterOutlineReview("course-1", {
+        reviewKind: "outline", sceneOutlines: sceneOutlines as never, testSectionId: "section-a", actorId: "teacher-1",
+      });
+      expect(loadCourse).toHaveBeenCalledExactlyOnceWith("course-1");
+      expect(update).toHaveBeenCalledWith(expect.objectContaining({
+        where: { id: "test-outline-review" },
+        data: expect.objectContaining({
+          status: "queued",
+          reviewStatus: "approved",
+          request: expect.objectContaining({ testSectionId: "section-a", reviewActorId: "teacher-1" }),
+        }),
+      }));
+    } finally {
+      find.mockRestore();
+      update.mockRestore();
+      loadCourse.mockRestore();
+      saveCourse.mockRestore();
+    }
+  });
+
+  it("continues a completed test lesson when the course retains the full outline and split pages", async () => {
+    const { promoteTestLessonToFullCourse } = await import("./job-runner");
+    const { contentGenerationJobs, designGenerationJobs, resourcePackageJobs } = await import("@/lib/course-generation/job-storage");
+    const courseStore = await import("@/lib/session/server-store");
+    const resourcePackage = confirmedPackage();
+    const fullOutlines = [
+      { id: "s1-page", title: "讲解", type: "slide", lectureSectionId: "s1", targetDurationSec: 120 },
+      { id: "s1-quiz", title: "检测", type: "quiz", lectureSectionId: "s1", targetDurationSec: 60 },
+      { id: "s2-page", title: "其余讲解", type: "slide", lectureSectionId: "s2", targetDurationSec: 120 },
+      { id: "s2-quiz", title: "其余检测", type: "quiz", lectureSectionId: "s2", targetDurationSec: 60 },
+    ];
+    const acceptedPages = [
+      { ...fullOutlines[0]!, targetDurationSec: 60, sourcePageIds: ["s1-page"], sectionPlanVersion: "plan-v2" },
+      { ...fullOutlines[0]!, id: "s1-page--capacity-2", title: "后续讲解", targetDurationSec: 60,
+        sourcePageIds: ["s1-page"], sectionPlanVersion: "plan-v2" },
+      fullOutlines[1]!,
+    ];
+    const testLesson = { sectionId: "s1", sectionTitle: "第一节", sceneOutlineIds: ["s1-page", "s1-quiz"], durationSeconds: 180 };
+    const course = createPblTemplateCourse("course-1");
+    Object.assign(course.content, {
+      resourcePackage,
+      _openmaicSceneOutlines: [...acceptedPages, { ...fullOutlines[2], title: "非本次验收页面" }, fullOutlines[3]],
+      classroomGenerationRun: { scope: "test-lesson", status: "completed", testLesson,
+        generatedOutlineIds: acceptedPages.map((page) => page.id), fullOutlineCount: 4 },
+    });
+    const designJob = { id: "design-1", courseId: course.id, status: "completed",
+      request: { courseId: course.id, teacherBrief: "", generationScope: "test-lesson", resourcePackage,
+        generationModelString: "original:model", generationContractVersion: 3 } };
+    const contentJob = { id: "content-1", courseId: course.id, version: 12, status: "completed",
+      request: { courseId: course.id, generationScope: "test-lesson", sceneOutlines: fullOutlines, fullSceneCount: 4, testLesson } };
+    const spies = [
+      vi.spyOn(designGenerationJobs, "findUnique").mockResolvedValue(designJob as never),
+      vi.spyOn(resourcePackageJobs, "findUnique").mockResolvedValue({ status: "ready" } as never),
+      vi.spyOn(courseStore, "getCourse").mockResolvedValue(course),
+      vi.spyOn(contentGenerationJobs, "findUnique").mockResolvedValueOnce(contentJob as never)
+        .mockResolvedValueOnce(contentJob as never).mockResolvedValue({ ...contentJob, status: "queued" } as never),
+      vi.spyOn(designGenerationJobs, "update").mockResolvedValue(designJob as never),
+    ];
+    const save = vi.spyOn(courseStore, "updateCourse").mockResolvedValue(undefined as never);
+    const enqueue = vi.spyOn(contentGenerationJobs, "replace").mockResolvedValue({ ...contentJob, status: "queued" } as never);
+    try {
+      const result = await promoteTestLessonToFullCourse(course.id);
+      expect(result.contentJob.status).toBe("queued");
+      expect(enqueue).toHaveBeenCalledOnce();
+      expect(enqueue).toHaveBeenCalledWith(expect.objectContaining({
+        where: { id: "content-1", version: 12, status: "completed" },
+        checkpointPolicy: "prepared-outlines",
+        data: expect.objectContaining({ request: expect.objectContaining({
+          generationScope: "full-course", fullSceneCount: 4,
+          sceneOutlines: [...acceptedPages, ...fullOutlines.slice(2)].map((page) => expect.objectContaining(page)),
+        }) }),
+      }));
+      const restored = save.mock.calls[0]![1](course);
+      expect(restored.content._openmaicSceneOutlines).toEqual([...acceptedPages, ...fullOutlines.slice(2)]);
+      expect(modelCall).not.toHaveBeenCalled();
+    } finally {
+      [...spies, save, enqueue].forEach((spy) => spy.mockRestore());
+    }
+  }, 15_000);
+
+  it("preserves teacher facts and required subpoints without asking the model to infer them", async () => {
+    const { applyResourcePackageGenerationInput, inferCourseSeed } = await import("./job-runner");
+    const resourcePackage = confirmedPackage();
+    resourcePackage.draft.teachingHighlights = ["训练样本的作用是教学重点。"];
+    resourcePackage.draft.teachingDifficulties = ["学生容易混淆训练样本与测试样本。"];
+    const original = createPblTemplateCourse("course-1", { name: "旧课程", hours: 2 });
+    const course = applyResourcePackageGenerationInput(original, resourcePackage, "用校园案例讲解，并给学生比较时间。");
+    const seed = await inferCourseSeed(course, { courseId: course.id, teacherBrief: "可选补充", resourcePackage }, new AbortController().signal);
+    expect(seed).toMatchObject({ name: resourcePackage.draft.courseName, grade: "七年级", hours: 140 / 60, learningObjectives: resourcePackage.draft.learningObjectives });
+    expect(modelCall).not.toHaveBeenCalled();
+    expect(course.content.teacherRequiredKnowledgePoints).toEqual([]);
+    expect(course.content.knowledgeGroups?.[0]?.knowledgePointIds).toHaveLength(2);
+    expect(course.drivingQuestion).toBe(resourcePackage.draft.drivingQuestion);
+    expect(course.pblConfig?.projectMode).toBe("personal");
+    expect(course.content.stagePlan?.totalMinutes).toBe(140);
+    expect(course.content.teachingRequirements?.items.map((item) => item.kind)).toEqual(expect.arrayContaining([
+      "teacher-directive", "highlight", "difficulty", "stage-requirement",
+    ]));
+  }, 15_000);
+
+  it("keeps the approved nominal minutes while allowing necessary teaching to overrun", () => {
+    const stagePlan = stagePlanFromResourcePackage(confirmedPackage().draft);
+    expect(knowledgeLectureBudgetBounds(2, stagePlan)).toMatchObject({ courseMinutes: 140, minMinutes: 80, maxMinutes: 80 });
+    const input = { course: { name: "AI", subject: "科技", grade: "七年级", hours: 140 / 60, summary: "" }, stagePlan, knowledgePoints: [{ id: "kp-1", name: "训练样本", description: "作用" }, { id: "kp-2", name: "测试样本", description: "检验" }], teacherBrief: "", generationMode: "standard" as const };
+    const messages = buildNewSystemAiDurationMessages(input);
+    expect(messages[0].content).toContain("第二阶段知识讲授 80 分钟");
+    expect(messages[0].content).toContain("实际讲清必要内容可以超过预计时长");
+    expect(messages[0].content).not.toContain("20%–40%");
+    const recommendation = normalizeNewSystemAiDurationRecommendation({ durationMin: 20, rationale: "按教案分配", teachingClusterBudgets: [{ clusterId: "teaching-cluster-1", knowledgePointIds: ["kp-1"], durationMin: 1 }, { clusterId: "teaching-cluster-2", knowledgePointIds: ["kp-2"], durationMin: 3 }] }, input);
+    expect(recommendation.durationMin).toBe(80);
+    expect(recommendation.teachingClusterBudgets.map((item) => item.durationMin)).toEqual([20, 60]);
+    expect(isNewSystemAiTimingPlan(buildNewSystemTimingPlan(80), 140 / 60, stagePlan)).toBe(true);
+    expect(isNewSystemAiTimingPlan(buildNewSystemTimingPlan(40), 140 / 60, stagePlan)).toBe(false);
+  });
+
+  it("uses all five package durations for the live clock and preserves an active session", () => {
+    const course = createPblTemplateCourse("course-1");
+    course.content.stagePlan = stagePlanFromResourcePackage(confirmedPackage().draft);
+    course.content.moduleTimingPlan = buildNewSystemTimingPlan(80);
+    const input = { stages: course.stages, totalMinutes: resolveCourseTimingMinutes(course), stagePlan: course.content.stagePlan, moduleTimingPlan: course.content.moduleTimingPlan };
+    const clock = createClassroomTimingState({ ...input, now: "2026-09-12T00:00:00Z" });
+    expect(clock.stages.map((stage) => stage.basePlannedSec)).toEqual([600, 4800, 2100, 600, 300]);
+    expect(deriveClassroomTimingSnapshot(clock, "2026-09-12T00:01:00Z")).toMatchObject({ coursePlannedSec: 8400, courseElapsedSec: 60 });
+    const paused = pauseClassroomTiming(clock, "2026-09-12T00:01:00Z");
+    expect(reconcileClassroomTimingState({ ...input, state: paused })).toBe(paused);
+    expect(deriveClassroomTimingSnapshot(paused, "2026-09-12T00:30:00Z").courseElapsedSec).toBe(60);
+  });
+
+  it("invalidates a previous generation after package revision or supplementary answers change", () => {
+    const request = { courseId: "course-1", teacherBrief: "", resourcePackage: confirmedPackage(), supplementalAnswers: { brief: "多举校园例子" } };
+    expect(isSameCourseDesignRequest(request, structuredClone(request))).toBe(true);
+    expect(isSameCourseDesignRequest(request, { ...request, resourcePackage: { ...request.resourcePackage, revision: 4 } })).toBe(false);
+    expect(isSameCourseDesignRequest(request, { ...request, supplementalAnswers: { brief: "使用生活例子" } })).toBe(false);
+    expect(isSameCourseDesignRequest(request, { courseId: request.courseId, teacherBrief: "" })).toBe(false);
+  });
+
+  it("does not automatically revive a legacy failed task while the first package is still parsing", async () => {
+    const { resumeRecoverableCourseDesignJob } = await import("./job-runner");
+    const { designGenerationJobs, resourcePackageJobs } = await import("@/lib/course-generation/job-storage");
+    const legacy = { courseId: "course-1", teacherBrief: "旧课程要求" };
+    const job = { id: "old-design", courseId: "course-1", status: "failed", error: "生成的数据结构不完整", request: legacy };
+    const update = vi.spyOn(designGenerationJobs, "updateMany");
+    vi.spyOn(designGenerationJobs, "findUnique").mockResolvedValue(job as never);
+    vi.spyOn(resourcePackageJobs, "findUnique").mockResolvedValue({ id: "new-import", status: "running" } as never);
+    try {
+      expect(await resumeRecoverableCourseDesignJob("course-1")).toEqual(job);
+      expect(update).not.toHaveBeenCalled();
+      expect(canResumeCourseDesignWithPackageState(legacy, null)).toBe(true);
+      expect(canResumeCourseDesignWithPackageState({ ...legacy, resourcePackage: confirmedPackage() }, { status: "running" })).toBe(false);
+      expect(canResumeCourseDesignWithPackageState({ ...legacy, resourcePackage: confirmedPackage() }, { status: "ready" })).toBe(true);
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("keeps the failed first draft without an automatic whole-job infrastructure replay", async () => {
+    const { resumeRecoverableCourseDesignJob } = await import("./job-runner");
+    const { designGenerationJobs, resourcePackageJobs } = await import("@/lib/course-generation/job-storage");
+    const job = {
+      id: "recoverable-design",
+      courseId: "course-1",
+      status: "failed",
+      version: 7,
+      stepIndex: 1,
+      error: "network connection timed out",
+      request: { courseId: "course-1", teacherBrief: "保留已有阶段", transientRecoveryCount: 1 },
+    };
+    const find = vi.spyOn(designGenerationJobs, "findUnique")
+      .mockResolvedValueOnce(job as never)
+      .mockResolvedValueOnce({ ...job, status: "queued" } as never);
+    const replace = vi.spyOn(designGenerationJobs, "replace").mockResolvedValue({ ...job, status: "queued" } as never);
+    const packageFind = vi.spyOn(resourcePackageJobs, "findUnique").mockResolvedValue(null);
+    try {
+      expect(await resumeRecoverableCourseDesignJob("course-1")).toEqual(job);
+      expect(replace).not.toHaveBeenCalled();
+    } finally {
+      find.mockRestore();
+      replace.mockRestore();
+      packageFind.mockRestore();
+    }
+  });
+
+  it("keeps confirmed audience and supplementary instructions before long DOCX evidence in real generation context", async () => {
+    const { buildCourseTeachingSourceContext } = await import("./job-runner");
+    const resourcePackage = confirmedPackage();
+    resourcePackage.draft.grade = "小学五年级（教师已修正）";
+    resourcePackage.draft.knowledgePoints[0]!.taskAssociation = "把训练样本写入最终研究报告";
+    resourcePackage.draft.knowledgePoints[0]!.source = {
+      documentRole: "knowledge", locator: "第 1 节",
+      quote: "内容：训练样本用于学习规律。\n任务关联：把训练样本写入最终研究报告",
+    };
+    const context = buildCourseTeachingSourceContext(resourcePackage, "使用校园生活例证", [{
+      id: "docx-1", fileName: "原始教案.docx", mimeType: "application/docx", content: `原始正文开始${"正文".repeat(40_000)}`,
+    }]);
+    const boundedReviewContext = context.slice(0, 60_000);
+    expect(boundedReviewContext).toContain(`"courseName":"${resourcePackage.draft.courseName}"`);
+    expect(boundedReviewContext).toContain('"grade":"小学五年级（教师已修正）"');
+    expect(boundedReviewContext).toContain('"durationMin":80');
+    expect(boundedReviewContext).toContain('"optionalFinalTaskContext"');
+    expect(boundedReviewContext).toContain('"suggestion":"把训练样本写入最终研究报告"');
+    expect(boundedReviewContext).not.toContain('"taskAssociation":');
+    expect(boundedReviewContext).not.toContain("任务关联：把训练样本写入最终研究报告");
+    expect(boundedReviewContext).toContain("不得据此要求每个知识点、页面、活动或小测都连接最终成果");
+    expect(context.indexOf("教师已确认")).toBeLessThan(context.indexOf("教师补充要求：使用校园生活例证"));
+    expect(context.indexOf("教师补充要求：使用校园生活例证")).toBeLessThan(context.indexOf("原始正文开始"));
+    expect(boundedReviewContext).toContain("教师补充要求：使用校园生活例证");
+  });
+
+  it("keeps management status and raw package documents outside teaching context without deleting normal subject language", async () => {
+    const { buildCourseTeachingSourceContext } = await import("./job-runner");
+    const resourcePackage = confirmedPackage();
+    resourcePackage.draft.knowledgePoints[0]!.evidenceStatus = "PARTIAL";
+    resourcePackage.draft.knowledgePoints[0]!.evidenceGap = "缺少直接证据";
+    resourcePackage.draft.knowledgePoints[0]!.source = { documentRole: "knowledge", locator: "第 2 节", quote: "训练样本用于学习规律。" };
+    resourcePackage.draft.knowledgeEvidenceSummary = { overallStatus: "PARTIAL", gaps: ["待审核"] };
+    resourcePackage.documents.knowledge = { id: "package-knowledge", fileName: "知识点.md", url: "/private/knowledge", format: "markdown" };
+    resourcePackage.planningIssues = [{
+      id: "issue-1", kind: "evidence", severity: "warning", requiresAcknowledgement: true,
+      summary: "证据不完整", detail: "PARTIAL", suggestion: "教师复核", evidence: [],
+    }];
+    const context = buildCourseTeachingSourceContext(resourcePackage, "保留数学术语", [
+      { id: "package-knowledge", fileName: "知识点.md", mimeType: "text/markdown", content: "# 内部审查\n**PARTIAL**\n证据状态：PARTIAL" },
+      { id: "package-knowledge:part-2", fileName: "知识点.md（第2段）", mimeType: "text/markdown", content: "原始包尾部管理信息 PARTIAL" },
+      { id: "teacher-extra", fileName: "补充资料.md", mimeType: "text/markdown", content: "偏导数的英文是 partial derivative。讨论证据状态随实验条件变化的科学含义。\nevidenceStatus: PARTIAL\n用于课堂的可靠例子。" },
+    ]);
+    expect(context).not.toContain("evidenceStatus");
+    expect(context).not.toContain("evidenceGap");
+    expect(context).not.toContain("knowledgeEvidenceSummary");
+    expect(context).not.toContain("planningIssues");
+    expect(context).not.toContain("**PARTIAL**");
+    expect(context).not.toContain("内部审查");
+    expect(context).not.toContain("原始包尾部管理信息");
+    expect(context).toContain("partial derivative");
+    expect(context).toContain("讨论证据状态随实验条件变化的科学含义");
+    expect(context).toContain("用于课堂的可靠例子");
+    expect(context).toContain("训练样本用于学习规律");
+    expect(context).toContain("第 2 节");
+  });
+
+  it("requires actual teaching coverage instead of quiz-only coverage and rejects duplicate pages", async () => {
+    const { assertAiOutlineKnowledgeCoverage } = await import("./job-runner");
+    const points = [{ id: "kp-1", name: "训练样本", description: "作用" }, { id: "kp-2", name: "测试样本", description: "检验" }];
+    const slide = { id: "slide-1", type: "slide" as const, title: "训练样本", description: "比较带标签样本的作用", keyPoints: ["训练样本"], knowledgePointIds: ["kp-1"], order: 0 };
+    const quiz = { ...slide, id: "quiz-1", type: "quiz" as const, knowledgePointIds: ["kp-2"], order: 1 };
+    expect(() => assertAiOutlineKnowledgeCoverage([slide, quiz], points)).toThrow("测试样本");
+    const complete = { ...slide, knowledgePointIds: ["kp-1", "kp-2"] };
+    expect(() => assertAiOutlineKnowledgeCoverage([complete], points)).not.toThrow();
+    expect(() => assertAiOutlineKnowledgeCoverage([complete, { ...complete, id: "duplicate" }], points)).toThrow("重复教学页面");
+  });
+});

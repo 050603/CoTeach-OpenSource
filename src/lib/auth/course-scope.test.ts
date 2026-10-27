@@ -1,0 +1,64 @@
+import { describe, expect, it } from "vitest";
+import type { AuthClaims, StudentClaims } from "@/lib/auth/session";
+import type { Course } from "@/lib/session/types";
+import { scopeCourseForClaims } from "./course-scope";
+
+describe("scopeCourseForClaims", () => {
+  it("keeps learning-time statistics private to each student and preserves the teacher's complete view", () => {
+    const timing = {
+      "student-a": { effectiveDurationMs: 10000, expectedDurationMs: 60000, hasEvidence: true },
+      "student-b": { effectiveDurationMs: 20000, expectedDurationMs: 60000, hasEvidence: true },
+    };
+    const course = { id: "course", stages: [], students: [], content: {}, aiLearningTimingByStudent: timing } as unknown as Course;
+    for (const studentId of Object.keys(timing)) {
+      const result = scopeCourseForClaims(course, { role: "student", sub: studentId } as AuthClaims);
+      expect(Object.keys(result.aiLearningTimingByStudent ?? {})).toEqual([studentId]);
+      expect(result.aiLearningTimingByStudent?.[studentId]).toEqual(timing[studentId as keyof typeof timing]);
+    }
+    expect(scopeCourseForClaims(course, { role: "teacher", sub: "teacher" } as AuthClaims).aiLearningTimingByStudent).toEqual(timing);
+    expect(scopeCourseForClaims(course, { role: "student", sub: "absent" } as AuthClaims).aiLearningTimingByStudent).toEqual({});
+    expect(scopeCourseForClaims(course, { role: "student" } as AuthClaims).aiLearningTimingByStudent).toEqual({});
+    expect(course.aiLearningTimingByStudent).toEqual(timing);
+  });
+
+  it("removes private package authoring data while retaining classroom stage requirements", () => {
+    const course = { id: "course", stages: [], students: [], content: { resourcePackage: { secret: "teacher source" }, stagePlan: { totalMinutes: 135 } } } as unknown as Course;
+    const scoped = scopeCourseForClaims(course, { role: "student", sub: "student" } as StudentClaims);
+    expect(scoped.content).not.toHaveProperty("resourcePackage");
+    expect(scoped.content.stagePlan?.totalMinutes).toBe(135);
+    expect(course.content).toHaveProperty("resourcePackage");
+  });
+  it("does not expose another student's knowledge-lecture answers", () => {
+    const course = {
+      id: "course-1",
+      stages: [{ key: "ai-learning", label: "AI 授知", description: "旧课程" }],
+      students: [{ id: "student-1", name: "甲" }, { id: "student-2", name: "乙" }],
+      aiLearningProgress: {
+        "student-1": { studentId: "student-1", knowledgeLectureAttempts: [{ id: "attempt-1" }] },
+        "student-2": { studentId: "student-2", knowledgeLectureAttempts: [{ id: "attempt-2" }] },
+      },
+    } as unknown as Course;
+    const claims = {
+      role: "student",
+      courseId: "course-1",
+      studentId: "stale-legacy-id",
+      studentName: "甲",
+      sub: "student-1",
+      sv: 1,
+    } as StudentClaims;
+
+    const scoped = scopeCourseForClaims(course, claims);
+    expect(Object.keys(scoped.aiLearningProgress ?? {})).toEqual(["student-1"]);
+    expect(scoped.aiLearningProgress?.["student-2"]).toBeUndefined();
+    expect(scoped.stages[0]?.label).toBe("知识讲授");
+  });
+  it("keeps student AI research events scoped and hides teacher-only events", () => {
+    const event = { id: "own", courseId: "course", studentId: "student", stageKey: "make", source: "sidebar", eventType: "request", actorRole: "student", content: "我的问题", createdAt: "2026-09-01T00:00:00Z" } as const;
+    const course = {
+      id: "course", stages: [], students: [], content: {},
+      aiInteractionEvents: [event, { ...event, id: "private", payload: { visibility: "teacher-only" } }, { ...event, id: "model-output", actorRole: "system", payload: { kind: "model-output" } }, { ...event, id: "other", studentId: "other" }],
+    } as unknown as Course;
+    expect(scopeCourseForClaims(course, { role: "student", sub: "student" } as StudentClaims).aiInteractionEvents?.map(item => item.id)).toEqual(["own"]);
+    expect(scopeCourseForClaims(course, { role: "teacher", sub: "teacher" } as AuthClaims).aiInteractionEvents).toHaveLength(4);
+  });
+});

@@ -1,0 +1,74 @@
+import type { CourseQualityIssue } from './types';
+import type { CourseResourceIssue } from '@/lib/course-generation/resource-audit-server';
+import type { Course } from '@/lib/session/types';
+
+export const COURSE_RENDER_REVIEW_POLICY_VERSION = 'render-visible-content-v2';
+
+/** A browser measurement is evidence for teacher review, never a server validation. */
+export type CourseRenderPageReview = {
+  sceneId: string;
+  checkedAt: string;
+  status: 'completed' | 'failed';
+  issues: CourseQualityIssue[];
+};
+
+export type CourseRenderReview = {
+  schemaVersion: 1;
+  reviewPolicyVersion?: string;
+  runId?: string;
+  signature: string;
+  classroomId: string;
+  status: 'pending' | 'running' | 'completed';
+  pages: CourseRenderPageReview[];
+  updatedAt: string;
+};
+
+export type CourseTeacherReview = {
+  schemaVersion: 1;
+  courseId: string;
+  classroomId: string;
+  signature: string;
+  teacherId: string;
+  confirmedAt: string;
+  acceptedIssueIds: string[];
+  manualContentReview?: boolean;
+  /** Authenticates this server-issued confirmation when a template is copied. */
+  seal: string;
+};
+
+/** Presentation hint only; the server verifies the receipt's HMAC, snapshot and classroom before opening a session. */
+export function hasCourseAudioPublicationIdentity(course: Pick<Course, 'id' | 'content' | 'aiLearningClassroomId' | 'platformContext'>): boolean {
+  const publication = course.content.teachingRevisionState?.audioPublication;
+  const review = course.content.teacherReview;
+  // A teaching run keeps the published template's receipt, while its own ID
+  // identifies the classroom instance rather than the authored course.
+  const templateId = course.platformContext?.templateId ?? course.id;
+  return Boolean(publication && review && publication.schemaVersion === 1
+    && publication.kind === 'course-audio-publication' && publication.courseId === templateId
+    && publication.classroomId === (course.aiLearningClassroomId || course.content._openmaicClassroomId)
+    && publication.teacherId === review.teacherId && publication.teacherReviewSeal === review.seal
+    && /^[a-f0-9]{64}$/.test(publication.seal));
+}
+
+export function unresolvedHardIssues(issues: readonly CourseQualityIssue[]): CourseQualityIssue[] {
+  return issues.filter((issue) => issue.severity === 'error'
+    && issue.status !== 'resolved'
+    && issue.blocking === true);
+}
+
+export function reviewableIssues(issues: readonly CourseQualityIssue[]): CourseQualityIssue[] {
+  return issues.filter((issue) => issue.status !== 'resolved'
+    && !(issue.severity === 'error' && issue.blocking === true));
+}
+
+/** These checks describe unsolved quality differences in an existing draft,
+ * not absent runtime content. Both client and server keep them advisory. */
+export function isAdvisoryCourseReadinessCheck(id: string): boolean {
+  return ['timing', 'ai-outline', 'design-workspace-freshness'].includes(id);
+}
+
+/** Publication and its preview use the same resource integrity requirements. */
+export function isTechnicalCourseResourceIssue(issue: Pick<CourseResourceIssue, 'id' | 'type'>): boolean {
+  if (issue.id.startsWith('media:source-image:') || issue.id.startsWith('content:source-sequence:')) return false;
+  return !['source-consistency', 'teaching-tool', 'speech-sync', 'adaptive-resource'].includes(issue.type);
+}

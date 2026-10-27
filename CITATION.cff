@@ -1,0 +1,13 @@
+cff-version: 1.2.0
+message: "如在研究或教学工作中使用 CoTeach，请引用此软件版本。"
+type: software
+title: "CoTeach：AI 协同教学平台"
+authors:
+  - family-names: "李"
+    given-names: "科骏"
+    affiliation: "北京师范大学"
+repository-code: "https://github.com/050603/CoTeach-OpenSource"
+url: "https://github.com/050603/CoTeach-OpenSource"
+license: Apache-2.0
+version: 0.1.0
+date-released: 2026-10-27

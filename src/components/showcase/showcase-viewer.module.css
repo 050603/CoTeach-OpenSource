@@ -1,0 +1,15 @@
+.presentationDocument [data-document-preview] [data-slate-editor] {
+  font-size: var(--showcase-font-size) !important;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+.presentationDocument [data-document-preview] h1 { font-size: 1.7em; }
+.presentationDocument [data-document-preview] h2 { font-size: 1.4em; }
+.presentationDocument [data-document-preview] h3 { font-size: 1.2em; }
+.presentationDocument [data-document-preview] [data-slate-editor] > :first-child { margin-top: 0; }
+.presentationDocument [data-document-preview] img { max-width: 100%; height: auto; }
+.presentationDocument [data-document-preview] table { max-width: 100%; width: 100%; table-layout: fixed; }
+.presentationDocument [data-document-preview] td, .presentationDocument [data-document-preview] th { overflow-wrap: anywhere; }
+@media (max-width: 600px) {
+  .presentationDocument [data-document-preview] [data-slate-editor] { font-size: var(--showcase-compact-font-size) !important; }
+}

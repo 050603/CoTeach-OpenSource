@@ -1,0 +1,117 @@
+# CoTeach — full local/dev stack.
+#
+# Brings up the Next.js app, PostgreSQL, and Redis together with healthchecks
+# so `docker compose up` gives you a working environment. Production uses the
+# independent `docker-compose.prod.yml`; do not stack it on this development
+# Compose file.
+#
+# Required environment (read from `.env.local` next to this file):
+#   - POSTGRES_PASSWORD  — password for the `openpbl` Postgres role.
+#   - DATABASE_URL       — `postgresql://openpbl:${POSTGRES_PASSWORD}@postgres:5432/openpbl`
+#   - REDIS_URL          — `redis://redis:6379`
+#   - JWT_SECRET         — long random string (use `openssl rand -base64 48`).
+#   - PUBLIC_BASE_URL    — e.g. `http://localhost:3000` for local dev.
+#   - WEBSOCKET_PORT     — defaults to 3001.
+#
+# Secrets must NOT be committed. The `.env.local` file is gitignored.
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: coteach-app:latest
+    ports:
+      - "127.0.0.1:3000:3000"
+      # WebSocket server (Stage 4 realtime). Exposed for direct local testing;
+      # in production Nginx proxies /ws to this port (see docker-compose.prod.yml).
+      - "127.0.0.1:3001:3001"
+    env_file:
+      - .env.local
+    environment:
+      # Compose interpolates ${POSTGRES_PASSWORD} from the shell or .env file.
+      # We pin DATABASE_URL/REDIS_URL here so the app talks to the sibling
+      # services by their compose DNS names, regardless of what .env.local says.
+      DATABASE_URL: postgresql://openpbl:${POSTGRES_PASSWORD}@postgres:5432/openpbl
+      REDIS_URL: redis://redis:6379
+      ENABLE_WEBSOCKET: "true"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # Graceful shutdown budget. The app's SIGTERM handler (src/instrumentation.ts)
+    # drains connections within ~20s; 30s gives headroom for slow clients.
+    stop_grace_period: 30s
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "10"
+    volumes:
+      # Persistent upload storage. The Dockerfile creates `.openpbl-data/uploads`
+      # owned by nextjs (uid 1001); this volume preserves uploads across
+      # container rebuilds.
+      - .openpbl-data:/app/.openpbl-data
+      - classrooms:/app/data/classrooms
+
+  postgres:
+    build:
+      context: ./deploy/postgres
+      dockerfile: Dockerfile
+      network: host
+      args:
+        PGVECTOR_BASE_IMAGE: ${OPENPBL_PGVECTOR_BASE_IMAGE:-pgvector/pgvector:0.8.6-pg16@sha256:ccc6e83d6e35e931dc7c5def2022729d5a6c370318d099181995567ff1fb4d6b}
+    image: openpbl-postgres:16-pgvector0.8.6
+    environment:
+      POSTGRES_DB: openpbl
+      POSTGRES_USER: openpbl
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    # Expose 5432 to host so the local Next.js dev server (running outside
+    # Docker) can connect via DATABASE_URL=...@localhost:5432/openpbl.
+    # Bind only to loopback; production uses docker-compose.prod.yml.
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U openpbl -d openpbl"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  redis:
+    image: redis:7-alpine
+    # Expose Redis for a local Next.js process running outside Compose.
+    ports:
+      - "127.0.0.1:6379:6379"
+    # Disable Redis persistence — the cache is ephemeral by design and we
+    # don't want to lose memory to AOF/RDB writes. Re-enable if you start
+    # using Redis for durable state.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+volumes:
+  pgdata:
+    name: openpbl-pgdata
+  classrooms:
+    name: openpbl-classrooms

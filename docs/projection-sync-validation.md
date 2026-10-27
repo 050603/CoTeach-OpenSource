@@ -1,0 +1,32 @@
+# 课堂投屏同步验收
+
+[测量脚本](../scripts/measure-projection-sync.mjs)通过 `pnpm test:projection-sync` 使用一个教师浏览器上下文和 30 个相互独立的学生上下文，持续切换已加载资源的页码、滚动位置、视频播放状态、进度和倍速。每次操作从教师请求发出开始计时，到各学生页面完成对应投屏版本的 React 渲染为止。
+
+## 准备与运行
+
+本检查会用教师身份改变目标课堂的投屏状态，应使用专门的测试课堂和测试账号。需要可用的 Playwright Chromium、已启动的应用与正常鉴权会话；界面适配和隔离联动检查见[多终端验证](responsive-layout-checks.md)。
+
+运行前准备一个正在授课、当前阶段包含 PDF/PPT 或视频资源的测试课堂，并分别保存教师和 30 名学生的 Playwright `storageState`。学生目录中的每个 JSON 必须属于不同账号；脚本会通过 `/api/auth/me` 检查并拒绝重复身份。
+
+```bash
+PROJECTION_COURSE_ID='<课堂 ID>' \
+PROJECTION_TEACHER_STORAGE_STATE='/absolute/path/teacher.json' \
+PROJECTION_STUDENT_STORAGE_DIR='/absolute/path/students' \
+pnpm test:projection-sync
+```
+
+登录态文件保存在已忽略的本机目录，不提交到 Git。`PROJECTION_COURSE_ID` 使用实际授课场次的课堂 ID，不能填写课程模板或教学班 ID。
+
+## 参数与判定
+
+默认参数为 30 名学生、运行 1800 秒、每 1200 毫秒一次操作、同步目标 1000 毫秒。以下环境变量可调整或扩展验证：
+
+- `PROJECTION_BASE_URL`：默认 `http://127.0.0.1:3000`。
+- `PROJECTION_RESOURCE_ID`、`PROJECTION_STAGE_KEY`：指定测试资源和阶段；缺省时读取当前课堂。
+- `PROJECTION_BLOCK_WEBSOCKET=true`：阻断学生 WebSocket，单独验证 HTTP 补漏路径；当前投屏轮询为 500 毫秒，WebSocket 已订阅时完整性检查为 15 秒，以 `src/lib/realtime/projection-state.ts` 为准。
+- `PROJECTION_STUDENT_COUNT`、`PROJECTION_DURATION_SECONDS`：调试时可缩小，完整默认验收使用 30 名学生和 1800 秒。
+- `PROJECTION_OPERATION_INTERVAL_MS`、`PROJECTION_LATENCY_TARGET_MS`：操作间隔与时延阈值，默认分别为 1200 和 1000 毫秒；修改后报告实际门槛。
+- `PROJECTION_METRICS_TOKEN`：提供内部监控令牌后，在报告中保存测试前后的进程及 HTTP 指标。
+- `PROJECTION_REPORT_PATH`：默认写入 `tests/load/reports/projection-sync-report.json`。
+
+验收报告包含整体和逐学生的 P50/P95/P99、最大时延、超时次数、页面错误以及可选服务指标。只有所有有效最终操作都不超过配置的时延阈值（默认 1000 毫秒）且没有页面错误时，命令才返回成功。正式验收分别运行正常 WebSocket 场景和阻断 WebSocket 场景；完全断网不计入在线同步时延，恢复联网后重新运行一次操作验证追平。

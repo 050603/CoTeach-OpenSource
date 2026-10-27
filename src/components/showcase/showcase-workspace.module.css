@@ -1,0 +1,165 @@
+.workspace { container-type: inline-size; min-width: 0; }
+.immersiveWorkspace { display: flex; height: 100%; min-height: 0; flex-direction: column; }
+.projectedWorkspace { flex: 1; min-height: 0; }
+.header { display: flex; align-items: center; flex-wrap: wrap; gap: .5rem 1rem; min-height: 3.25rem; padding: .25rem 0 .6rem; border-bottom: 1px solid var(--pbl-border); }
+.headerTitle { display: flex; align-items: center; flex: 1; min-width: 0; gap: .7rem; }
+.headerActions { display: flex; align-items: center; flex-wrap: wrap; gap: .5rem; }
+.layout { display: grid; grid-template-columns: minmax(0, 1fr) 17.25rem; gap: .75rem; align-items: start; margin-top: .75rem; }
+.teacherLayout { grid-template-columns: minmax(0, 1fr) 18.25rem; }
+.immersiveLayout { flex: 1; min-height: 0; align-items: stretch; }
+.projectedLayout { height: 100%; min-height: 0; margin-top: 0; align-items: stretch; }
+.projectedLayout > :global(.teacher-presentation-showcase) { min-width: 0; }
+.main { display: flex; min-width: 0; flex-direction: column; border: 1px solid var(--pbl-border); border-radius: var(--radius-md); background: var(--pbl-surface); }
+.immersiveMain { min-height: 0; overflow: hidden; }
+.aside { min-width: 0; border: 1px solid var(--pbl-border); border-radius: var(--radius-md); background: var(--pbl-surface); }
+.immersiveAside { display: flex; min-height: 0; flex-direction: column; overflow: hidden; }
+.managementBody { min-height: 0; }
+.immersiveAside .managementBody { flex: 1; overflow-y: auto; }
+.queueList { max-height: min(55dvh, 40rem); overflow-y: auto; }
+.immersiveAside .queueList { max-height: none; overflow: visible; }
+.preview { height: clamp(18rem, calc(100dvh - 16rem), 56rem); min-height: 0; overflow: hidden; background: var(--pbl-surface-soft); }
+.teacherPreview { height: clamp(17rem, calc(100dvh - 22rem), 48rem); }
+.teacherPreview.immersivePreview { height: auto; flex: 1; min-height: 0; }
+.slidesPreview { min-height: 0; }
+.preview :global(.min-h-72) { min-height: 0; }
+.preview :global(.min-h-full) { min-height: 100%; }
+.toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: .35rem .65rem; min-width: 0; min-height: 3.5rem; padding: .35rem .6rem; border-bottom: 1px solid var(--pbl-border); background: white; }
+.picker { position: relative; flex: 1 1 16rem; min-width: 0; max-width: 33rem; }
+.pickerButton { display: flex; align-items: center; gap: .5rem; width: 100%; min-height: 2.75rem; padding: .45rem .7rem; border: 1px solid var(--pbl-border); border-radius: var(--radius-xs); text-align: left; font-size: .875rem; font-weight: 600; }
+.pickerButton span { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.pickerMenu { position: absolute; top: calc(100% + .25rem); left: 0; z-index: 40; width: min(30rem, 100%); max-height: min(25rem, 60dvh); overflow-y: auto; border: 1px solid var(--pbl-border); border-radius: var(--radius-sm); background: white; box-shadow: 0 12px 30px #1f293326; }
+.pickerSearch { width: calc(100% - 1rem); min-height: 2.75rem; margin: .5rem; padding: .5rem .7rem; border: 1px solid var(--pbl-border); border-radius: var(--radius-xs); font-size: 1rem; }
+.pickerOption { display: block; width: 100%; min-height: 2.75rem; padding: .5rem .75rem; border-top: 1px solid var(--pbl-border); text-align: left; font-size: .8125rem; overflow-wrap: anywhere; }
+.pickerOption:hover, .pickerOption[aria-selected="true"] { background: var(--pbl-surface-soft); }
+.toolbarActions { display: flex; flex: 0 1 auto; align-items: center; flex-wrap: wrap; gap: .35rem; }
+.toolbarButton { display: inline-flex; align-items: center; justify-content: center; gap: .35rem; min-height: 2.75rem; padding: .35rem .65rem; border: 1px solid var(--pbl-border); border-radius: var(--radius-xs); background: white; color: var(--pbl-text-strong); font-size: .8125rem; font-weight: 600; white-space: nowrap; }
+.toolbarButton[aria-pressed="true"] { border-color: var(--pbl-teacher); background: var(--pbl-teacher-soft); color: var(--pbl-teacher); }
+.student .toolbarButton[aria-pressed="true"] { border-color: var(--pbl-student); background: var(--pbl-student-soft); color: var(--pbl-student); }
+.toolbarButton:focus-visible, .pickerButton:focus-visible, .pickerOption:focus-visible { outline: 2px solid var(--pbl-teacher); outline-offset: -2px; }
+.student .toolbarButton:focus-visible, .student .pickerButton:focus-visible, .student .pickerOption:focus-visible { outline-color: var(--pbl-student); }
+.drawerBackdrop { position: fixed; inset: 0; z-index: 190; background: #1f293399; }
+.drawer { position: absolute; top: 0; right: 0; display: flex; flex-direction: column; width: min(26rem, 100vw); height: 100dvh; overflow: hidden; background: var(--pbl-surface); box-shadow: -8px 0 30px #1f293326; }
+.drawerHeader { display: flex; align-items: center; justify-content: space-between; gap: 1rem; min-height: 3.5rem; padding: .5rem 1rem; border-bottom: 1px solid var(--pbl-border); }
+.drawerBody { min-height: 0; flex: 1; overflow-y: auto; padding: 1rem; }
+.flowAction button { display: inline-flex; min-height: 2.75rem; align-items: center; justify-content: center; gap: .4rem; border-radius: var(--radius-xs); background: var(--pbl-teacher); padding: .45rem .9rem; color: white; font-size: .875rem; font-weight: 600; }
+.flowAction button:disabled { opacity: .55; }
+.flowAction button[data-tone="danger"] { border: 1px solid var(--pbl-danger); background: white; color: var(--pbl-danger); }
+@container (max-width: 1099px) { .layout, .teacherLayout { grid-template-columns: minmax(0, 1fr); } .immersiveLayout { height: auto; flex: none; } .immersiveMain { overflow: visible; } .teacherPreview.immersivePreview { height: clamp(17rem, calc(100dvh - 19rem), 48rem); flex: none; } .immersiveAside { max-height: min(34rem, 65dvh); } .projectedLayout { grid-template-columns: minmax(0, 1fr); } .projectedLayout .aside { display: none; } }
+@container (max-width: 767px) { .picker { flex-basis: 100%; max-width: none; } .header { gap: .3rem; } .toolbar { gap: .35rem; } .slidesPreview { height: clamp(19rem, 42dvh, 27rem); } .student .slidesPreview { height: clamp(18rem, calc(100dvh - 19rem), 38rem); } }
+@media (max-height: 650px) { .preview { height: max(15rem, calc(100dvh - 16.5rem)); } .teacherPreview { height: max(15rem, calc(100dvh - 18rem)); } }
+
+/* Teacher selection opens the roster on demand, keeping the work itself visible. */
+.selectionSummary { display: flex; flex-wrap: wrap; align-items: center; gap: .4rem 1.1rem; min-height: 2.75rem; padding: .4rem .2rem; font-size: .8125rem; color: var(--pbl-text-muted); }
+.selectionLayout { display: grid; grid-template-columns: minmax(0, 1fr); gap: .75rem; flex: 1; min-height: 0; }
+.studentList { display: flex; height: 100%; min-height: 0; flex-direction: column; }
+.selectionTabs { display: flex; flex-shrink: 0; gap: .25rem; padding: .35rem; border-bottom: 1px solid var(--pbl-border); }
+.selectionTabs button { min-width: 0; min-height: 2.75rem; flex: 1; border-radius: var(--radius-xs); padding: .25rem; font-size: .75rem; font-weight: 600; }
+.selectionTabs button[aria-selected="true"] { color: var(--pbl-teacher); background: var(--pbl-teacher-soft); }
+.studentListBody { min-height: 0; max-height: calc(100dvh - 24rem); overflow-y: auto; }
+.studentRow { border-top: 1px solid var(--pbl-border); }
+.studentRow[data-current="true"] { background: var(--pbl-teacher-soft); box-shadow: inset 3px 0 var(--pbl-teacher); }
+.studentRowPreview { display: flex; width: 100%; min-height: 2.75rem; flex-direction: column; align-items: flex-start; gap: .2rem; padding: .75rem .8rem .35rem; text-align: left; }
+.studentRowPreview strong { font-size: .875rem; }
+.studentRowPreview span, .studentRowPreview small { font-size: .75rem; line-height: 1.5; overflow-wrap: anywhere; color: var(--pbl-text-muted); }
+.recommendationReasons { display: flex; flex-wrap: wrap; gap: .4rem .8rem; padding: .5rem .75rem; border-bottom: 1px solid var(--pbl-border); background: var(--pbl-teacher-soft); font-size: .75rem; line-height: 1.6; }
+.recommendationReasons details { min-width: 0; max-width: 100%; }
+.recommendationReasons summary { cursor: pointer; overflow-wrap: anywhere; }
+.recommendationReasons p { max-width: 50rem; margin-top: .35rem; color: var(--pbl-text-muted); overflow-wrap: anywhere; }
+.handoff { margin-bottom: .6rem; padding: .65rem .8rem; border-radius: var(--radius-sm); background: #ecfdf5; color: #065f46; font-size: .8125rem; line-height: 1.6; }
+.projectionOverlay { position: fixed; inset: 0; z-index: 180; display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--pbl-surface, white); color: var(--pbl-text, #292524); }
+.projectionOverlay[hidden] { display: none; }
+.localFullscreen { z-index: 200; }
+.projectionHeader, .projectionFooter { display: flex; flex-wrap: wrap; align-items: center; flex-shrink: 0; gap: .5rem .75rem; min-height: 3.5rem; padding: .35rem .75rem; background: white; }
+.projectionHeader { border-bottom: 1px solid var(--pbl-border); }
+.projectionHeader strong { color: var(--pbl-teacher); }
+.projectionFooter { border-top: 1px solid var(--pbl-border); }
+.projectionBody { min-height: 0; min-width: 0; flex: 1; overflow: hidden; }
+.browseBackdrop { position: fixed; inset: 0; z-index: 185; padding: .75rem; background: #1f2933a6; }
+.browseDialog { display: flex; height: 100%; min-height: 0; overflow: auto; border-radius: var(--radius-md); background: var(--pbl-surface); padding: .75rem; }
+.browseDialog > .workspace { display: flex; width: 100%; min-height: 0; flex-direction: column; }
+.immersiveWorkspace .selectionLayout > .main, .browseDialog .selectionLayout > .main { min-height: 0; overflow: hidden; }
+.immersiveWorkspace .studentListBody, .browseDialog .studentListBody { max-height: none; flex: 1; }
+.browseDialog .teacherPreview { height: auto; min-height: 0; flex: 1; }
+button.toolbarButton:disabled { opacity: .5; }
+.teacherWorkspace { display: flex; height: 100%; min-height: 0; flex-direction: column; }
+.teacherWorkspace .main { min-height: 0; overflow: hidden; }
+.teacherWorkspace .teacherPreview { height: auto; flex: 1; min-height: 0; }
+.teacherWorkspace[data-sidebar="true"] .selectionLayout { grid-template-columns: 18rem minmax(0, 1fr); }
+.teacherSidebar { display: flex; min-height: 0; min-width: 0; flex-direction: column; overflow: hidden; border: 1px solid var(--pbl-border); border-radius: var(--radius-md); background: var(--pbl-surface); }
+.sidebarHeader { display: flex; flex: none; align-items: center; justify-content: space-between; gap: .5rem; min-height: 3.5rem; padding: .35rem .65rem; border-bottom: 1px solid var(--pbl-border); }
+.sidebarHeader h2 { color: var(--pbl-text-strong); font-size: .9375rem; font-weight: 700; }
+.sidebarSummary { color: var(--pbl-text-muted); font-size: .75rem; }
+.teacherSidebar .studentList { flex: 1; height: auto; overflow: hidden; }
+.teacherSidebar .studentListBody { flex: 1; max-height: none; }
+.sidebarActions { display: flex; flex: none; flex-wrap: wrap; gap: .35rem; padding: .5rem; border-top: 1px solid var(--pbl-border); }
+.sidebarActions .planCount { display: none; }
+.selectionTabs button { display: flex; align-items: center; justify-content: center; gap: .25rem; }
+.selectionTabs button > span { border-radius: 4px; padding-inline: .25rem; font-size: .6875rem; font-variant-numeric: tabular-nums; opacity: .75; }
+.studentSearchField { display: flex; flex: none; align-items: center; gap: .5rem; margin: .5rem; padding-left: .65rem; border: 1px solid var(--pbl-border); border-radius: var(--radius-xs); color: var(--pbl-text-muted); background: white; }
+.studentSearchField input { width: 100%; min-width: 0; min-height: 44px; padding: .5rem .5rem .5rem 0; outline: none; font-size: .875rem; color: var(--pbl-text); }
+.studentSearchField:focus-within { outline: 2px solid var(--pbl-teacher); outline-offset: -2px; }
+.studentSearchField input:focus-visible { outline: none; }
+.studentRowMain { display: flex; align-items: center; gap: .35rem; padding: .3rem .5rem; }
+.studentRowMain .studentRowPreview { width: auto; flex: 1; min-width: 0; gap: .2rem; padding: .3rem .25rem; }
+.studentRowPreview .studentName { display: flex; align-items: center; flex-wrap: wrap; gap: .35rem; color: var(--pbl-text-strong); }
+.studentName strong { font-size: .875rem; }
+.studentRowPreview .browsingBadge { color: var(--pbl-teacher); font-size: .625rem; font-weight: 500; }
+.studentRowPreview .reasonBadges { display: flex; flex-wrap: wrap; gap: .25rem; }
+.reasonBadges small { padding: 0 .3rem; border-radius: 4px; background: var(--pbl-surface-soft); color: var(--pbl-text-muted); font-size: .625rem; line-height: 1.7; }
+.rosterSelect { display: inline-flex; flex: none; align-items: center; justify-content: center; min-width: 44px; min-height: 44px; padding: .25rem .4rem; border: 1px solid var(--pbl-border); border-radius: 6px; background: white; color: var(--pbl-teacher); font-size: .75rem; }
+.rosterSelect[aria-pressed="true"] { background: var(--pbl-teacher-soft); border-color: var(--pbl-teacher); }
+.rosterSelect:disabled { opacity: .4; }
+.rosterOrder { flex: none; min-width: 1.25rem; text-align: center; font-size: .75rem; color: var(--pbl-text-muted); font-variant-numeric: tabular-nums; }
+.rosterOrderActions { display: flex; justify-content: flex-end; gap: .5rem; padding: 0 .5rem .2rem; }
+.rosterOrderActions button { display: inline-flex; align-items: center; justify-content: center; gap: .25rem; min-height: 44px; min-width: 44px; color: var(--pbl-teacher); font-size: .75rem; }
+.rosterOrderActions button:disabled { opacity: .35; }
+.rosterProgress { display: flex; align-items: center; gap: .4rem; padding: 0 .75rem .5rem; color: var(--pbl-text-muted); font-size: .75rem; }
+.rosterEmpty { display: flex; align-items: center; flex-direction: column; gap: .65rem; padding: 1.5rem 1rem; text-align: center; }
+.rosterEmptyIcon { display: grid; place-items: center; width: 44px; height: 44px; border-radius: 50%; background: var(--pbl-teacher-soft); color: var(--pbl-teacher); }
+.rosterEmpty h3 { font-size: .875rem; font-weight: 600; color: var(--pbl-text-strong); }
+.rosterEmpty p { max-width: 15rem; font-size: .8125rem; color: var(--pbl-text-muted); line-height: 1.7; }
+.rosterEmpty .toolbarButton { margin-top: .25rem; }
+.zoomControls { display: flex; flex: none; align-items: center; min-height: 44px; overflow: hidden; border: 1px solid var(--pbl-border); border-radius: 6px; background: white; color: var(--pbl-text-strong); }
+.zoomControls button { display: inline-flex; align-items: center; justify-content: center; min-width: 44px; min-height: 44px; padding: 0; }
+.zoomControls button:hover { background: var(--pbl-teacher-soft); }
+.zoomControls button:disabled { opacity: .35; }
+.zoomControls output { min-width: 3rem; font-size: .75rem; font-variant-numeric: tabular-nums; text-align: center; }
+.readingSurface { position: relative; }
+.cornerZoom { position: absolute; inset-inline-end: .5rem; bottom: .5rem; overflow: visible; min-height: 44px; z-index: 2; background: #ffffffeb; box-shadow: 0 2px 12px #1f293326; backdrop-filter: blur(6px); }
+.cornerZoom[hidden] { display: none; }
+.readingSurface:focus-visible { outline: 2px solid var(--pbl-teacher); outline-offset: -2px; }
+.cornerZoom > button { min-width: 3rem; }
+.zoomMenu { position: absolute; bottom: calc(100% + .25rem); right: 0; display: flex; flex-direction: column; width: 100%; padding: .2rem 0; border: 1px solid var(--pbl-border); border-radius: 6px; background: white; box-shadow: 0 4px 16px #1f293326; }
+.zoomMenu button { width: 100%; font-size: .75rem; }
+@media (max-width: 500px) { .readingSurface[data-paged="true"] .cornerZoom { bottom: 4rem; } }
+.currentPresentation { display: flex; flex: none; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: .25rem .5rem; padding: .25rem .6rem; border-bottom: 1px solid var(--pbl-border); background: var(--pbl-teacher-soft); font-size: .75rem; }
+.currentPresentation strong { margin-left: .35rem; }
+.fullscreenNotice { flex: none; padding: .4rem .75rem; background: #fffbeb; color: #92400e; font-size: .8125rem; }
+.teacherMaterialToolbar { flex: none; gap: .4rem .6rem; padding: .4rem .6rem; }
+.teacherMaterialToolbar .picker { flex: 1 1 12rem; max-width: none; }
+.teacherMaterialToolbar .toolbarActions { flex: none; }
+.previewIdentity { display: flex; flex: 0 1 9rem; min-width: 0; flex-direction: column; line-height: 1.4; }
+.previewIdentity strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: .875rem; }
+.previewIdentity span { color: var(--pbl-text-muted); font-size: .75rem; }
+.planCount { color: var(--pbl-text-muted); font-size: .75rem; font-weight: 400; }
+.workspaceError { display: flex; flex: none; align-items: center; gap: .75rem; max-height: 5.5rem; overflow-y: auto; margin-bottom: .5rem; padding: .4rem .6rem; border-radius: var(--radius-sm); background: #fff1f2; color: #be123c; font-size: .875rem; }
+.workspaceError > span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.planActions { display: flex; flex-wrap: wrap; gap: .5rem; margin-block: .75rem 1.25rem; }
+.planRecommendations { display: grid; gap: .75rem; font-size: .875rem; color: var(--pbl-text-muted); }
+.planRecommendations + button { margin-top: .75rem; }
+@container (max-width: 1099px) {
+  .teacherMaterialToolbar .picker { flex-basis: 10rem; }
+  .previewIdentity { flex-basis: 6rem; }
+  .planCount { display: none; }
+}
+@container (max-width: 599px) {
+  .teacherMaterialToolbar { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: .25rem .4rem; padding: .25rem .4rem; }
+  .teacherMaterialToolbar .picker { grid-column: 1 / -1; grid-row: 2; }
+  .teacherMaterialToolbar .toolbarActions { display: contents; }
+  .teacherMaterialToolbar .toolbarActions > :not(:last-child) { grid-column: 1 / -1; }
+  .teacherMaterialToolbar .toolbarActions > :last-child { grid-column: 3; grid-row: 1; }
+  .teacherMaterialToolbar .toolbarActions > :last-child span { display: none; }
+  .teacherMaterialToolbar .toolbarActions > :last-child { min-width: 44px; }
+}
+@media (max-height: 650px) { .selectionLayout { grid-template-columns: minmax(0, 1fr); } .selectionSummary { gap: .25rem .75rem; } .projectionHeader, .projectionFooter { min-height: 3rem; padding-block: .1rem; } .browseDialog .teacherPreview { min-height: 8rem; } }
+@media (max-width: 640px) { .projectionHeader, .projectionFooter { gap: .25rem .4rem; padding-inline: .4rem; } .projectionHeader { font-size: .8125rem; } .projectionFooter > :first-child { margin-right: auto; } .browseBackdrop { padding: 0; } .browseDialog { padding: .5rem; border-radius: 0; } }

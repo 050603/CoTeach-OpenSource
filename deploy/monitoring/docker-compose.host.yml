@@ -1,0 +1,25 @@
+# Apply AFTER docker-compose.prod.yml and docker-compose.ip.yml.
+# Explicitly select prometheus; do not start the entire observability profile.
+services:
+  prometheus:
+    # This immutable image is already cached on the current host.
+    image: proxy.vvvv.ee/prom/prometheus@sha256:63805ebb8d2b3920190daf1cb14a60871b16fd38bed42b857a3182bc621f4996
+    user: "${OPENPBL_MONITOR_UID:?Set UID to monitor_token file owner}:${OPENPBL_MONITOR_GID:?Set GID to monitor_token file group}"
+    network_mode: host
+    command: !override
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=30d
+      - --web.listen-address=127.0.0.1:9090
+    volumes:
+      # Same mount targets replace the two base mounts; inherited alerts/secret
+      # mounts remain read-only. The data directory must have the same UID/GID.
+      - type: bind
+        source: ./deploy/monitoring/prometheus.host.yml
+        target: /etc/prometheus/prometheus.yml
+        read_only: true
+        bind: { create_host_path: false }
+      - type: bind
+        source: ./.openpbl-data/prometheus
+        target: /prometheus
+        bind: { create_host_path: false }

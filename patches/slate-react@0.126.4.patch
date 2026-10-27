@@ -1,0 +1,352 @@
+diff --git a/dist/index.es.js b/dist/index.es.js
+--- a/dist/index.es.js
++++ b/dist/index.es.js
+@@ -2684,6 +2684,10 @@
+   // Keep track of some state for the event handler logic.
+   var state = useMemo(() => ({
+     isDraggingInternally: false,
++      // Backport https://github.com/ianstormtaylor/slate/pull/6179 (f851cbc).
++      pendingSelection: null,
++      // Desktop native caret guard; expanded pointer selection remains owned by Slate/Plate.
++      nativeSelection: null,
+     isUpdatingSelection: false,
+     latestElement: null,
+     hasMarkPlaceholder: false
+@@ -2707,6 +2711,23 @@
+    * it needs to be initialized.
+    */
+   var androidInputManagerRef = useRef();
++  var syncNativeInteraction = useCallback(() => {
++    var pending = state.nativeSelection;
++    if (!pending) return;
++    if (pending.basedOn !== editor.selection) { state.nativeSelection = null; return; }
++    var manager = androidInputManagerRef.current;
++    if (ReactEditor.isComposing(editor) || IS_NODE_MAP_DIRTY.get(editor) || state.isDraggingInternally || (manager && (manager.hasPendingChanges() || manager.isFlushing()))) return;
++    var root = ReactEditor.findDocumentOrShadowRoot(editor);
++    if (root.activeElement !== ReactEditor.toDOMNode(editor, editor)) return;
++    var dom = getSelection(root);
++    if (!dom || !ReactEditor.hasEditableTarget(editor, dom.anchorNode) || !ReactEditor.hasTarget(editor, dom.focusNode)) return;
++    var range = ReactEditor.toSlateRange(editor, dom, { exactMatch: false, suppressThrow: true });
++    if (range) {
++      state.pendingSelection = null;
++      state.nativeSelection = null;
++      Transforms.select(editor, range);
++    }
++  }, [editor, state]);
+   // Listen on the native `selectionchange` event to be able to update any time
+   // the selection changes. This is required because React's `onSelect` is leaky
+   // and non-standard so it doesn't fire until after a selection has been
+@@ -2717,6 +2738,7 @@
+       onDOMSelectionChange();
+       return;
+     }
++    state.pendingSelection = null;
+     var el = ReactEditor.toDOMNode(editor, editor);
+     var root = el.getRootNode();
+     if (!processing.current && IS_WEBKIT && root instanceof ShadowRoot) {
+@@ -2761,6 +2783,8 @@
+         if (range) {
+           if (!ReactEditor.isComposing(editor) && !(androidInputManager !== null && androidInputManager !== void 0 && androidInputManager.hasPendingChanges()) && !(androidInputManager !== null && androidInputManager !== void 0 && androidInputManager.isFlushing())) {
+             Transforms.select(editor, range);
++            if (state.nativeSelection?.kind === 'pointer' && Range.isCollapsed(range)) state.nativeSelection.basedOn = editor.selection;
++            else state.nativeSelection = null;
+           } else {
+             androidInputManager === null || androidInputManager === void 0 || androidInputManager.handleUserSelect(range);
+           }
+@@ -2857,6 +2881,14 @@
+           exactMatch: false,
+           suppressThrow: true
+         });
++        return;
++      }
++      if (!forceChange && !readOnly && state.nativeSelection && state.nativeSelection.basedOn === selection) return;
++      state.nativeSelection = null;
++      var pending = state.pendingSelection;
++      state.pendingSelection = null;
++      if (pending && !forceChange && pending.basedOn === selection && !(selection && Range.equals(pending.range, selection))) {
++        Transforms.select(editor, pending.range);
+         return;
+       }
+       // Otherwise the DOM selection is out of sync, so update it.
+@@ -3222,6 +3254,14 @@
+     // <textarea> elements are appended to the DOM, causing
+     // `editor.selection` to be overwritten in some circumstances.
+     // (2025/01/16) https://issues.chromium.org/issues/389368412
++    var readUnsyncedSelection = function () {
++      var androidInputManager = androidInputManagerRef.current;
++      if (state.isUpdatingSelection || state.isDraggingInternally || ReactEditor.isComposing(editor) || (androidInputManager && (androidInputManager.hasPendingChanges() || androidInputManager.isFlushing())) || IS_NODE_MAP_DIRTY.get(editor)) return null;
++      var domSelection = getSelection(ReactEditor.findDocumentOrShadowRoot(editor));
++      if (!domSelection || !(ReactEditor.hasEditableTarget(editor, domSelection.anchorNode) || ReactEditor.isTargetInsideNonReadonlyVoid(editor, domSelection.anchorNode)) || !ReactEditor.hasTarget(editor, domSelection.focusNode)) return null;
++      var range = ReactEditor.toSlateRange(editor, domSelection, {exactMatch: false, suppressThrow: true});
++      return range ? {range: range, basedOn: editor.selection} : null;
++    };
+     var onSelectionChange = _ref => {
+       var {
+         target
+@@ -3231,6 +3271,7 @@
+       if (targetTagName === 'INPUT' || targetTagName === 'TEXTAREA') {
+         return;
+       }
++      state.pendingSelection = readUnsyncedSelection();
+       scheduleOnDOMSelectionChange();
+     };
+     // Attach a native DOM event handler for `selectionchange`, because React's
+@@ -3239,6 +3280,15 @@
+     // want to fire for any change to the selection inside the editor.
+     // (2019/11/04) https://github.com/facebook/react/issues/5785
+     window.document.addEventListener('selectionchange', onSelectionChange);
++    var cancelNativeSelection = () => { state.nativeSelection = null; };
++    var releaseOutsideNativeSelection = event => {
++      var pending = state.nativeSelection;
++      var element = EDITOR_TO_ELEMENT.get(editor);
++      if (pending?.kind === 'pointer' && pending.pointerId === event.pointerId && (event.type === 'pointercancel' || !element || !event.composedPath().includes(element))) state.nativeSelection = null;
++    };
++    window.addEventListener('blur', cancelNativeSelection);
++    window.document.addEventListener('pointerup', releaseOutsideNativeSelection, true);
++    window.document.addEventListener('pointercancel', releaseOutsideNativeSelection, true);
+     // Listen for dragend and drop globally. In Firefox, if a drop handler
+     // initiates an operation that causes the originally dragged element to
+     // unmount, that element will not emit a dragend event. (2024/06/21)
+@@ -3249,10 +3299,13 @@
+     window.document.addEventListener('drop', stoppedDragging);
+     return () => {
+       window.document.removeEventListener('selectionchange', onSelectionChange);
++      window.removeEventListener('blur', cancelNativeSelection);
++      window.document.removeEventListener('pointerup', releaseOutsideNativeSelection, true);
++      window.document.removeEventListener('pointercancel', releaseOutsideNativeSelection, true);
+       window.document.removeEventListener('dragend', stoppedDragging);
+       window.document.removeEventListener('drop', stoppedDragging);
+     };
+-  }, [scheduleOnDOMSelectionChange, state]);
++  }, [editor, scheduleOnDOMSelectionChange, state]);
+   var decorations = decorate([editor, []]);
+   var decorateContext = useDecorateContext(decorate);
+   var showPlaceholder = placeholder && editor.children.length === 1 && Array.from(Node.texts(editor)).length === 1 && Node.string(editor) === '' && !isComposing;
+@@ -3405,7 +3458,31 @@
+         handleNativeHistoryEvents(editor, event.nativeEvent);
+       }
+     }, [attributes.onInput, editor]),
++    onKeyUp: useCallback(event => {
++      if (isEventHandled(event, attributes.onKeyUp)) { state.nativeSelection = null; return; }
++      if (!readOnly && !event.nativeEvent.isComposing && event.nativeEvent.keyCode !== 229 && state.nativeSelection?.kind === 'key' && state.nativeSelection.key === event.key) syncNativeInteraction();
++    }, [readOnly, state, attributes.onKeyUp, syncNativeInteraction]),
++    onPointerDown: useCallback(event => {
++      var dom = getSelection(ReactEditor.findDocumentOrShadowRoot(editor));
++      if (!readOnly && !IS_ANDROID && !ReactEditor.isComposing(editor) && (!editor.selection || Range.isCollapsed(editor.selection)) && dom?.isCollapsed && ReactEditor.hasEditableTarget(editor, event.target)) {
++        state.nativeSelection = { kind: 'pointer', pointerId: event.pointerId, basedOn: editor.selection };
++      }
++      if (isEventHandled(event, attributes.onPointerDown)) state.nativeSelection = null;
++    }, [editor, readOnly, state, attributes.onPointerDown]),
++    onPointerUp: useCallback(event => {
++      if (isEventHandled(event, attributes.onPointerUp)) { state.nativeSelection = null; return; }
++      if (!readOnly && state.nativeSelection?.kind === 'pointer' && state.nativeSelection.pointerId === event.pointerId) {
++        var dom = getSelection(ReactEditor.findDocumentOrShadowRoot(editor));
++        if (!dom?.isCollapsed) { state.nativeSelection = null; return; }
++        syncNativeInteraction();
++      }
++    }, [editor, readOnly, state, attributes.onPointerUp, syncNativeInteraction]),
++    onPointerCancel: useCallback(event => {
++      state.nativeSelection = null;
++      isEventHandled(event, attributes.onPointerCancel);
++    }, [state, attributes.onPointerCancel]),
+     onBlur: useCallback(event => {
++      state.nativeSelection = null;
+       if (readOnly || state.isUpdatingSelection || !ReactEditor.hasSelectableTarget(editor, event.target) || isEventHandled(event, attributes.onBlur)) {
+         return;
+       }
+@@ -3672,8 +3749,12 @@
+           IS_COMPOSING.set(editor, false);
+           setIsComposing(false);
+         }
++        if (nativeEvent.key === 'Escape') state.nativeSelection = null;
+         if (isEventHandled(event, attributes.onKeyDown) || ReactEditor.isComposing(editor)) {
+           return;
++        }
++        if (!IS_ANDROID && !nativeEvent.isComposing && nativeEvent.keyCode !== 229 && /^(ArrowLeft|ArrowRight|ArrowUp|ArrowDown|Home|End|PageUp|PageDown)$/.test(nativeEvent.key)) {
++          state.nativeSelection = { kind: 'key', key: nativeEvent.key, basedOn: editor.selection };
+         }
+         var {
+           selection
+@@ -4246,4 +4327,4 @@
+ };
+ 
+ export { DefaultElement, DefaultLeaf, DefaultPlaceholder, DefaultText, Editable, ReactEditor, Slate, defaultScrollSelectionIntoView, useComposing, useEditor, useElement, useElementIf, useFocused, useReadOnly, useSelected, useSlate, useSlateSelection, useSlateSelector, useSlateStatic, useSlateWithV, withReact };
+-//# sourceMappingURL=index.es.js.map
++
+diff --git a/dist/index.js b/dist/index.js
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -3139,6 +3139,10 @@
+   var state = React.useMemo(function () {
+     return {
+       isDraggingInternally: false,
++      // Backport https://github.com/ianstormtaylor/slate/pull/6179 (f851cbc).
++      pendingSelection: null,
++      // Desktop native caret guard; expanded pointer selection remains owned by Slate/Plate.
++      nativeSelection: null,
+       isUpdatingSelection: false,
+       latestElement: null,
+       hasMarkPlaceholder: false
+@@ -3163,6 +3167,23 @@
+    * it needs to be initialized.
+    */
+   var androidInputManagerRef = React.useRef();
++  var syncNativeInteraction = React.useCallback(() => {
++    var pending = state.nativeSelection;
++    if (!pending) return;
++    if (pending.basedOn !== editor.selection) { state.nativeSelection = null; return; }
++    var manager = androidInputManagerRef.current;
++    if (ReactEditor.isComposing(editor) || slateDom.IS_NODE_MAP_DIRTY.get(editor) || state.isDraggingInternally || (manager && (manager.hasPendingChanges() || manager.isFlushing()))) return;
++    var root = ReactEditor.findDocumentOrShadowRoot(editor);
++    if (root.activeElement !== ReactEditor.toDOMNode(editor, editor)) return;
++    var dom = slateDom.getSelection(root);
++    if (!dom || !ReactEditor.hasEditableTarget(editor, dom.anchorNode) || !ReactEditor.hasTarget(editor, dom.focusNode)) return;
++    var range = ReactEditor.toSlateRange(editor, dom, { exactMatch: false, suppressThrow: true });
++    if (range) {
++      state.pendingSelection = null;
++      state.nativeSelection = null;
++      slate.Transforms.select(editor, range);
++    }
++  }, [editor, state]);
+   // Listen on the native `selectionchange` event to be able to update any time
+   // the selection changes. This is required because React's `onSelect` is leaky
+   // and non-standard so it doesn't fire until after a selection has been
+@@ -3174,6 +3195,7 @@
+         onDOMSelectionChange();
+         return;
+       }
++      state.pendingSelection = null;
+       var el = ReactEditor.toDOMNode(editor, editor);
+       var root = el.getRootNode();
+       if (!processing.current && slateDom.IS_WEBKIT && root instanceof ShadowRoot) {
+@@ -3214,7 +3236,9 @@
+           if (range) {
+             if (!ReactEditor.isComposing(editor) && !(androidInputManager !== null && androidInputManager !== void 0 && androidInputManager.hasPendingChanges()) && !(androidInputManager !== null && androidInputManager !== void 0 && androidInputManager.isFlushing())) {
+               slate.Transforms.select(editor, range);
+-            } else {
++            if (state.nativeSelection?.kind === 'pointer' && slate.Range.isCollapsed(range)) state.nativeSelection.basedOn = editor.selection;
++            else state.nativeSelection = null;
++          } else {
+               androidInputManager === null || androidInputManager === void 0 || androidInputManager.handleUserSelect(range);
+             }
+           }
+@@ -3311,6 +3335,14 @@
+           exactMatch: false,
+           suppressThrow: true
+         });
++        return;
++      }
++      if (!forceChange && !readOnly && state.nativeSelection && state.nativeSelection.basedOn === selection) return;
++      state.nativeSelection = null;
++      var pending = state.pendingSelection;
++      state.pendingSelection = null;
++      if (pending && !forceChange && pending.basedOn === selection && !(selection && slate.Range.equals(pending.range, selection))) {
++        slate.Transforms.select(editor, pending.range);
+         return;
+       }
+       // Otherwise the DOM selection is out of sync, so update it.
+@@ -3679,6 +3711,14 @@
+     // <textarea> elements are appended to the DOM, causing
+     // `editor.selection` to be overwritten in some circumstances.
+     // (2025/01/16) https://issues.chromium.org/issues/389368412
++    var readUnsyncedSelection = function () {
++      var androidInputManager = androidInputManagerRef.current;
++      if (state.isUpdatingSelection || state.isDraggingInternally || ReactEditor.isComposing(editor) || (androidInputManager && (androidInputManager.hasPendingChanges() || androidInputManager.isFlushing())) || slateDom.IS_NODE_MAP_DIRTY.get(editor)) return null;
++      var domSelection = slateDom.getSelection(ReactEditor.findDocumentOrShadowRoot(editor));
++      if (!domSelection || !(ReactEditor.hasEditableTarget(editor, domSelection.anchorNode) || ReactEditor.isTargetInsideNonReadonlyVoid(editor, domSelection.anchorNode)) || !ReactEditor.hasTarget(editor, domSelection.focusNode)) return null;
++      var range = ReactEditor.toSlateRange(editor, domSelection, {exactMatch: false, suppressThrow: true});
++      return range ? {range: range, basedOn: editor.selection} : null;
++    };
+     var onSelectionChange = function onSelectionChange(_ref) {
+       var target = _ref.target;
+       var targetElement = target instanceof HTMLElement ? target : null;
+@@ -3686,6 +3726,7 @@
+       if (targetTagName === 'INPUT' || targetTagName === 'TEXTAREA') {
+         return;
+       }
++      state.pendingSelection = readUnsyncedSelection();
+       scheduleOnDOMSelectionChange();
+     };
+     // Attach a native DOM event handler for `selectionchange`, because React's
+@@ -3694,6 +3735,15 @@
+     // want to fire for any change to the selection inside the editor.
+     // (2019/11/04) https://github.com/facebook/react/issues/5785
+     window.document.addEventListener('selectionchange', onSelectionChange);
++    var cancelNativeSelection = () => { state.nativeSelection = null; };
++    var releaseOutsideNativeSelection = event => {
++      var pending = state.nativeSelection;
++      var element = slateDom.EDITOR_TO_ELEMENT.get(editor);
++      if (pending?.kind === 'pointer' && pending.pointerId === event.pointerId && (event.type === 'pointercancel' || !element || !event.composedPath().includes(element))) state.nativeSelection = null;
++    };
++    window.addEventListener('blur', cancelNativeSelection);
++    window.document.addEventListener('pointerup', releaseOutsideNativeSelection, true);
++    window.document.addEventListener('pointercancel', releaseOutsideNativeSelection, true);
+     // Listen for dragend and drop globally. In Firefox, if a drop handler
+     // initiates an operation that causes the originally dragged element to
+     // unmount, that element will not emit a dragend event. (2024/06/21)
+@@ -3704,10 +3754,13 @@
+     window.document.addEventListener('drop', stoppedDragging);
+     return function () {
+       window.document.removeEventListener('selectionchange', onSelectionChange);
++      window.removeEventListener('blur', cancelNativeSelection);
++      window.document.removeEventListener('pointerup', releaseOutsideNativeSelection, true);
++      window.document.removeEventListener('pointercancel', releaseOutsideNativeSelection, true);
+       window.document.removeEventListener('dragend', stoppedDragging);
+       window.document.removeEventListener('drop', stoppedDragging);
+     };
+-  }, [scheduleOnDOMSelectionChange, state]);
++  }, [editor, scheduleOnDOMSelectionChange, state]);
+   var decorations = decorate([editor, []]);
+   var decorateContext = useDecorateContext(decorate);
+   var showPlaceholder = placeholder && editor.children.length === 1 && Array.from(slate.Node.texts(editor)).length === 1 && slate.Node.string(editor) === '' && !isComposing;
+@@ -3854,7 +3907,31 @@
+         handleNativeHistoryEvents(editor, event.nativeEvent);
+       }
+     }, [attributes.onInput, editor]),
++    onKeyUp: React.useCallback(function (event) {
++      if (isEventHandled(event, attributes.onKeyUp)) { state.nativeSelection = null; return; }
++      if (!readOnly && !event.nativeEvent.isComposing && event.nativeEvent.keyCode !== 229 && state.nativeSelection?.kind === 'key' && state.nativeSelection.key === event.key) syncNativeInteraction();
++    }, [readOnly, state, attributes.onKeyUp, syncNativeInteraction]),
++    onPointerDown: React.useCallback(function (event) {
++      var dom = slateDom.getSelection(ReactEditor.findDocumentOrShadowRoot(editor));
++      if (!readOnly && !slateDom.IS_ANDROID && !ReactEditor.isComposing(editor) && (!editor.selection || slate.Range.isCollapsed(editor.selection)) && dom?.isCollapsed && ReactEditor.hasEditableTarget(editor, event.target)) {
++        state.nativeSelection = { kind: 'pointer', pointerId: event.pointerId, basedOn: editor.selection };
++      }
++      if (isEventHandled(event, attributes.onPointerDown)) state.nativeSelection = null;
++    }, [editor, readOnly, state, attributes.onPointerDown]),
++    onPointerUp: React.useCallback(function (event) {
++      if (isEventHandled(event, attributes.onPointerUp)) { state.nativeSelection = null; return; }
++      if (!readOnly && state.nativeSelection?.kind === 'pointer' && state.nativeSelection.pointerId === event.pointerId) {
++        var dom = slateDom.getSelection(ReactEditor.findDocumentOrShadowRoot(editor));
++        if (!dom?.isCollapsed) { state.nativeSelection = null; return; }
++        syncNativeInteraction();
++      }
++    }, [editor, readOnly, state, attributes.onPointerUp, syncNativeInteraction]),
++    onPointerCancel: React.useCallback(function (event) {
++      state.nativeSelection = null;
++      isEventHandled(event, attributes.onPointerCancel);
++    }, [state, attributes.onPointerCancel]),
+     onBlur: React.useCallback(function (event) {
++      state.nativeSelection = null;
+       if (readOnly || state.isUpdatingSelection || !ReactEditor.hasSelectableTarget(editor, event.target) || isEventHandled(event, attributes.onBlur)) {
+         return;
+       }
+@@ -4115,8 +4192,12 @@
+           slateDom.IS_COMPOSING.set(editor, false);
+           setIsComposing(false);
+         }
++        if (nativeEvent.key === 'Escape') state.nativeSelection = null;
+         if (isEventHandled(event, attributes.onKeyDown) || ReactEditor.isComposing(editor)) {
+           return;
++        }
++        if (!slateDom.IS_ANDROID && !nativeEvent.isComposing && nativeEvent.keyCode !== 229 && /^(ArrowLeft|ArrowRight|ArrowUp|ArrowDown|Home|End|PageUp|PageDown)$/.test(nativeEvent.key)) {
++          state.nativeSelection = { kind: 'key', key: nativeEvent.key, basedOn: editor.selection };
+         }
+         var selection = editor.selection;
+         var element = editor.children[selection !== null ? selection.focus.path[0] : 0];
+@@ -4726,4 +4807,4 @@
+ exports.useSlateStatic = useSlateStatic;
+ exports.useSlateWithV = useSlateWithV;
+ exports.withReact = withReact;
+-//# sourceMappingURL=index.js.map
++

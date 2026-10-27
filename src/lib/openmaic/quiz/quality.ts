@@ -1,0 +1,432 @@
+import type { QuizMatchingPair, QuizOption, QuizQuestion } from '@openmaic/lib/types/stage';
+import type { SceneOutline } from '@openmaic/lib/types/generation';
+import { ensureScoringRubric, validScoringRubric } from './rubric';
+
+/** Publish the actual generated count; the outline count is only a planning estimate. */
+export function withGeneratedQuizQuestionCounts<T extends SceneOutline>(
+  outlines: readonly T[],
+  scenes: readonly { outlineId?: string; content: { type: string; questions?: QuizQuestion[]; scoring?: { sectionPoints: number } } }[],
+): T[] {
+  const counts = new Map(scenes.flatMap((scene) => scene.content.type === 'quiz'
+    && scene.outlineId && Array.isArray(scene.content.questions)
+    ? [[scene.outlineId, { count: scene.content.questions.length, points: scene.content.scoring?.sectionPoints }] as const] : []));
+  return outlines.map((outline) => {
+    const actual = counts.get(outline.id);
+    return outline.type === 'quiz' && outline.quizConfig && actual !== undefined
+      ? { ...outline, quizConfig: { ...outline.quizConfig, questionCount: actual.count, generatedQuestionCount: actual.count,
+        ...(actual.points !== undefined ? { allocatedPoints: actual.points } : {}) } }
+      : outline;
+  });
+}
+
+export const SUPPORTED_QUIZ_FORMATS = [
+  'single_choice',
+  'multiple_choice',
+  'true_false',
+  'matching',
+  'fill_blank',
+  'short_answer',
+  'scenario_task',
+] as const;
+
+export type SupportedQuizFormat = (typeof SUPPORTED_QUIZ_FORMATS)[number];
+
+export interface QuizNormalizationResult {
+  questions: QuizQuestion[];
+  issues: string[];
+}
+
+const GENERATABLE_FORMATS = new Set(['single', 'multiple', 'matching', 'short_answer', 'true_false', 'fill_blank', 'scenario_task']);
+
+export function selectQuizFormats(input: {
+  objectiveText: string;
+  difficulty: 'easy' | 'medium' | 'hard';
+  questionCount: number;
+  requested?: string[];
+}): string[] {
+  const selected = (input.requested ?? []).filter((item) => GENERATABLE_FORMATS.has(item));
+  const textValue = input.objectiveText.toLowerCase();
+  const candidates: string[] = [];
+  if (/判断|辨认|识别|概念|定义|recogn|identify|define/.test(textValue)) candidates.push('true_false', 'single');
+  if (/对应|配对|匹配|关系|术语.*含义|概念.*例子|match|pair|correspond|relation/.test(textValue)) candidates.push('single', 'true_false');
+  if (/比较|分类|证据|多种|compare|classif|evidence/.test(textValue)) candidates.push('multiple');
+  if (/解释|原因|机制|说明|explain|why|mechanism/.test(textValue)) candidates.push('short_answer');
+  if (/应用|解决|设计|情境|案例|迁移|apply|solve|design|scenario|case/.test(textValue)) candidates.push('scenario_task');
+  if (/术语|关键词|关系|填|term|keyword|relation/.test(textValue)) candidates.push('fill_blank');
+  if (candidates.length === 0) candidates.push('single', input.difficulty === 'easy' ? 'true_false' : 'short_answer');
+  if (input.difficulty === 'hard') candidates.push('scenario_task');
+
+  const merged = selected.length > 0
+    ? Array.from(new Set([
+        ...candidates.filter((candidate) => selected.includes(candidate)),
+        ...selected,
+      ]))
+    : Array.from(new Set(candidates));
+  const maxFormats = Math.max(1, Math.min(input.questionCount, 3));
+  return merged.slice(0, maxFormats);
+}
+
+function text(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function rawAnswer(record: Record<string, unknown>): unknown {
+  return record.answer ?? record.correctAnswer ?? record.correct_answer;
+}
+
+function answerArray(record: Record<string, unknown>): string[] {
+  const value = rawAnswer(record);
+  if (Array.isArray(value)) return value.map(String).map((item) => item.trim()).filter(Boolean);
+  if (value === undefined || value === null || value === '') return [];
+  return [String(value).trim()];
+}
+
+function normalizeOptions(value: unknown): QuizOption[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((item, index) => {
+    const fallback = String.fromCharCode(65 + index);
+    if (typeof item === 'string') return { value: fallback, label: item.trim() || fallback };
+    const record = item && typeof item === 'object' ? item as Record<string, unknown> : {};
+    return {
+      value: text(record.value) || fallback,
+      label: text(record.label) || text(record.text) || text(record.value) || fallback,
+    };
+  });
+}
+
+function semanticFormat(rawType: string, rawFormat: string): SupportedQuizFormat {
+  const value = `${rawFormat || rawType}`.toLowerCase().replace(/[\s-]+/g, '_');
+  if (/match|matching|drag|配对|匹配|拖拽/.test(value)) return 'matching';
+  if (/true_false|judg|判断|boolean/.test(value)) return 'true_false';
+  if (/fill|blank|填空/.test(value)) return 'fill_blank';
+  if (/scenario|situation|情境|case_task/.test(value)) return 'scenario_task';
+  if (/multiple|multi_choice|多选/.test(value)) return 'multiple_choice';
+  if (/short|text|essay|简答/.test(value)) return 'short_answer';
+  return 'single_choice';
+}
+
+export function hasExplicitFillBlankSlot(question: string): boolean {
+  return /_{2,}|＿{2,}|\[\s*(?:blank|空)\s*\]|【\s*(?:blank|空)\s*】|\(\s*\)|（\s*）|<\s*blank\s*>/iu.test(question);
+}
+
+function unsupportedStructuredType(rawType: string): boolean {
+  return /connect|line|order|sort|排序|连线/.test(rawType.toLowerCase());
+}
+
+function normalizeMatchingPairs(value: unknown): QuizMatchingPair[] {
+  if (!Array.isArray(value)) return [];
+  const pairs = value.slice(0, 8).flatMap((item, index): QuizMatchingPair[] => {
+    const record = item && typeof item === 'object' ? item as Record<string, unknown> : {};
+    const left = text(record.left) || text(record.term) || text(record.source) || text(record.prompt);
+    const right = text(record.right) || text(record.definition) || text(record.target) || text(record.match);
+    if (!left || !right) return [];
+    const leftId = text(record.leftId).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 40);
+    const rightId = text(record.rightId).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 40);
+    return [{
+      leftId: leftId || `L${index + 1}`,
+      left,
+      rightId: rightId || `R${index + 1}`,
+      right,
+    }];
+  });
+  const leftIds = new Set<string>();
+  const rightIds = new Set<string>();
+  const leftLabels = new Set<string>();
+  const rightLabels = new Set<string>();
+  return pairs.filter((pair) => {
+    if (leftIds.has(pair.leftId) || rightIds.has(pair.rightId)
+      || leftLabels.has(pair.left) || rightLabels.has(pair.right)) return false;
+    leftIds.add(pair.leftId);
+    rightIds.add(pair.rightId);
+    leftLabels.add(pair.left);
+    rightLabels.add(pair.right);
+    return true;
+  });
+}
+
+function explainUnsupported(record: Record<string, unknown>): string {
+  const parts: string[] = [];
+  if (Array.isArray(record.options)) {
+    parts.push((record.options as unknown[]).map((item) => typeof item === 'string' ? item : JSON.stringify(item)).join('；'));
+  }
+  if (Array.isArray(record.pairs)) {
+    parts.push((record.pairs as unknown[]).map((item) => JSON.stringify(item)).join('；'));
+  }
+  return parts.filter(Boolean).join('；').slice(0, 500);
+}
+
+function choiceAnalysis(options: QuizOption[], answers: string[], original: string): string {
+  if (original.length >= 12) return original;
+  const labels = answers.map((answer) => options.find((option) => option.value === answer)?.label ?? answer);
+  return `正确答案为${labels.join('、')}。判断时应回到题目对应的核心概念，说明这些选项为什么符合条件，并辨析其他选项所反映的常见误解。`;
+}
+
+/** Compile the first authored response for the quiz runtime without judging or
+ * rewriting its teaching content. Count, coverage, explanations and requested
+ * formats are first-draft guidance; the final course is reviewed by the teacher. */
+export function compileAuthoredQuizQuestions(input: unknown): QuizQuestion[] {
+  if (!Array.isArray(input) || !input.length) throw new Error('quiz questions must be a nonempty array');
+  const ids = new Set<string>();
+  const reservedIds = new Set(input.flatMap((value) => value && typeof value === 'object'
+    && typeof value.id === 'string' && value.id.trim() ? [value.id.trim()] : []));
+  const stringIds = (value: unknown, field: string): string[] | undefined => {
+    if (value === undefined) return undefined;
+    if (!Array.isArray(value) || value.some((id) => typeof id !== 'string' || !id.trim())) {
+      throw new Error(`quiz ${field} must contain nonempty string ids`);
+    }
+    return [...new Set(value)];
+  };
+  return input.map((value, index): QuizQuestion => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`quiz question ${index + 1} must be an object`);
+    const record = value as Record<string, unknown>;
+    const question = text(record.question) || text(record.prompt) || text(record.title);
+    if (!question) throw new Error(`quiz question ${index + 1} has no displayable stem`);
+    const rawFormat = text(record.format) || text(record.type);
+    if (!/^(?:single(?:_choice)?|multiple(?:_choice)?|multi_choice|matching|true_false|boolean|fill_blank|short_answer|scenario_task)$/iu.test(rawFormat)) {
+      throw new Error(`quiz question ${index + 1} has an unsupported runtime format`);
+    }
+    const format = semanticFormat(rawFormat, rawFormat);
+    let id = text(record.id) || `q_${index + 1}`;
+    if (ids.has(id)) {
+      id = `q_${index + 1}`;
+      let suffix = 2;
+      while (ids.has(id) || reservedIds.has(id)) id = `q_${index + 1}_${suffix++}`;
+    }
+    ids.add(id);
+    const knowledgePointIds = stringIds(record.knowledgePointIds, 'knowledgePointIds');
+    const teachingUnitIds = stringIds(record.teachingUnitIds, 'teachingUnitIds');
+    const analysis = typeof record.analysis === 'string' ? record.analysis
+      : typeof record.explanation === 'string' ? record.explanation : undefined;
+    const base = { id, question, format, ...(knowledgePointIds ? { knowledgePointIds } : {}),
+      ...(teachingUnitIds ? { teachingUnitIds } : {}), ...(analysis !== undefined ? { analysis } : {}),
+      ...(typeof record.points === 'number' && Number.isFinite(record.points) && record.points > 0
+        ? { points: record.points } : {}) };
+    if (format === 'short_answer' || format === 'fill_blank' || format === 'scenario_task') {
+      const authoredRubric = typeof record.commentPrompt === 'string' ? record.commentPrompt : '';
+      const referenceAnswer = typeof record.referenceAnswer === 'string' ? record.referenceAnswer : '';
+      const commentPrompt = [authoredRubric, referenceAnswer ? `参考答案：${referenceAnswer}` : ''].filter(Boolean).join('\n');
+      const compiled: QuizQuestion = { ...base, type: 'short_answer', ...(commentPrompt ? { commentPrompt } : {}),
+        ...(referenceAnswer ? { referenceAnswer } : {}),
+        ...(validScoringRubric(record.scoringRubric) ? { scoringRubric: record.scoringRubric } : {}), hasAnswer: false };
+      return { ...compiled, scoringRubric: ensureScoringRubric(compiled) };
+    }
+    if (format === 'matching') {
+      const rawPairs = record.matchingPairs ?? record.pairs;
+      if (!Array.isArray(rawPairs) || !rawPairs.length) throw new Error(`quiz question ${index + 1} has no matching pairs`);
+      const matchingPairs = rawPairs.map((value, pairIndex): QuizMatchingPair => {
+        if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('quiz matching pair must be an object');
+        const pair = value as Record<string, unknown>;
+        const left = text(pair.left) || text(pair.term) || text(pair.source) || text(pair.prompt);
+        const right = text(pair.right) || text(pair.definition) || text(pair.target) || text(pair.match);
+        if (!left || !right) throw new Error('quiz matching pair has no displayable text');
+        return { leftId: text(pair.leftId) || `L${pairIndex + 1}`, left,
+          rightId: text(pair.rightId) || `R${pairIndex + 1}`, right };
+      });
+      if (new Set(matchingPairs.map((pair) => pair.leftId)).size !== matchingPairs.length
+        || new Set(matchingPairs.map((pair) => pair.rightId)).size !== matchingPairs.length) {
+        throw new Error('quiz matching pair ids must be unique');
+      }
+      return { ...base, type: 'matching', matchingPairs,
+        answer: matchingPairs.map((pair) => `${pair.leftId}:${pair.rightId}`), hasAnswer: true };
+    }
+    const options: QuizOption[] = format === 'true_false'
+      ? [{ value: 'true', label: '正确' }, { value: 'false', label: '错误' }]
+      : Array.isArray(record.options) ? record.options.map((option, optionIndex): QuizOption => {
+          const fallback = String.fromCharCode(65 + optionIndex);
+          if (typeof option === 'string' && option.trim()) return { value: fallback, label: option };
+          if (!option || typeof option !== 'object' || Array.isArray(option)) throw new Error('quiz option must contain displayable text');
+          const raw = option as Record<string, unknown>;
+          const label = text(raw.label) || text(raw.text) || text(raw.value);
+          if (!label) throw new Error('quiz option must contain displayable text');
+          return { value: text(raw.value) || fallback, label };
+        }) : [];
+    if (!options.length || new Set(options.map((option) => option.value)).size !== options.length) {
+      throw new Error(`quiz question ${index + 1} has missing or ambiguous option ids`);
+    }
+    const answers = answerArray(record).map((answer) => format === 'true_false'
+      ? /^(true|正确|对|是|1)$/iu.test(answer) ? 'true'
+        : /^(false|错误|错|否|0)$/iu.test(answer) ? 'false' : answer
+      : options.find((option) => option.value === answer || option.label === answer)?.value ?? answer);
+    if (answers.some((answer) => !options.some((option) => option.value === answer))) {
+      throw new Error(`quiz question ${index + 1} references an unknown answer option`);
+    }
+    return { ...base, type: format === 'multiple_choice' ? 'multiple' : 'single', options,
+      ...(answers.length ? { answer: answers } : {}), hasAnswer: answers.length > 0 };
+  });
+}
+
+export function normalizeQuizQuestions(
+  input: unknown,
+  config: {
+    allowedKnowledgePointIds?: readonly string[];
+  } = {},
+): QuizNormalizationResult {
+  const issues: string[] = [];
+  const allowedKnowledgePointIds = config.allowedKnowledgePointIds
+    ? new Set(config.allowedKnowledgePointIds)
+    : undefined;
+  const rawQuestions = Array.isArray(input) ? input : [];
+  const questions = rawQuestions.flatMap((value, index): QuizQuestion[] => {
+    const record = value && typeof value === 'object' ? value as Record<string, unknown> : {};
+    const question = text(record.question) || text(record.prompt) || text(record.title);
+    if (!question) {
+      issues.push(`question ${index + 1}: missing stem and removed`);
+      return [];
+    }
+    const rawType = text(record.type) || 'single';
+    const id = text(record.id) || `q_${index + 1}`;
+    const requestedKnowledgePointIds = Array.isArray(record.knowledgePointIds)
+      ? record.knowledgePointIds.map(text).filter(Boolean)
+      : [];
+    if (allowedKnowledgePointIds && requestedKnowledgePointIds.length === 0) {
+      issues.push(`question ${index + 1}: missing explicit knowledgePointIds`);
+    }
+    const invalidKnowledgePointIds = allowedKnowledgePointIds
+      ? requestedKnowledgePointIds.filter((knowledgePointId) => !allowedKnowledgePointIds.has(knowledgePointId))
+      : [];
+    if (invalidKnowledgePointIds.length > 0) {
+      issues.push(`question ${index + 1}: knowledgePointIds outside the allowed section: ${Array.from(new Set(invalidKnowledgePointIds)).join(', ')}`);
+    }
+    const validKnowledgePointIds = Array.from(new Set(requestedKnowledgePointIds.filter((knowledgePointId) =>
+      !allowedKnowledgePointIds || allowedKnowledgePointIds.has(knowledgePointId),
+    )));
+    const knowledgePointIds = validKnowledgePointIds;
+    const teachingUnitIds = Array.isArray(record.teachingUnitIds)
+      ? Array.from(new Set(record.teachingUnitIds.map(text).filter(Boolean)))
+      : [];
+    const pointsValue = Number(record.points);
+    const points = Number.isFinite(pointsValue) && pointsValue > 0 ? Math.min(100, Math.round(pointsValue)) : 10;
+    const originalAnalysis = text(record.analysis) || text(record.explanation);
+
+    const format = semanticFormat(rawType, text(record.format));
+    if (format === 'matching') {
+      const matchingPairs = normalizeMatchingPairs(record.matchingPairs ?? record.pairs);
+      if (matchingPairs.length >= 2) {
+        return [{
+          id,
+          knowledgePointIds,
+          teachingUnitIds,
+          type: 'matching',
+          format: 'matching',
+          question,
+          matchingPairs,
+          answer: matchingPairs.map((pair) => `${pair.leftId}:${pair.rightId}`),
+          analysis: originalAnalysis || '正确配对应体现每个概念、对象或步骤与其对应特征之间的准确关系。',
+          hasAnswer: true,
+          points,
+        }];
+      }
+      issues.push(`question ${index + 1}: invalid matching structure repaired as fill_blank`);
+      return [{
+        id,
+        knowledgePointIds,
+        teachingUnitIds,
+        type: 'short_answer',
+        format: 'fill_blank',
+        question: `${question}\n请填写最关键的一组对应关系。`,
+        analysis: originalAnalysis || '参考答案应准确写出题干要求的核心对应关系。',
+        commentPrompt: '评分规则：对应对象准确占80%；语义等价占20%。不要求展开论述。',
+        hasAnswer: false,
+        points,
+      }];
+    }
+
+    if (unsupportedStructuredType(rawType)) {
+      issues.push(`question ${index + 1}: unsupported ${rawType} downgraded to scenario_task`);
+      const structure = explainUnsupported(record);
+      return [{
+        id,
+        knowledgePointIds,
+        teachingUnitIds,
+        type: 'short_answer',
+        format: 'scenario_task',
+        question: structure ? `${question}\n请用“对象—对应关系/顺序—理由”的方式作答。可参考待处理项目：${structure}` : `${question}\n请写出完整关系或顺序，并说明理由。`,
+        analysis: originalAnalysis || '参考答案应给出完整关系或顺序，并根据当前知识点解释每一项判断的依据。',
+        commentPrompt: text(record.commentPrompt) || '评分规则：关系或顺序完整且正确占60%；理由符合当前知识点占30%；表达清楚占10%。',
+        hasAnswer: false,
+        points,
+      }];
+    }
+
+    if (format === 'fill_blank' || format === 'short_answer' || format === 'scenario_task') {
+      if (format === 'fill_blank' && !hasExplicitFillBlankSlot(question)) {
+        issues.push(`question ${index + 1}: fill_blank stem has no explicit blank slot`);
+      }
+      return [{
+        id,
+        knowledgePointIds,
+        teachingUnitIds,
+        type: 'short_answer',
+        format,
+        question,
+        analysis: originalAnalysis || '参考答案必须围绕当前知识点给出关键概念、判断依据和必要步骤，而不只是结论。',
+        commentPrompt: text(record.commentPrompt) || (format === 'fill_blank'
+          ? '评分规则：关键概念准确占70%；语义符合题干占20%；表达清楚占10%。允许语义等价表述。'
+          : '评分规则：核心概念和结论占40%；推理或证据占40%；表达清楚占20%。'),
+        hasAnswer: false,
+        points,
+      }];
+    }
+
+    let options = normalizeOptions(record.options);
+    let answers = answerArray(record);
+    if (new Set(options.map((option) => option.value)).size !== options.length
+      || new Set(options.map((option) => option.label)).size !== options.length) {
+      issues.push(`question ${index + 1}: choice options must have unique values and labels`);
+    }
+    if (format === 'true_false') {
+      if (answers.length !== 1 || !/^(?:true|false|正确|错误|对|错|是|否|0|1)$/iu.test(answers[0] ?? '')) {
+        issues.push(`question ${index + 1}: true_false must provide one explicit boolean answer`);
+      }
+      options = [{ value: 'true', label: '正确' }, { value: 'false', label: '错误' }];
+      answers = answers.map((answer) => /^(true|正确|对|是|1)$/i.test(answer) ? 'true' : 'false').slice(0, 1);
+    } else {
+      answers = answers.map((answer) => {
+        const byValue = options.find((option) => option.value === answer);
+        if (byValue) return byValue.value;
+        return options.find((option) => option.label === answer)?.value ?? answer;
+      });
+    }
+    answers = Array.from(new Set(answers.filter((answer) => options.some((option) => option.value === answer))));
+
+    if (format === 'single_choice' && answers.length > 1) {
+      issues.push(`question ${index + 1}: single choice must provide exactly one correct answer`);
+    }
+
+    if (options.length < 2 || answers.length === 0) {
+      issues.push(`question ${index + 1}: invalid choice structure repaired as fill_blank`);
+      return [{
+        id,
+        knowledgePointIds,
+        teachingUnitIds,
+        type: 'short_answer',
+        format: 'fill_blank',
+        question: `${question}\n请只填写关键概念或正确结论。`,
+        analysis: originalAnalysis || '参考答案应给出题干要求的关键概念或正确结论。',
+        commentPrompt: text(record.commentPrompt) || '评分规则：关键概念或结论准确占80%；语义等价占20%。不要求展开论述。',
+        hasAnswer: false,
+        points,
+      }];
+    }
+
+    const type = format === 'multiple_choice' && answers.length > 1 ? 'multiple' : 'single';
+    if (format === 'multiple_choice' && type === 'single') {
+      issues.push(`question ${index + 1}: multiple choice had fewer than two answers and was repaired as single choice`);
+    }
+    return [{
+      id,
+      knowledgePointIds,
+      teachingUnitIds,
+      type,
+      format: type === 'multiple' ? 'multiple_choice' : format,
+      question,
+      options,
+      answer: type === 'single' ? answers.slice(0, 1) : answers,
+      analysis: choiceAnalysis(options, type === 'single' ? answers.slice(0, 1) : answers, originalAnalysis),
+      hasAnswer: true,
+      points,
+    }];
+  });
+
+  return { questions, issues };
+}

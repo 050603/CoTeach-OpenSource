@@ -1,0 +1,74 @@
+import type {
+  Action,
+  InteractiveContent,
+  PBLContent,
+  PBLProject,
+  PPTElement,
+  QuizContent,
+  QuizQuestion,
+  Scene,
+  SlideBackground,
+  SlideContent,
+  SlideContentBinding,
+  WidgetConfigBase,
+  WidgetType,
+} from '@openmaic/dsl';
+import type { FlowLayoutDecision, FlowPageMeasurement } from './flow-layout-compiler.js';
+
+/** AI-generated slide payload before it is assembled into a scene. */
+export interface GeneratedSlideContent {
+  elements: PPTElement[];
+  contentBindings?: SlideContentBinding[];
+  background?: SlideBackground;
+  remark?: string;
+  sourceGroupIds?: string[];
+  teachingText?: string[];
+  paginationVersion?: 'balanced-v1';
+  occupiedHeight?: number;
+  /** Deterministic measured decision after trying a single-page layout. */
+  layoutDecision?: FlowLayoutDecision;
+  layoutMeasurement?: FlowPageMeasurement;
+  /** Non-blocking quality findings; the rendered draft remains available. */
+  qualityDiagnostics?: string[];
+  /** Host expands these pages before generating per-page actions and media. */
+  continuationPages?: GeneratedSlideContent[];
+}
+
+/** AI-generated quiz payload before it is assembled into a scene. */
+export interface GeneratedQuizContent {
+  questions: QuizQuestion[];
+}
+
+export interface ScientificModel {
+  core_formulas: string[];
+  mechanism: string[];
+  constraints: string[];
+  forbidden_errors: string[];
+}
+
+/** AI-generated interactive payload before it is assembled into a scene. */
+export interface GeneratedInteractiveContent {
+  html: string;
+  scientificModel?: ScientificModel;
+  widgetType?: WidgetType;
+  widgetConfig?: WidgetConfigBase;
+}
+
+/** AI-generated PBL payload. The persisted project contract is owned by the DSL. */
+export interface GeneratedPBLContent {
+  projectV2: PBLProject;
+}
+
+export type GeneratedSceneContent =
+  | GeneratedSlideContent
+  | GeneratedQuizContent
+  | GeneratedInteractiveContent
+  | GeneratedPBLContent;
+
+export type CompleteSceneContent = SlideContent | QuizContent | InteractiveContent | PBLContent;
+
+/** Scene assembled by the package, including the originating outline identity. */
+export type CompleteScene = Scene<Action, CompleteSceneContent> & { outlineId: string };
+
+/** Widget configuration emitted by the model and normalized by the scene layer. */
+export type WidgetConfig = WidgetConfigBase;

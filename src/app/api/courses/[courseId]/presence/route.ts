@@ -1,0 +1,196 @@
+import { withReadApiBoundary, readApiOptionsFor, readApiMethodNotAllowed } from "@/lib/auth/read-api-boundary";
+import { withHttpMetrics } from "@/lib/observability/http";
+import { z } from "zod";
+import { authenticateRequest, requireSameOrigin } from "@/lib/auth/request-guards";
+import { getRedisClient } from "@/lib/redis/client";
+import { prisma } from "@/lib/db/client";
+import type { AuthClaims } from "@/lib/auth/session";
+import type { PresenceMember, PresenceSnapshot } from "@/lib/presence";
+import { canAccessLegacyCourse } from "@/lib/platform/access";
+import { readPresenceHeartbeat, recordPendingSaveReport } from "@/lib/observability/pending-save-reports";
+import { readShowcaseReceipts, recordShowcaseReceipt } from "@/lib/showcase/projection-receipts";
+
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
+const ParamsSchema = z.object({ courseId: z.string().uuid() });
+const PRESENCE_TTL_MS = 60_000;
+const KEY_TTL_SECONDS = 120;
+let lastRedisFallbackLogAt = 0;
+
+async function redisOrDatabase() {
+  try {
+    return await getRedisClient();
+  } catch (error) {
+    const now = Date.now();
+    if (now - lastRedisFallbackLogAt > 30_000) {
+      lastRedisFallbackLogAt = now;
+      console.error("[presence] Redis unavailable; using database heartbeats", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+    return null;
+  }
+}
+
+async function putMeasured(
+  request: Request,
+  context: { params: Promise<{ courseId: string }> },
+) {
+  const csrfError = requireSameOrigin(request);
+  if (csrfError) return csrfError;
+  const auth = await authenticateRequest(request);
+  if ("response" in auth) return auth.response;
+  const parsed = ParamsSchema.safeParse(await context.params);
+  if (!parsed.success) return new Response(null, { status: 404 });
+  if (!(await canAccessLegacyCourse(auth.claims, parsed.data.courseId, "write"))) {
+    return new Response(null, { status: 403 });
+  }
+  const captureSaveTelemetry = async () => {
+    if (auth.claims.role !== "student" || !auth.claims.sub) return;
+    try {
+      const metadata = await readPresenceHeartbeat(request);
+      recordPendingSaveReport(auth.claims.sub, parsed.data.courseId, metadata?.pendingSaves);
+      await recordShowcaseReceipt(parsed.data.courseId, auth.claims.sub, metadata?.showcaseReceipt, redis);
+    }
+    catch { /* Optional diagnostics cannot reject a valid presence heartbeat. */ }
+  };
+  const redis = await redisOrDatabase();
+  if (!redis) {
+    if (auth.claims.role === "student") {
+      await prisma.classroomParticipation.updateMany({
+        where: {
+          instanceId: parsed.data.courseId,
+          enrollment: { userId: auth.claims.sub },
+        },
+        data: {
+          lastEnteredAt: new Date(),
+        },
+      });
+    }
+    await captureSaveTelemetry();
+    return Response.json({ online: true, degraded: true, source: "database" });
+  }
+
+  const now = Date.now();
+  const member = `${auth.claims.role}:${auth.claims.sub}`;
+  const zset = presenceKey(parsed.data.courseId);
+  const details = detailsKey(parsed.data.courseId);
+  await redis
+    .multi()
+    .zAdd(zset, { score: now, value: member })
+    .zRemRangeByScore(zset, 0, now - PRESENCE_TTL_MS)
+    .hSet(details, member, JSON.stringify(publicPresence(auth.claims)))
+    .expire(zset, KEY_TTL_SECONDS)
+    .expire(details, KEY_TTL_SECONDS)
+    .exec();
+  await captureSaveTelemetry();
+  return Response.json({
+    online: true,
+    expiresInSeconds: PRESENCE_TTL_MS / 1_000,
+    source: "redis",
+  });
+}
+
+async function deleteMeasured(
+  request: Request,
+  context: { params: Promise<{ courseId: string }> },
+) {
+  const csrfError = requireSameOrigin(request);
+  if (csrfError) return csrfError;
+  const auth = await authenticateRequest(request);
+  if ("response" in auth) return auth.response;
+  const parsed = ParamsSchema.safeParse(await context.params);
+  if (!parsed.success) return new Response(null, { status: 404 });
+  if (!(await canAccessLegacyCourse(auth.claims, parsed.data.courseId, "write"))) {
+    return new Response(null, { status: 403 });
+  }
+  const redis = await redisOrDatabase();
+  if (!redis && auth.claims.role === "student") {
+    await prisma.classroomParticipation.updateMany({
+      where: {
+        instanceId: parsed.data.courseId,
+        enrollment: { userId: auth.claims.sub },
+      },
+      data: { lastEnteredAt: new Date(Date.now() - PRESENCE_TTL_MS - 1) },
+    });
+  } else if (redis) {
+    const member = `${auth.claims.role}:${auth.claims.sub}`;
+    await redis
+      .multi()
+      .zRem(presenceKey(parsed.data.courseId), member)
+      .hDel(detailsKey(parsed.data.courseId), member)
+      .exec();
+  }
+  return new Response(null, { status: 204 });
+}
+
+async function getMeasured(
+  request: Request,
+  context: { params: Promise<{ courseId: string }> },
+) {
+  const auth = await authenticateRequest(request);
+  if ("response" in auth) return auth.response;
+  const parsed = ParamsSchema.safeParse(await context.params);
+  if (!parsed.success) return new Response(null, { status: 404 });
+  if (!(await canAccessLegacyCourse(auth.claims, parsed.data.courseId, "read"))) {
+    return new Response(null, { status: 403 });
+  }
+  const redis = await redisOrDatabase();
+  if (!redis) {
+    const participations = await prisma.classroomParticipation.findMany({
+      where: { instanceId: parsed.data.courseId, lastEnteredAt: { gte: new Date(Date.now() - PRESENCE_TTL_MS) }, enrollment: { status: { in: ['ACTIVE', 'COMPLETED'] } } },
+      select: { enrollment: { select: { user: { select: { id: true, displayName: true } } } } },
+    });
+    const members: PresenceMember[] = participations.map((row) => ({ id: row.enrollment.user.id, role: 'student', name: row.enrollment.user.displayName }));
+    const snapshot: PresenceSnapshot = {
+      members,
+      ...(auth.claims.role === "teacher" ? { showcaseReceipts: await readShowcaseReceipts(parsed.data.courseId, null) } : {}),
+      degraded: true,
+      source: "database",
+    };
+    return Response.json(snapshot);
+  }
+  const now = Date.now();
+  const zset = presenceKey(parsed.data.courseId);
+  await redis.zRemRangeByScore(zset, 0, now - PRESENCE_TTL_MS);
+  const members = await redis.zRangeByScore(zset, now - PRESENCE_TTL_MS, "+inf");
+  const details = members.length
+    ? await redis.hmGet(detailsKey(parsed.data.courseId), members)
+    : [];
+  const snapshot: PresenceSnapshot = {
+    ...(auth.claims.role === "teacher" ? { showcaseReceipts: await readShowcaseReceipts(parsed.data.courseId, redis) } : {}),
+    members: details.flatMap((value) => {
+      if (!value) return [];
+      try {
+        return [JSON.parse(value) as PresenceMember];
+      } catch {
+        return [];
+      }
+    }),
+    source: "redis",
+  };
+  return Response.json(snapshot);
+}
+
+function publicPresence(claims: AuthClaims) {
+  return claims.role === "teacher"
+    ? { id: claims.sub, role: claims.role, name: claims.displayName }
+    : { id: claims.sub, role: claims.role, name: claims.studentName };
+}
+
+function presenceKey(courseId: string): string {
+  return `openpbl:presence:${courseId}`;
+}
+
+function detailsKey(courseId: string): string {
+  return `openpbl:presence-details:${courseId}`;
+}
+
+export const GET = withReadApiBoundary(withHttpMetrics("GET", "/api/courses/:courseId/presence", getMeasured));
+export const PUT = withReadApiBoundary(withHttpMetrics("PUT", "/api/courses/:courseId/presence", putMeasured, { operation: "write" }));
+export const DELETE = withReadApiBoundary(withHttpMetrics("DELETE", "/api/courses/:courseId/presence", deleteMeasured, { operation: "write" }));
+
+export const OPTIONS = readApiOptionsFor(["GET", "PUT", "DELETE"]);
+export const POST = readApiMethodNotAllowed;
+export const PATCH = readApiMethodNotAllowed;

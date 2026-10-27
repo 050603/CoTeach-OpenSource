@@ -1,0 +1,175 @@
+import { generateInteractiveTts } from '@openmaic/lib/server/interactive-tts';
+import { TtsCapacityError } from '@openmaic/lib/server/tts-provider-limiter';
+/**
+ * Single TTS Generation API
+ *
+ * Generates TTS audio for a single text string and returns base64-encoded audio.
+ * Called by the client in parallel for each speech action after a scene is generated.
+ *
+ * POST /api/openmaic/generate/tts
+ */
+
+import { NextRequest } from 'next/server';
+import { TTSRateLimitError } from '@openmaic/lib/audio/tts-providers';
+import {
+  isServerConfiguredProvider,
+  isServerTTSProviderDisabled,
+  resolveTTSApiKey,
+  resolveTTSBaseUrl,
+  resolveTTSModel,
+  resolveTTSVoice,
+} from '@openmaic/lib/server/provider-config';
+import type { TTSProviderId } from '@openmaic/lib/audio/types';
+import {
+  normalizeTtsScenarioId,
+  type TtsScenarioId,
+} from '@openmaic/lib/audio/tts-scenarios';
+import { qwenAudioTtsModelForVoice } from '@openmaic/lib/audio/qwen-audio-tts-catalog';
+import { createLogger } from '@openmaic/lib/logger';
+import { apiError, apiSuccess } from '@openmaic/lib/server/api-response';
+import { validateUrlForSSRF } from '@openmaic/lib/server/ssrf-guard';
+import { VOXCPM_AUTO_VOICE_ID, VOXCPM_TTS_PROVIDER_ID } from '@openmaic/lib/audio/voxcpm';
+import { checkMediaRateLimit } from '@/lib/auth/media-rate-limit';
+
+const log = createLogger('TTS API');
+
+// The shared 120-second synthesis budget includes local admission and retries.
+export const maxDuration = 150;
+
+export async function POST(req: NextRequest) {
+  const limitResponse = await checkMediaRateLimit(req, 'tts');
+  if (limitResponse) return limitResponse;
+
+  let ttsProviderId: string | undefined;
+  let ttsVoice: string | undefined;
+  let audioId: string | undefined;
+  try {
+    const body = await req.json();
+    const { text, ttsModelId, ttsSpeed, ttsApiKey, ttsBaseUrl, ttsProviderOptions } = body as {
+      text: string;
+      audioId: string;
+      ttsProviderId: TTSProviderId;
+      ttsModelId?: string;
+      ttsVoice: string;
+      ttsSpeed?: number;
+      ttsApiKey?: string;
+      ttsBaseUrl?: string;
+      ttsProviderOptions?: Record<string, unknown>;
+      ttsScenario?: TtsScenarioId;
+    };
+    ttsProviderId = body.ttsProviderId;
+    ttsVoice = body.ttsVoice;
+    audioId = body.audioId;
+
+    // Validate required fields
+    if (!text || !audioId || !ttsProviderId || !ttsVoice) {
+      return apiError(
+        'MISSING_REQUIRED_FIELD',
+        400,
+        'Missing required fields: text, audioId, ttsProviderId, ttsVoice',
+      );
+    }
+
+    // Reject browser-native TTS — must be handled client-side
+    if (ttsProviderId === 'browser-native-tts') {
+      return apiError('INVALID_REQUEST', 400, 'browser-native-tts must be handled client-side');
+    }
+
+    // Enforce server precedence: a force-disabled provider is off for everyone,
+    // regardless of any client key/selection (#665).
+    if (isServerTTSProviderDisabled(ttsProviderId)) {
+      return apiError('PROVIDER_DISABLED', 403, 'This TTS provider is disabled by the server');
+    }
+
+    const voxcpmVoicePrompt =
+      typeof ttsProviderOptions?.voicePrompt === 'string' ? ttsProviderOptions.voicePrompt : '';
+    const voxcpmRegisteredVoiceId =
+      typeof ttsProviderOptions?.registeredVoiceId === 'string'
+        ? ttsProviderOptions.registeredVoiceId
+        : '';
+    if (
+      ttsProviderId === VOXCPM_TTS_PROVIDER_ID &&
+      ttsVoice === VOXCPM_AUTO_VOICE_ID &&
+      !voxcpmVoicePrompt.trim() &&
+      !voxcpmRegisteredVoiceId.trim()
+    ) {
+      return apiError(
+        'VOXCPM_AUTO_VOICE_REQUIRES_CONTEXT',
+        400,
+        'VoxCPM Auto Voice requires agent context',
+      );
+    }
+
+    // Managed providers are admin-owned: ignore any client-sent key/baseUrl.
+    const managed = isServerConfiguredProvider('tts', ttsProviderId);
+    const clientBaseUrl = managed ? undefined : ttsBaseUrl || undefined;
+    if (clientBaseUrl) {
+      const ssrfError = await validateUrlForSSRF(clientBaseUrl);
+      if (ssrfError) {
+        return apiError('INVALID_URL', 403, ssrfError);
+      }
+    }
+
+    const apiKey = resolveTTSApiKey(ttsProviderId, managed ? undefined : ttsApiKey || undefined);
+    const baseUrl = resolveTTSBaseUrl(ttsProviderId, clientBaseUrl);
+    const scenario = normalizeTtsScenarioId(body.ttsScenario);
+    const modelId = resolveTTSModel(ttsProviderId, ttsModelId, scenario);
+    const scenarioVoice = resolveTTSVoice(ttsProviderId, ttsVoice, scenario) || ttsVoice;
+    // Keep feature/agent voice overrides when they work with the selected
+    // scenario model. Qwen Audio 3.0 has disjoint Plus/Flash voice catalogs,
+    // so an incompatible requested voice falls back to the teacher's scenario
+    // voice instead of sending an invalid vendor request.
+    const voice = managed
+      && ttsProviderId === 'qwen-tts'
+      && qwenAudioTtsModelForVoice(ttsVoice) !== modelId
+        ? scenarioVoice
+        : ttsVoice;
+
+    // Build TTS config (managed providers pin the model by usage scenario).
+    const config = {
+      providerId: ttsProviderId as TTSProviderId,
+      modelId,
+      voice,
+      speed: ttsSpeed ?? 1.0,
+      apiKey,
+      baseUrl,
+      providerOptions: ttsProviderOptions,
+    };
+
+    log.info(
+      `Generating TTS: provider=${ttsProviderId}, scenario=${scenario}, model=${config.modelId || 'default'}, voice=${voice}, ` +
+        `registeredVoiceId=${voxcpmRegisteredVoiceId || 'none'}, audioId=${audioId}, textLen=${text.length}`,
+    );
+
+    // Generate audio
+    const { audio, format } = await generateInteractiveTts(config, text, req.signal);
+
+    // Convert to base64
+    const base64 = Buffer.from(audio).toString('base64');
+
+    return apiSuccess({ audioId, base64, format });
+  } catch (error) {
+    if (req.signal.aborted) return new Response(null, { status: 499 });
+    log.error(
+      `TTS generation failed [provider=${ttsProviderId ?? 'unknown'}, voice=${ttsVoice ?? 'unknown'}, audioId=${audioId ?? 'unknown'}]:`,
+      error,
+    );
+    if (error instanceof TTSRateLimitError) {
+      const response = apiError('RATE_LIMITED', 429, error.message,
+        JSON.stringify({ upstreamCode: error.upstreamCode, upstreamRequestId: error.upstreamRequestId }));
+      if (error.retryAfterMs && error.retryAfterMs > 0) response.headers.set('Retry-After', String(Math.ceil(error.retryAfterMs / 1000)));
+      return response;
+    }
+    if (error instanceof TtsCapacityError) {
+      const response = apiError('RATE_LIMITED', 503, error.message);
+      response.headers.set('Retry-After', String(Math.ceil(error.retryAfterMs / 1000)));
+      return response;
+    }
+    if (error instanceof Error && error.name === 'TimeoutError') return apiError('GENERATION_FAILED', 504, '语音合成等待或生成超时，请重试');
+    return apiError(
+      'GENERATION_FAILED',
+      500,
+      error instanceof Error ? error.message : String(error),
+    );
+  }
+}

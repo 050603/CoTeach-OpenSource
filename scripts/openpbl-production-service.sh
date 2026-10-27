@@ -1,0 +1,216 @@
+#!/bin/sh
+set -eu
+
+PROJECT_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+SECRET_DIR="${OPENPBL_SECRET_DIR:-$PROJECT_ROOT/deploy/secrets}"
+APP_PORT="${OPENPBL_PORT:-3000}"
+RUNNER_PORT="${OPENPBL_CODE_RUNNER_PORT:-3002}"
+
+read_secret() {
+  secret_path="$SECRET_DIR/$1"
+  if [ ! -r "$secret_path" ] || [ ! -s "$secret_path" ]; then
+    echo "CoTeach 配置文件不可读或为空：$secret_path" >&2
+    exit 1
+  fi
+  tr -d '\r\n' < "$secret_path"
+}
+
+wait_for_tcp() {
+  dependency_name="$1"
+  dependency_host="$2"
+  dependency_port="$3"
+  attempt=0
+
+  while [ "$attempt" -lt 60 ]; do
+    if /usr/bin/node -e '
+      const net = require("node:net");
+      const socket = net.connect(Number(process.argv[2]), process.argv[1]);
+      socket.setTimeout(1000);
+      socket.once("connect", () => { socket.end(); process.exit(0); });
+      socket.once("error", () => process.exit(1));
+      socket.once("timeout", () => { socket.destroy(); process.exit(1); });
+    ' "$dependency_host" "$dependency_port"; then
+      return 0
+    fi
+
+    attempt=$((attempt + 1))
+    if [ "$attempt" -eq 1 ]; then
+      echo "等待 $dependency_name（$dependency_host:$dependency_port）就绪……"
+    fi
+    sleep 2
+  done
+
+  echo "$dependency_name 在 120 秒内未就绪。" >&2
+  return 1
+}
+
+load_shared_environment() {
+  export DATABASE_URL="$(read_secret database_url.txt)"
+  export JWT_SECRET="$(read_secret jwt_secret.txt)"
+  export PROVIDER_ENCRYPTION_KEY="$(read_secret provider_encryption_key.txt)"
+  export INTERNAL_MONITOR_TOKEN="$(read_secret monitor_token.txt)"
+  export REDIS_URL="redis://127.0.0.1:16379"
+  export NEXT_TELEMETRY_DISABLED="1"
+}
+
+apply_database_migrations() {
+  echo "检查 PostgreSQL 数据库迁移……"
+  (
+    cd "$PROJECT_ROOT"
+    /usr/bin/node scripts/run-prisma.mjs migrate deploy
+  )
+}
+
+run_app() {
+  runtime_server=""
+  if [ "${OPENPBL_RUNTIME_BUILD_ID+x}" = x ]; then
+    # An explicit pin must never silently fall back to a different build. Keep
+    # this check before secrets/dependencies/migrations, then use the normal
+    # application environment and lifecycle below for the selected release.
+    runtime_server="$(/usr/bin/node "$PROJECT_ROOT/scripts/lib/production-runtime-release.mjs" "$PROJECT_ROOT" "$OPENPBL_RUNTIME_BUILD_ID")"
+  elif [ -d "$PROJECT_ROOT/.openpbl-runtime/releases" ]; then
+    # A staged server.js may already exist while its chunks/workers are still
+    # being built. Select a fully checked release even when staging exists.
+    for release_dir in $(ls -dt "$PROJECT_ROOT"/.openpbl-runtime/releases/* 2>/dev/null); do
+      if [ -f "$release_dir/.release-ready" ] && [ -f "$release_dir/server.js" ]; then
+        if runtime_server="$(/usr/bin/node "$PROJECT_ROOT/scripts/lib/production-runtime-release.mjs" "$PROJECT_ROOT" "${release_dir##*/}")"; then
+          break
+        fi
+        runtime_server=""
+      fi
+    done
+  fi
+  if [ -z "$runtime_server" ] && [ ! -f "$PROJECT_ROOT/.next-build/standalone/server.js" ]; then
+    echo "未找到平台生产构建或可用的历史版本，请先运行：pnpm build" >&2
+    exit 1
+  fi
+
+  public_base_url="${OPENPBL_PUBLIC_BASE_URL:-${PUBLIC_BASE_URL:-}}"
+  if [ -z "$public_base_url" ]; then
+    echo "请为此部署显式配置 OPENPBL_PUBLIC_BASE_URL 或 PUBLIC_BASE_URL；systemd 可通过 ~/.config/openpbl/site.env 加载。" >&2
+    exit 1
+  fi
+  export PUBLIC_BASE_URL="$public_base_url"
+
+  load_shared_environment
+  wait_for_tcp "PostgreSQL" "127.0.0.1" "15432"
+  wait_for_tcp "Redis" "127.0.0.1" "16379"
+  # Keep the production schema in lockstep with the Prisma Client embedded in
+  # the build. `migrate deploy` is idempotent and only applies pending,
+  # committed migrations; it never creates development migrations here.
+  apply_database_migrations
+
+  # External IPv4 endpoints are reached through the deployment-managed NAT64
+  # sidecar. Never auto-discover a desktop/session proxy: its lifetime is not
+  # tied to the production service and a later disconnect would strand jobs.
+  outbound_proxy="${OPENPBL_OUTBOUND_PROXY:-}"
+  if [ -n "$outbound_proxy" ]; then
+    export OPENPBL_OUTBOUND_PROXY="$outbound_proxy"
+    export OPENPBL_DEEPSEEK_PROXY="${OPENPBL_DEEPSEEK_PROXY:-$outbound_proxy}"
+  fi
+
+  mkdir -p \
+    "$PROJECT_ROOT/.openpbl-data/uploads" \
+    "$PROJECT_ROOT/.openpbl-data/whiteboards"
+
+  export TRUST_PROXY_HEADERS="true"
+  # Keep durable generation owned by the server lifecycle so navigation or a
+  # completed route response cannot terminate the task that started it.
+  export COURSE_GENERATION_BACKGROUND_ENABLED="true"
+  # Whole-class AI discussion is enabled for the formal classroom service.
+  # Operators can still disable it without rebuilding the application.
+  export ENABLE_PUBLIC_DISCUSSION="${OPENPBL_ENABLE_PUBLIC_DISCUSSION:-true}"
+  # Resource/page/media controls use the dedicated realtime channel. Durable
+  # course-event polling remains enabled as a one-second outage fallback.
+  export ENABLE_WEBSOCKET="true"
+  export WEBSOCKET_PORT="${OPENPBL_WEBSOCKET_PORT:-3001}"
+  export WEBSOCKET_HOST="${OPENPBL_WEBSOCKET_HOST:-127.0.0.1}"
+  export UPLOAD_DIR="$PROJECT_ROOT/.openpbl-data/uploads"
+  export WHITEBOARD_DATA_DIR="$PROJECT_ROOT/.openpbl-data/whiteboards"
+  export CLASSROOM_DATA_DIR="$PROJECT_ROOT/.openpbl-data/classrooms"
+  # The standalone server changes cwd to its immutable release. Alignment
+  # results belong to durable audio, so keep them across release switches.
+  export OPENPBL_SPEECH_ALIGNMENT_CACHE_DIR="${OPENPBL_SPEECH_ALIGNMENT_CACHE_DIR:-$PROJECT_ROOT/.openpbl-data/speech-alignment-cache}"
+  export CODE_RUNNER_URL="http://127.0.0.1:$RUNNER_PORT"
+  export CODE_RUNNER_TOKEN="$INTERNAL_MONITOR_TOKEN"
+
+  cd "$PROJECT_ROOT"
+  export PORT="$APP_PORT"
+  export KEEP_ALIVE_TIMEOUT="${KEEP_ALIVE_TIMEOUT:-65000}"
+  export HOSTNAME="${OPENPBL_HOSTNAME:-127.0.0.1}"
+  if [ -n "$runtime_server" ]; then
+    # Prepared host releases embed .next-build. This direct path bypasses the
+    # normal launcher that sets NEXT_DIST_DIR for release-local runtime assets.
+    export NEXT_DIST_DIR=".next-build"
+    exec /usr/bin/node "$runtime_server"
+  fi
+  exec /usr/bin/node scripts/run-next-production.mjs start
+}
+
+run_code_runner() {
+  export CODE_RUNNER_TOKEN="$(read_secret monitor_token.txt)"
+  export CODE_RUNNER_HOST="127.0.0.1"
+  export CODE_RUNNER_PORT="$RUNNER_PORT"
+
+  cd "$PROJECT_ROOT"
+  exec /usr/bin/node scripts/code-runner-server.mjs
+}
+
+run_survey_nlp() {
+  export HANLP_HOME="$PROJECT_ROOT/.openpbl-runtime/nlp-models"
+  export OPENPBL_NLP_MODEL_PATH="$HANLP_HOME/coarse_electra_small_20220616_012050"
+  nlp_python="${OPENPBL_NLP_PYTHON:-$PROJECT_ROOT/.openpbl-runtime/nlp-venv/bin/python}"
+  cd "$PROJECT_ROOT"
+  exec "$nlp_python" scripts/survey-nlp-server.py
+}
+
+run_speech_alignment() {
+  export OPENPBL_ALIGNMENT_MODEL_PATH="$PROJECT_ROOT/.openpbl-runtime/speech-alignment-models/Qwen3-ForcedAligner-0.6B"
+  alignment_python="${OPENPBL_ALIGNMENT_PYTHON:-$PROJECT_ROOT/.openpbl-runtime/speech-alignment-venv/bin/python}"
+  cd "$PROJECT_ROOT"
+  exec "$alignment_python" scripts/speech-alignment-server.py
+}
+
+cleanup_data() {
+  load_shared_environment
+  wait_for_tcp "PostgreSQL" "127.0.0.1" "15432"
+  export UPLOAD_DIR="$PROJECT_ROOT/.openpbl-data/uploads"
+  export CLASSROOM_DATA_DIR="$PROJECT_ROOT/.openpbl-data/classrooms"
+  cd "$PROJECT_ROOT"
+  exec /usr/local/bin/pnpm exec tsx scripts/cleanup-storage.ts
+}
+
+rehydrate_data() {
+  load_shared_environment
+  wait_for_tcp "PostgreSQL" "127.0.0.1" "15432"
+  export UPLOAD_DIR="$PROJECT_ROOT/.openpbl-data/uploads"
+  export CLASSROOM_DATA_DIR="$PROJECT_ROOT/.openpbl-data/classrooms"
+  cd "$PROJECT_ROOT"
+  exec /usr/local/bin/pnpm exec tsx scripts/rehydrate-storage.ts "$@"
+}
+
+case "${1:-}" in
+  run-app)
+    run_app
+    ;;
+  run-code-runner)
+    run_code_runner
+    ;;
+  run-survey-nlp)
+    run_survey_nlp
+    ;;
+  run-speech-alignment)
+    run_speech_alignment
+    ;;
+  cleanup-data)
+    cleanup_data
+    ;;
+  rehydrate-data)
+    shift
+    rehydrate_data "$@"
+    ;;
+  *)
+    echo "用法：$0 {run-app|run-code-runner|run-survey-nlp|run-speech-alignment|cleanup-data|rehydrate-data [参数]}" >&2
+    exit 2
+    ;;
+esac

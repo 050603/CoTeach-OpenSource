@@ -1,0 +1,2197 @@
+// Isolated, sequential acceptance. Business writes use a disposable database;
+// reading deployed provider configuration requires PRELAUNCH_REAL_PROVIDERS=1.
+// Run after dependencies are installed: node scripts/verify-prelaunch-functional.mjs
+import assert from 'node:assert/strict';
+import { execFileSync, spawn } from 'node:child_process';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { cpSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
+import { Prisma, PrismaClient } from '@prisma/client';
+import { hash } from '@node-rs/argon2';
+import { chromium } from 'playwright';
+import { PDFDocument } from 'pdf-lib';
+import JSZip from 'jszip';
+import PptxGenJS from 'pptxgenjs';
+import { browserConfiguration, inspectBrowserIdentity } from './lib/prelaunch-browser.mjs';
+import { startPrelaunchProxy } from './lib/prelaunch-proxy.mjs';
+import { createAppRequestJournal } from './lib/prelaunch-http-diagnostics.mjs';
+import { snapshotAcceptanceProviders } from './lib/classroom-acceptance-provider-snapshot.mjs';
+import { removeAcknowledgedDocumentDrafts } from './lib/classroom-acceptance-document-review-settlement.mjs';
+import { observeSubmissionSaveReceipts, confirmSubmissionSave } from './lib/classroom-acceptance-save-confirmation.mjs';
+import { observeQuietClassroom, evaluateClassroomSoak } from './lib/classroom-acceptance-soak.mjs';
+import { captureProcessTreeMemoryAnchor, sampleProcessTreeMemory } from './lib/process-tree-memory.mjs';
+import { assertIsolatedRestoreDatabase, restoredClassroomEnvironment, runFileCommand, stopIsolatedApplication } from './lib/classroom-acceptance-restored-app.mjs';
+import { verifyStaticRuntime } from './lib/prelaunch-static-runtime.mjs';
+import { verifyReadApiBoundaryHttp } from './lib/prelaunch-read-api-boundary.mjs';
+import { HTTP_UPSTREAM_POLICY } from './lib/http-upstream-policy.mjs';
+import { desktopSizes, openLayoutContext, measureLayoutEnvironment, captureLayoutScreenshot, deployedLayoutBuild, settleLayoutAssets } from './lib/layout-browser.mjs';
+import { preserveAcceptanceFailureDatabases } from './lib/classroom-acceptance-failure-preservation.mjs';
+import { withCleanupRejectionGuard } from './lib/classroom-acceptance-promise-lifecycle.mjs';
+import { courseReadExperimentPrimaryURL, courseReadWorkerSettings, provisionCourseReadRole, readCourseReadEnvironmentFile } from './lib/course-read-role.mjs';
+import { completionCourseReadEnvironment } from './lib/completion-review-environment.mjs';
+
+const root = path.resolve(import.meta.dirname, '..');
+const browserConfig = browserConfiguration();
+const output = path.resolve(process.env.PRELAUNCH_OUTPUT_DIR || path.join(root, 'test-results/prelaunch/functional'));
+mkdirSync(output, { recursive: true });
+const resumeSource = process.env.PRELAUNCH_RESUME_AI_DIR ? path.resolve(process.env.PRELAUNCH_RESUME_AI_DIR) : null;
+const resumePublicDiscussion = process.env.PRELAUNCH_RESUME_PUBLIC_DISCUSSION === '1';
+assert.ok(!resumePublicDiscussion || resumeSource, 'Public discussion recovery requires a previous isolated report directory');
+const container = `openpbl-prelaunch-${randomUUID()}`;
+const redisContainer = `${container}-redis`;
+const temporary = path.join(tmpdir(), container);
+mkdirSync(temporary, { recursive: true });
+const reuseBuild = process.env.PRELAUNCH_REUSE_BUILD === '1';
+const distDir = process.env.PRELAUNCH_DIST_DIR || (reuseBuild ? '.next-build' : `.next-prelaunch-${process.pid}`);
+assert.ok(!path.isAbsolute(distDir) && !distDir.includes('..'), 'Build directory must stay inside the repository');
+assert.ok(reuseBuild || distDir.startsWith('.next-prelaunch-'), 'Disposable builds must use .next-prelaunch-*');
+const port = 3198;
+const origin = `http://127.0.0.1:${port}`;
+const websocketEnabled = process.env.PRELAUNCH_WEBSOCKET === '1';
+const linkageOnly = process.env.PRELAUNCH_LINKAGE_ONLY === '1';
+const practiceOnly = process.env.PRELAUNCH_PRACTICE_ONLY === '1';
+const classroomAcceptance = process.env.PRELAUNCH_CLASSROOM_ACCEPTANCE === '1';
+const completionReviewOnly = process.env.PRELAUNCH_COMPLETION_REVIEW === '1';
+const incrementalOnly = process.env.PRELAUNCH_INCREMENTAL === '1';
+const browserSuite = process.env.PRELAUNCH_BROWSER_SUITE;
+assert.ok(!browserSuite || ['ui', 'faults'].includes(browserSuite), 'Unknown acceptance browser suite');
+assert.ok(!classroomAcceptance || (!practiceOnly && !linkageOnly && !resumeSource && websocketEnabled), 'Whole-class acceptance requires an independent WebSocket instance');
+assert.ok(!completionReviewOnly || (!classroomAcceptance && !practiceOnly && !linkageOnly && !resumeSource && !browserSuite && websocketEnabled), 'Completion review requires an independent WebSocket instance');
+assert.ok(!incrementalOnly || (!classroomAcceptance && !completionReviewOnly && !practiceOnly && !linkageOnly
+  && !resumeSource && !browserSuite && websocketEnabled && process.env.PRELAUNCH_REAL_PROVIDERS === '1'),
+'Incremental acceptance requires an independent WebSocket instance, real providers and no other acceptance mode');
+const practiceModes = (process.env.PRELAUNCH_PRACTICE_MODES || 'python,c,document').split(',');
+assert.ok(practiceModes.every(mode => ['python', 'c', 'document'].includes(mode)), 'Unknown practice mode');
+assert.ok(!practiceOnly || (!linkageOnly && !resumeSource), 'Practice acceptance cannot be combined with linkage-only or AI recovery');
+assert.ok(!practiceOnly || process.env.PRELAUNCH_REAL_PROVIDERS !== '1', 'Practice acceptance reuses no paid provider configuration');
+const appPort = websocketEnabled ? 3197 : port;
+const password = randomBytes(18).toString('base64url');
+const env = {
+  ...process.env,
+  DATABASE_URL: '',
+  PROVIDER_CONFIG_DATABASE_URL: '',
+  PROVIDER_CONFIG_ENCRYPTION_KEY: '',
+  OPENPBL_COURSE_READ_DATABASE_URL: '',
+  REDIS_URL: '',
+  PROVIDER_ENCRYPTION_KEY: randomBytes(32).toString('base64'),
+  INTERNAL_MONITOR_TOKEN: randomBytes(32).toString('base64url'),
+  TRUST_PROXY_HEADERS: 'true',
+  ENABLE_LOAD_TEST_API: 'false',
+  JWT_SECRET: randomBytes(48).toString('base64url'),
+  NEXT_DIST_DIR: distDir,
+  KEEP_ALIVE_TIMEOUT: process.env.KEEP_ALIVE_TIMEOUT || String(HTTP_UPSTREAM_POLICY.serverKeepAliveMs),
+  NEXT_PUBLIC_OPENPBL_SYSTEM_MODE: 'new',
+  ENABLE_WEBSOCKET: String(websocketEnabled),
+  WEBSOCKET_HOST: '127.0.0.1',
+  WEBSOCKET_PORT: '3199',
+  ENABLE_TLDRAW_SYNC: 'false',
+  COURSE_GENERATION_BACKGROUND_ENABLED: 'false',
+  KNOWLEDGE_EXPLANATION_WARMUP_ENABLED: String(classroomAcceptance),
+  ENABLE_PUBLIC_DISCUSSION: process.env.PRELAUNCH_CLASSROOM_AI === '1' ? 'true' : 'false',
+  DOCUMENT_AI_PROACTIVE_REVIEW_ENABLED: practiceOnly ? 'false' : 'true',
+  UPLOAD_DIR: path.join(temporary, 'uploads'),
+  TTS_CACHE_DIR: path.join(temporary, 'tts-cache'),
+  WHITEBOARD_DATA_DIR: path.join(temporary, 'whiteboards'),
+  CLASSROOM_DATA_DIR: path.join(temporary, 'classrooms'),
+  AI_AUDIT_OUTBOX_DIR: path.join(temporary, 'ai-audit-outbox'),
+  PUBLIC_BASE_URL: origin,
+  NEXT_TELEMETRY_DISABLED: '1',
+};
+let completionReadConfiguration;
+if (completionReviewOnly || incrementalOnly) {
+  const installed = await readCourseReadEnvironmentFile(path.join(root, 'deploy/secrets/course-read.env'));
+  const resolved = completionCourseReadEnvironment(process.env, installed);
+  Object.assign(env, resolved.environment);
+  completionReadConfiguration = resolved.evidence;
+}
+const courseReadSettings = courseReadWorkerSettings(env);
+let isolatedCourseReadRole;
+let started = false;
+let redisStarted = false;
+let restoredDatabaseCreated = false;
+let server;
+let localProxy;
+let browser;
+let browserIdentity;
+let db;
+let serverOutput = '';
+const appRequestJournal = classroomAcceptance || completionReviewOnly || incrementalOnly
+  ? createAppRequestJournal(path.join(output, 'isolated-app-requests.ndjson')) : null;
+const appMemoryAnchors = new WeakMap();
+const observeServer = child => {
+  if (classroomAcceptance || completionReviewOnly || incrementalOnly) appMemoryAnchors.set(child, captureProcessTreeMemoryAnchor({ pid: child.pid }));
+  const remember = chunk => { serverOutput = (serverOutput + chunk.toString()).slice(-12000); };
+  if (appRequestJournal) appRequestJournal.attach(child, remember);
+  else for (const stream of [child.stdout, child.stderr]) stream.on('data', remember);
+};
+const applicationProcessTreeMemory = async () => {
+  const child = server; const anchor = child ? await appMemoryAnchors.get(child) : null;
+  if (!child || child !== server || child.exitCode !== null || child.signalCode !== null || anchor?.status !== 'measured') return null;
+  return sampleProcessTreeMemory({ pid: child.pid, startTicks: anchor.startTicks });
+};
+let verifiedBuildId = null;
+let classroomAcceptanceReport = null;
+let classroomSoakReport = null;
+const results = [];
+const aiSamples = [];
+const record = (name, status, detail = '', evidence = name.startsWith('real-ai-') || name.startsWith('provider-') ? 'real-provider-api' : 'isolated-backend') => {
+  results.push({ name, status, detail, evidence });
+  console.log(`${status} ${name}${detail ? `: ${typeof detail === 'object' ? JSON.stringify(detail) : detail}` : ''}`);
+};
+const command = (bin, args, options = {}) => execFileSync(bin, args, { cwd: root, env, encoding: 'utf8', timeout: 120_000, ...options }).trim();
+const sourceCommit = command('git', ['rev-parse', '--short', 'HEAD']);
+const report = () => writeFileSync(path.join(output, 'report.json'), JSON.stringify({
+  date: new Date().toISOString(), commit: sourceCommit,
+  mode: 'isolated-production-build-and-disposable-database', buildId: verifiedBuildId,
+  realClassroomAi: incrementalOnly || process.env.PRELAUNCH_CLASSROOM_AI === '1', browser: browserIdentity ?? null,
+  ...(classroomAcceptanceReport ? { classroomAcceptance: classroomAcceptanceReport } : {}),
+  ...(classroomSoakReport ? { classroomSoak: classroomSoakReport } : {}),
+  environment: { platform: process.platform, node: process.version, packageManager: process.env.npm_config_user_agent,
+    proxyProcess: localProxy ? { pid: localProxy.pid, driverPid: process.pid, port: localProxy.port } : null,
+    viewport: { width: 1366, height: 768 }, classroomTransport: websocketEnabled ? 'websocket-with-http-recovery' : 'http-polling',
+    httpConnections: { ...HTTP_UPSTREAM_POLICY, serverKeepAliveMs: Number(env.KEEP_ALIVE_TIMEOUT) },
+    database: 'disposable-container', resources: 'temporary-directories', linkageOnly, practiceOnly, incremental: incrementalOnly,
+    ...(completionReviewOnly ? { completionReadConfiguration } : {}),
+    ...(incrementalOnly ? { incrementalReadConfiguration: completionReadConfiguration } : {}), ...(practiceOnly ? { practiceModes } : {}) },
+  evidence: { 'isolated-backend': 'Real disposable database and application APIs', 'browser-real-backend': 'Browser operations against the disposable backend', 'real-provider-api': 'Actual configured provider requests; not proof of browser controls or audible hardware output', 'browser-media': 'Browser decoding/playback with advancing media time', 'injected-fault': 'Deterministic intercepted error with the remaining business flow on the real isolated backend' },
+  limitations: ['Linux only; no physical microphone, speaker or projection hardware',
+    ...(practiceOnly ? ['Practice-only run configures no paid AI providers; automatic code-review failures are recorded separately from editing, persistence and real sandbox execution'] : []),
+    ...(websocketEnabled ? ['Loopback reverse proxy routes real upgrades to the isolated WebSocket server; deployment TLS/proxy is checked separately'] : ['WebSocket transport is disabled; classroom recovery checks HTTP polling']),
+    'Native browser zoom is covered by the separate branded-native-zoom suite'], results,
+}, null, 2));
+
+async function captureAiUsageMetrics() {
+    try {
+      const metrics = await fetch(`${origin}/api/metrics`, {
+        headers: { Authorization: `Bearer ${env.INTERNAL_MONITOR_TOKEN}` }, signal: AbortSignal.timeout(5_000),
+      });
+      assert.equal(metrics.status, 200);
+      const aiMetrics = (await metrics.text()).split('\n').filter(line => /^classroom_ai_/.test(line));
+      writeFileSync(path.join(output, 'ai-usage-metrics.prom'), `${aiMetrics.join('\n')}\n`);
+      record('classroom-ai-usage-and-cache-metrics', '通过', '保留供应商token和unknown标记，不推算货币费用');
+    } catch (error) { record('classroom-ai-usage-and-cache-metrics', '失败', String(error.message).slice(0, 200)); }
+}
+
+// The orchestrator terminates this process group on identity changes or a
+// timeout. The server and database have independent lifetimes, so POSIX's
+// default signal exit would leak them and occupy the next suite's ports.
+let signalCleanup;
+let interruptPromiseRejections = 0;
+async function cleanupInterruptedRun(signal) {
+  if (signalCleanup) return signalCleanup;
+  signalCleanup = withCleanupRejectionGuard(async () => {
+    record('interrupted', '失败', `Isolated acceptance interrupted by ${signal}`);
+    try { report(); } catch (error) { console.error('Could not preserve interrupted report', error.message); }
+    const cleanup = await Promise.allSettled([browser?.close(), localProxy?.close(), db?.$disconnect(),
+      stopIsolatedApplication(server, { graceMs: 15000, killMs: 5000 })]);
+    if (cleanup.some(result => result.status === 'rejected')) {
+      record('isolated-interrupt-cleanup', '失败', 'One or more resources did not confirm shutdown before the database snapshot');
+    }
+    try { await appRequestJournal?.close(); }
+    catch { record('isolated-app-request-journal', '失败', 'Interrupted diagnostic journal incomplete'); }
+    // The interrupt path exits directly, so it must preserve its own evidence
+    // before removing the databases; it cannot rely on the normal finally.
+    await preserveFailureDatabases('interrupted');
+    if (interruptPromiseRejections > 3) record('isolated-interrupt-promise-rejection-summary', '失败', { count: interruptPromiseRejections, individuallyRecorded: 3 });
+    try { report(); } catch (error) { console.error('Could not preserve interrupted report', error.message); }
+    for (const name of [started && container, redisStarted && redisContainer].filter(Boolean)) {
+      try { command('docker', ['rm', '--force', name]); } catch { /* already removed */ }
+    }
+    rmSync(temporary, { recursive: true, force: true });
+    process.exit(signal === 'SIGINT' ? 130 : 143);
+  }, () => {
+    // The interrupted run is already failed. Avoid logging waiter messages:
+    // Playwright errors may contain request headers or private response data.
+    interruptPromiseRejections += 1;
+    if (interruptPromiseRejections <= 3) {
+      record('isolated-interrupt-promise-rejection', '失败', 'A pending operation rejected during controlled shutdown; preserving evidence before exit.');
+      try { report(); } catch { /* The final preservation/report path still runs. */ }
+    }
+  });
+  return signalCleanup;
+}
+// pnpm/tsx may forward the same signal after the process group receives it.
+// Keep both handlers until cleanup exits; a second signal must not restore the
+// default immediate exit and strand this run's disposable containers.
+process.on('SIGINT', () => { void cleanupInterruptedRun('SIGINT'); });
+process.on('SIGTERM', () => { void cleanupInterruptedRun('SIGTERM'); });
+
+async function preserveFailureDatabases(reason = 'failure') {
+  try {
+    const evidence = await preserveAcceptanceFailureDatabases({ started, container, output,
+      restoredDatabaseCreated, reason });
+    if (evidence.status === 'failed') {
+      record('isolated-database-preservation', '失败', `${reason}: one or more diagnostic snapshots failed; see database-${reason}-preservation.json`);
+    }
+  } catch (error) {
+    record('isolated-database-preservation', '失败', String(error.message ?? error)
+      .replace(/postgres(?:ql)?:\/\/\S+/g, '[database]').slice(0, 500));
+  }
+}
+
+async function checkedRequest(context, method, url, data, expected = 200) {
+  const response = await context.request.fetch(`${origin}${url}`, {
+    method, headers: { Origin: origin }, ...(data === undefined ? {} : { data }), timeout: 30_000,
+  });
+  const body = await response.json().catch(() => ({}));
+  assert.equal(response.status(), expected, `${method} ${url}: ${response.status()} ${JSON.stringify(body).slice(0, 300)}`);
+  return body;
+}
+
+async function pageCheckAtViewport(context, name, route, expected, expectedApiErrors = [], layout) {
+  const page = await context.newPage();
+  const pageErrors = [];
+  const resources = [];
+  const apiErrors = [];
+  page.on('pageerror', (error) => pageErrors.push(error.message));
+  page.on('response', (response) => {
+    if (response.status() >= 400 && /\.(?:js|css|woff2?|png|jpe?g|webp)(?:\?|$)/.test(response.url())) resources.push(`${response.status()} ${new URL(response.url()).pathname}`);
+    if (response.status() >= 400 && new URL(response.url()).pathname.startsWith('/api/')) {
+      const actual = `${response.status()} ${new URL(response.url()).pathname}`;
+      if (!expectedApiErrors.some((allowed) => allowed.test(actual))) apiErrors.push(actual);
+    }
+  });
+  try {
+    const response = await page.goto(`${origin}${route}`, { waitUntil: 'domcontentloaded', timeout: 90_000 });
+    assert.equal(response?.status(), 200, `${route} returned ${response?.status()}`);
+    await page.getByText(expected).filter({ visible: true }).first().waitFor({ timeout: 30_000 });
+    assert.equal(new URL(page.url()).pathname, route.split('?')[0], 'unexpected redirect');
+    await page.reload({ waitUntil: 'domcontentloaded', timeout: 30_000 });
+    await page.getByText(expected).filter({ visible: true }).first().waitFor({ timeout: 30_000 });
+    assert.deepEqual(pageErrors, [], 'uncaught browser error');
+    assert.deepEqual(resources, [], 'broken static resource');
+    assert.deepEqual(apiErrors, [], 'unexpected API response');
+    if (layout) {
+      await settleLayoutAssets(page);
+      const runtime = await measureLayoutEnvironment(page, layout);
+      const brokenImages = await page.evaluate(() => [...document.images].filter(img => img.getClientRects().length && (!img.complete || !img.naturalWidth)).map(img => img.currentSrc || img.src));
+      assert.deepEqual(brokenImages, [], 'page images decoded');
+      const controls = [];
+      if (/classroom-setup@/.test(name)) {
+        for (const button of await page.getByRole('button').all()) {
+          if (!await button.isVisible()) continue;
+          const label = await button.getAttribute('aria-label') || (await button.innerText()).trim();
+          const enabled = await button.isEnabled();
+          if (enabled) await button.click({ trial: true, timeout: 5000 });
+          controls.push({ label, enabled, reachable: enabled ? true : null });
+        }
+      }
+      const file = path.join(output, `${name.replaceAll('/', '-')}`);
+      await captureLayoutScreenshot(page, `${file}.png`, layout.nativeZoom);
+      writeFileSync(`${file}.json`, JSON.stringify({ route, buildId: await deployedLayoutBuild(origin), browser: layout.identity, runtime, controls, pageErrors, resources, apiErrors }, null, 2));
+    }
+    const overflow = await page.evaluate(() => document.documentElement.scrollWidth - innerWidth);
+    assert.ok(overflow <= 2, `horizontal overflow ${overflow}px`);
+    record(name, '通过', '', 'browser-real-backend');
+  } catch (error) {
+    const shot = path.join(output, `${name.replaceAll('/', '-')}.png`);
+    await page.screenshot({ path: shot, fullPage: true }).catch(() => undefined);
+    record(name, '失败', String(error.message).slice(0, 350), 'browser-real-backend');
+  } finally { await page.close(); }
+}
+
+// These server-rendered routes read repositories before browser interception.
+// Exercise them with real synthetic accounts in the disposable database.
+async function pageCheck(context, name, route, expected, expectedApiErrors = []) {
+  if (process.env.PRELAUNCH_DESKTOP_LAYOUT !== '1'
+    || !['teacher/legacy-template-setup', 'teacher/compatible-classroom-setup', 'teacher/pbl-classroom-setup', 'teacher/legacy-classroom-history'].includes(name)) {
+    return pageCheckAtViewport(context, name, route, expected, expectedApiErrors);
+  }
+  const matrices = [
+    ...desktopSizes.map(([width, height]) => ({ viewport: { width, height }, zoom: 1, dpr: 1, nativeZoom: false })),
+    ...[[1366, 768], [1920, 1080]].flatMap(([width, height]) => [0.8, 0.9, 1, 1.1, 1.25, 1.5]
+      .map(zoom => ({ viewport: { width, height }, zoom, dpr: 1, nativeZoom: true }))),
+  ];
+  for (const matrix of matrices) {
+    const session = await openLayoutContext({ browser, ...matrix, ...browserConfig,
+      reducedMotion: 'reduce', serviceWorkers: 'block' });
+    try {
+      await session.context.addCookies(await context.cookies());
+      const suffix = `${matrix.viewport.width}x${matrix.viewport.height}-${matrix.nativeZoom ? 'native' : 'viewport'}-${matrix.zoom}`;
+      await pageCheckAtViewport(session.context, `${name}@${suffix}`, route, expected, expectedApiErrors,
+        { ...matrix, identity: session.identity, physicalWidth: matrix.viewport.width, physicalHeight: matrix.viewport.height });
+    } finally { await session.close(); }
+  }
+}
+
+async function checkConfiguredProviders(teacher) {
+  const sections = (process.env.PRELAUNCH_PROVIDER_SECTIONS || 'providers,tts,asr,pdf,image,video,web-search,embedding').split(',');
+  let speechSample;
+  for (const section of sections) {
+    try {
+      const configuration = await checkedRequest(teacher, 'GET', `/api/openmaic/provider-config?section=${section}`);
+      const candidate = Object.entries(configuration.providers || {}).find(([id, item]) =>
+        item.enabled !== false && (item.hasApiKey || section === 'pdf' || id === 'ollama-embedding'));
+      if (!candidate) { record(`provider-${section}`, '阻塞', '未发现已启用且可用的服务配置'); continue; }
+      const [providerId, config] = candidate;
+      const model = config.defaultModel || config.models?.[0];
+      if (section === 'asr' && !speechSample) {
+        record('provider-asr', '未验证', '先启用 TTS 检查以生成明确标记的合成测试音频；不以配置探测代替真实转写');
+        continue;
+      }
+      let endpoint = '/api/openmaic/test-provider';
+      let data = { section, providerId, ...(model ? { model } : {}) };
+      if (section === 'providers') {
+        endpoint = '/api/openmaic/verify-model';
+        assert.ok(model, '语言模型缺少可测试的模型 ID');
+        data = { model: `${providerId}:${model}` };
+      } else if (section === 'tts') {
+        endpoint = '/api/openmaic/generate/tts';
+        const voice = config.defaultVoice || config.scenarioConfigs?.['realtime-interaction']?.voiceId;
+        assert.ok(voice, '语音合成缺少默认音色');
+        data = { audioId: randomUUID(), text: '上线验收。', ttsProviderId: providerId, ttsVoice: voice, ttsModelId: model };
+      }
+      const response = section === 'asr' && speechSample
+        ? await teacher.request.post(`${origin}/api/openmaic/transcription`, {
+          multipart: {
+            audio: { name: `prelaunch.${speechSample.extension}`, mimeType: speechSample.mimeType, buffer: speechSample.buffer },
+            providerId,
+            ...(model ? { modelId: model } : {}),
+            language: 'zh',
+          },
+          headers: { Origin: origin }, timeout: 90_000,
+        })
+        : await teacher.request.post(`${origin}${endpoint}`, { data, headers: { Origin: origin }, timeout: 90_000 });
+      const result = await response.json().catch(() => ({}));
+      assert.ok(response.ok(), `${response.status()} ${JSON.stringify(result).slice(0, 180)}`);
+      if (section === 'tts') {
+        const buffer = Buffer.from(result.base64 || result.data?.base64 || '', 'base64');
+        assert.ok(buffer.length > 500, '语音服务未返回可播放音频');
+        const format = String(result.format || result.data?.format || 'wav').toLowerCase();
+        const extension = format === 'mp3' ? 'mp3' : format === 'ogg' ? 'ogg' : 'wav';
+        speechSample = { buffer, extension, mimeType: extension === 'mp3' ? 'audio/mpeg' : `audio/${extension}` };
+        const audioPage = await teacher.newPage();
+        try {
+          await audioPage.goto(`${origin}/teacher/classes`, { waitUntil: 'domcontentloaded' });
+          await audioPage.evaluate(({ base64, mimeType }) => {
+            const audio = document.createElement('audio');
+            audio.id = 'provider-tts-test-audio';
+            audio.src = `data:${mimeType};base64,${base64}`;
+            audio.controls = true;
+            const play = document.createElement('button');
+            play.id = 'provider-tts-test-play';
+            play.textContent = '播放合成测试音频（上线验收）';
+            play.onclick = () => { void audio.play().catch(error => { audio.dataset.error = error.message; }); };
+            document.body.replaceChildren(audio, play);
+          }, { base64: buffer.toString('base64'), mimeType: speechSample.mimeType });
+          await audioPage.locator('#provider-tts-test-play').click();
+          await audioPage.waitForFunction(() => {
+            const audio = document.querySelector('#provider-tts-test-audio');
+            return audio?.currentTime > 0.1 || audio?.dataset.error;
+          }, undefined, { timeout: 15_000 });
+          assert.equal(await audioPage.locator('audio').getAttribute('data-error'), null);
+          record('provider-tts-browser-playback', '通过', '真实 TTS 音频在浏览器点击后解码并推进播放时间；不代表实际扬声器验收', 'browser-media');
+        } finally { await audioPage.close(); }
+      }
+      if (section === 'asr' && speechSample) assert.ok(result.text || result.data?.text, '真实语音未获得识别文本');
+      if (section === 'image') assert.ok(result.previewUrl || result.data?.previewUrl, '图像服务未返回图片');
+      if (section === 'providers') assert.ok(result.response || result.data?.response, '语言模型未返回文字');
+      record(`provider-${section}`, '通过', `${providerId} 实际请求成功${section === 'asr' ? '；输入为 TTS 生成的“上线验收”合成测试音频，不是真实麦克风录音' : ''}`);
+    } catch (error) {
+      record(`provider-${section}`, '失败', String(error.message).slice(0, 250));
+    }
+  }
+}
+
+async function checkPracticeAi(student, instance, learner, aiRequest) {
+    const documentRequest = { courseId: instance.id, studentId: learner.id, stageKey: 'make', workspaceKind: 'document',
+      requestId: randomUUID(), conversationId: 'legacy', intent: 'discuss',
+      message: '请指出这份观察记录中还缺少哪项便于核验的信息，不要替我作结论。', documentHtml: '<p>我今天在学校东侧绿地观察到了三只麻雀。</p>' };
+    if (!resumeSource) {
+    const documentReply = await aiRequest(student, '/api/ai-collaboration/document', documentRequest);
+    assert.ok(documentReply.result?.message);
+    assert.deepEqual(await aiRequest(student, '/api/ai-collaboration/document', documentRequest), documentReply);
+    aiSamples.push({ feature: 'document-discussion', prompt: documentRequest.message, document: documentRequest.documentHtml, response: documentReply.result });
+    record('real-ai-document-discussion-and-request-replay', '通过');
+    }
+    const documentModelCalls = async () => {
+      const metrics = await fetch(`${origin}/api/metrics`, {
+        headers: { Authorization: `Bearer ${env.INTERNAL_MONITOR_TOKEN}` }, signal: AbortSignal.timeout(5_000),
+      });
+      assert.equal(metrics.status, 200);
+      return (await metrics.text()).split('\n')
+        .filter(line => line.startsWith('classroom_ai_calls_total{') && line.includes('feature="document-collaboration"'))
+        .reduce((total, line) => total + Number(line.split(' ').at(-1)), 0);
+    };
+    try {
+    const suggestionRequest = { courseId: instance.id, studentId: learner.id, stageKey: 'make', workspaceKind: 'document',
+      action: 'suggest-delegated-work', requestId: randomUUID(), documentHtml: documentRequest.documentHtml };
+    const callsBeforeSuggestions = await documentModelCalls();
+    const suggestions = await aiRequest(student, '/api/ai-collaboration/document', suggestionRequest);
+    assert.ok(Array.isArray(suggestions.starters), '任务建议必须明确返回候选数组，空结果也有效');
+    const callsAfterSuggestions = await documentModelCalls();
+    if (resumeSource && suggestions.resultSource === 'reused') {
+      assert.equal(callsAfterSuggestions, callsBeforeSuggestions, '恢复已有建议不应调用模型');
+    } else {
+      assert.equal(suggestions.resultSource, 'generated');
+      assert.ok(callsAfterSuggestions > callsBeforeSuggestions, '首次建议未调用真实模型');
+      if (suggestions.starters.length) assert.ok(callsAfterSuggestions - callsBeforeSuggestions >= 2, '非空任务建议必须经过生成和边界审核');
+    }
+    const reusedSuggestions = await aiRequest(student, '/api/ai-collaboration/document', { ...suggestionRequest, requestId: randomUUID() });
+    assert.equal(reusedSuggestions.resultSource, 'reused');
+    assert.equal(reusedSuggestions.requestId, suggestions.requestId);
+    assert.deepEqual(reusedSuggestions.starters, suggestions.starters);
+    assert.equal(await documentModelCalls(), callsAfterSuggestions, '相同学生及完整上下文不应重复生成或审核建议');
+    aiSamples.push({ feature: 'document-work-suggestions', document: suggestionRequest.documentHtml,
+      response: suggestions.starters, modelCalls: callsAfterSuggestions - callsBeforeSuggestions, reusedWithoutModelCall: true });
+    record('real-ai-document-two-stage-suggestions-content-cache', '通过', `${suggestions.starters.length} 项建议；新请求编号复用完整结果，无新增模型调用`);
+    } catch (error) { record('real-ai-document-two-stage-suggestions-content-cache', '失败', String(error.message).slice(0, 350)); }
+    try {
+    const reviewText = '我只在东侧绿地观察了三分钟，看到了三只麻雀，因此证明学校所有绿地的鸟类数量都在增加。';
+    const reviewRequest = { courseId: instance.id, studentId: learner.id, stageKey: 'make', workspaceKind: 'document',
+      action: 'proactive-document-comments', requestId: randomUUID(), documentHtml: `<p>${reviewText}</p>`,
+      paragraphs: [{ candidateId: 'observation-paragraph', blockId: 'observation-paragraph', blockIndex: 0, targetText: reviewText }] };
+    const callsBeforeReview = await documentModelCalls();
+    const review = await aiRequest(student, '/api/ai-collaboration/document', reviewRequest);
+    assert.equal(review.complete, true, '单段主动审阅必须明确完成');
+    assert.ok(Array.isArray(review.commentThreads));
+    const callsAfterReview = await documentModelCalls();
+    assert.ok(callsAfterReview > callsBeforeReview, '首次主动批注未调用真实模型');
+    const reviewAgain = await aiRequest(student, '/api/ai-collaboration/document', { ...reviewRequest, requestId: randomUUID() });
+    assert.equal(reviewAgain.complete, true);
+    assert.equal(await documentModelCalls(), callsAfterReview, '已审阅段落（含无问题结论）应复用指纹检查点');
+    aiSamples.push({ feature: 'document-proactive-review', document: reviewText,
+      response: review.commentThreads, decision: review.reviewDecision, reusedWithoutModelCall: true });
+    record('real-ai-document-proactive-review-and-paragraph-checkpoint', '通过', `${review.commentThreads.length} 条批注；新请求编号不重复审阅`);
+
+    } catch (error) { record('real-ai-document-proactive-review-and-paragraph-checkpoint', '失败', String(error.message).slice(0, 350)); }
+
+    try {
+    const codeRequest = { courseId: instance.id, studentId: learner.id, stageKey: 'make', language: 'python',
+      requestId: randomUUID(), conversationId: 'legacy', intent: 'discuss', message: '请解释这段代码的输出，不要修改代码。',
+      artifact: { version: 1, language: 'python', activeFileId: 'main', files: [{ id: 'main', path: 'main.py', content: 'print(1 + 2)\n' }] }, run: { status: 'idle' } };
+    const codeReply = await aiRequest(student, '/api/ai-collaboration/code', codeRequest);
+    assert.ok(codeReply.result?.message);
+    assert.deepEqual(await aiRequest(student, '/api/ai-collaboration/code', codeRequest), codeReply);
+    aiSamples.push({ feature: 'code-discussion', prompt: codeRequest.message, artifact: codeRequest.artifact, response: codeReply.result });
+    record('real-ai-code-discussion-and-request-replay', '通过');
+    } catch (error) { record('real-ai-code-discussion-and-request-replay', '失败', String(error.message).slice(0, 350)); }
+}
+
+async function checkPublicDiscussionAi(teacher, student, observer, instance, learner, aiRequest,
+  { knowledgePointId = 'observation-kp', recordResult = record } = {}) {
+  const route = `/api/courses/${instance.id}/public-discussion`;
+  const clientId = `prelaunch-sound-${randomUUID()}`;
+  try {
+    let snapshot = await aiRequest(teacher, route, { action: 'start', requestId: randomUUID(),
+      knowledgePointId, topic: '科学观察证据', mode: 'inquiry',
+      openingPrompt: '比较两个地点鸟类数量时，为什么需要保持观察时长一致？', studentId: learner.id });
+    assert.equal(snapshot.session.status, 'inviting');
+    snapshot = await aiRequest(student, route, { action: 'accept', requestId: randomUUID(), expectedVersion: snapshot.session.version });
+    await aiRequest(teacher, route, { action: 'acquire-sound', clientId });
+    snapshot = await aiRequest(teacher, route, { action: 'complete-playback', requestId: randomUUID(), expectedVersion: snapshot.session.version, clientId });
+    const replyRequest = { action: 'submit-answer', requestId: randomUUID(), expectedVersion: snapshot.session.version,
+      content: '观察更久通常会记录到更多鸟类，因此要保持时长一致，并记录日期与地点才能比较。', source: 'text' };
+    snapshot = await aiRequest(student, route, replyRequest);
+    for (let attempt = 0; attempt < 90 && snapshot.session.status === 'ai-generating'; attempt++) {
+      await delay(1000);
+      snapshot = await checkedRequest(student, 'GET', route);
+    }
+    assert.ok(['ai-ready', 'ai-completion-ready'].includes(snapshot.session.status), `公开讨论生成未成功：${snapshot.session.status}`);
+    const assistantTurns = snapshot.session.turns.filter(turn => turn.role === 'assistant');
+    assert.ok(assistantTurns.length >= 2, '公开讨论只有预写开场白，没有生成模型回应');
+    const generatedTurn = assistantTurns.at(-1);
+    assert.ok(generatedTurn?.content, '公开讨论未保存真实模型回应');
+    const replay = await aiRequest(student, route, replyRequest);
+    assert.equal(replay.session.turns.filter(turn => turn.role === 'student').length, 1, '重复提交不得重复学生回答');
+    recordResult('real-ai-public-discussion-answer-idempotent-replay', '通过', '', 'real-provider-api');
+    aiSamples.push({ feature: 'public-discussion', input: replyRequest.content, response: generatedTurn.content });
+    await checkSavedPublicDiscussion(teacher, student, observer, instance, aiRequest, recordResult);
+  } catch (error) {
+    recordResult('real-ai-public-discussion', '失败', String(error.message).slice(0, 500), 'real-provider-api');
+  }
+}
+
+async function checkSavedPublicDiscussion(teacher, student, observer, instance, aiRequest, recordResult = record) {
+  const route = `/api/courses/${instance.id}/public-discussion`;
+  const pages = [];
+  try {
+    let snapshot = await checkedRequest(teacher, 'GET', route);
+    const generatedTurn = snapshot.session.turns.filter(turn => turn.role === 'assistant').at(-1);
+    assert.ok(generatedTurn?.content, '公开讨论未保存真实模型回应');
+    const invitedPage = await student.newPage();
+    const observerPage = await observer.newPage();
+    pages.push(invitedPage, observerPage);
+    await invitedPage.goto(`${origin}/student/classroom/${instance.id}`, { waitUntil: 'domcontentloaded' });
+    await invitedPage.getByRole('dialog', { name: '回答课堂提问' }).getByText(generatedTurn.content, { exact: true }).waitFor({ timeout: 30_000 });
+    await observerPage.goto(`${origin}/student/classroom/${instance.id}`, { waitUntil: 'domcontentloaded' });
+    await observerPage.locator('[data-course-projection-version]').waitFor({ state: 'attached', timeout: 30_000 });
+    assert.equal(await observerPage.getByRole('dialog', { name: '回答课堂提问' }).count(), 0, '旁听学生不应收到点名回答弹窗');
+    const otherSnapshot = await checkedRequest(observer, 'GET', route);
+    assert.equal(otherSnapshot.session.isCurrentStudent, false);
+    assert.equal(otherSnapshot.session.turns.at(-1).content, generatedTurn.content);
+    aiSamples.push({ feature: 'saved-public-discussion', response: generatedTurn.content });
+    recordResult('real-ai-public-discussion-invited-display-observer-snapshot', '通过', '点名学生显示真实模型回应；旁听学生无回答弹窗且持久化快照一致；播放完成状态由测试 API 驱动，语音另行验收', 'browser-real-backend');
+    snapshot = await aiRequest(teacher, route, { action: 'finish', requestId: randomUUID(), expectedVersion: snapshot.session.version });
+    for (let attempt = 0; attempt < 90 && snapshot.session.status === 'summarizing'; attempt++) {
+      await delay(1000);
+      snapshot = await checkedRequest(teacher, 'GET', route);
+    }
+    assert.equal(snapshot.session.status, 'ended', '讨论结束后应持久化收尾状态');
+    assert.ok(snapshot.session.summary?.keyConclusion, '讨论结束应保存总结');
+    // A fallback summary is a valid durable ending. Its presence alone cannot
+    // prove the summary model succeeded; the generated answer is checked above.
+    recordResult('real-ai-public-discussion-finish-summary', '通过', '讨论结束及总结持久化；总结可能采用服务端回退内容，不作为总结模型成功证据', 'isolated-backend');
+  } catch (error) {
+    for (const [index, page] of pages.entries()) await page.screenshot({ path: path.join(output, `public-discussion-${index}-failure.png`) }).catch(() => undefined);
+    recordResult('real-ai-public-discussion-saved-display-and-finish', '失败', String(error.message).slice(0, 500), 'browser-real-backend');
+  } finally { await Promise.all(pages.map(page => page.close())); }
+}
+
+async function checkLinkedClassroomBrowsers(teacher, student, instance, activity, invitation, question) {
+  const second = await browser.newContext({ viewport: { width: 1366, height: 768 } });
+  const pages = [];
+  const errors = [];
+  const socketEvidence = [];
+  const pollingEvidence = [];
+  const consoleEvidence = [];
+  const responseEvidence = [];
+  const responseReads = [];
+  let transportPhase = 'connected';
+  const waitForSocketEvidence = async (predicate, message, timeoutMs = 15000) => {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (predicate()) return;
+      await delay(Math.min(100, Math.max(0, deadline - Date.now())));
+    }
+    assert.ok(predicate(), message);
+  };
+  try {
+    await checkedRequest(second, 'POST', '/api/platform/auth/register', {
+      invitationCode: invitation.code, username: 'prelaunch-linked-student', displayName: '联动验收学生', password, confirmPassword: password,
+    }, 201);
+    await checkedRequest(second, 'GET', `/api/platform/activities/${activity.id}`);
+    await checkedRequest(second, 'POST', `/api/platform/classroom-instances/${instance.id}/experiment`, {
+      phase: 'pretest', answers: { 'pre-observation': '记录日期和时长' },
+    });
+    await checkedRequest(second, 'POST', `/api/platform/classroom-instances/${instance.id}/enter`, {});
+    const document = await PDFDocument.create();
+    for (const text of ['SAME OBSERVATION DURATION', 'RECORD DATE, LOCATION AND COUNT']) {
+      document.addPage([960, 540]).drawText(text, { x: 48, y: 350, size: 28 });
+    }
+    const uploaded = await teacher.request.post(`${origin}/api/uploads`, {
+      multipart: { file: { name: 'linked-classroom-slides.pdf', mimeType: 'application/pdf', buffer: Buffer.from(await document.save()) },
+        title: '联动投屏两页课件', courseId: instance.id, stageKey: 'launch', bindAsCourseResource: 'true', pdfDisplayMode: 'slides' },
+      headers: { Origin: origin }, timeout: 30_000,
+    });
+    assert.equal(uploaded.status(), 201, '联动课件应写入隔离资源目录');
+    const teacherPage = await teacher.newPage();
+    const studentPage = await student.newPage();
+    const otherPage = await second.newPage();
+    pages.push(teacherPage, studentPage, otherPage);
+    for (const [index, page] of pages.entries()) {
+      page.on('pageerror', error => errors.push(error.message));
+      page.on('console', message => {
+        if (message.type() !== 'error') return;
+        const text = message.text();
+        consoleEvidence.push({ client: index, phase: transportPhase, text });
+        if (text.includes('[session] Course synchronization failed:') && /AbortError|aborted/i.test(text)) {
+          errors.push(text);
+        }
+      });
+      page.on('response', response => {
+        const route = new URL(response.url()).pathname;
+        if (!route.startsWith('/api/') || (response.status() < 400 && !/\/(actions|projection)$/.test(route))) return;
+        const entry = { client: index, phase: transportPhase, route, method: response.request().method(), status: response.status() };
+        const request = response.request().postDataJSON();
+        if (request?.requestId) entry.requestId = request.requestId;
+        if (request?.action?.type) entry.action = request.action.type;
+        responseEvidence.push(entry);
+        responseReads.push(response.json().then(body => {
+          entry.code = body.code || body.error || null;
+          entry.message = body.message || null;
+          entry.courseVersion = body.courseVersion ?? body.projection?.courseVersion ?? null;
+          entry.projectionVersion = body.projectionVersion ?? body.projection?.projectionVersion ?? null;
+        }).catch(() => undefined));
+      });
+      page.on('websocket', socket => {
+        if (new URL(socket.url()).pathname !== '/ws') return;
+        socket.on('framereceived', ({ payload }) => {
+          try {
+            const message = JSON.parse(String(payload));
+            if (message.courseId === instance.id) socketEvidence.push({ client: index, phase: transportPhase, at: new Date().toISOString(), type: message.type,
+              event: message.event?.type, action: message.event?.payload?.actionType });
+          } catch { /* Only structured application messages are evidence. */ }
+        });
+      });
+    }
+    await teacherPage.goto(`${origin}/teacher/teach/${instance.id}/classroom`, { waitUntil: 'domcontentloaded' });
+    for (const page of [studentPage, otherPage]) {
+      await page.goto(`${origin}/student/classroom/${instance.id}`, { waitUntil: 'domcontentloaded' });
+      await page.locator('[data-course-projection-version]').waitFor({ state: 'attached', timeout: 30_000 });
+    }
+    if (websocketEnabled) await waitForSocketEvidence(() => [0, 1, 2].every(client =>
+      socketEvidence.some(entry => entry.client === client && entry.type === 'subscribed')), '教师和两学生未全部订阅真实 WebSocket');
+    await teacherPage.getByRole('button', { name: /^(同步到学生|投屏)$/ }).filter({ visible: true }).first().click();
+    for (const page of [studentPage, otherPage]) {
+      await page.locator('[data-teacher-resource-projection] canvas[aria-label="PPT 第 1 页"]').waitFor({ timeout: 30_000 });
+    }
+    await teacherPage.getByRole('button', { name: '下一页', exact: true }).filter({ visible: true }).first().click();
+    for (const page of [studentPage, otherPage]) {
+      await page.locator('[data-teacher-resource-projection] canvas[aria-label="PPT 第 2 页"]').waitFor({ timeout: 30_000 });
+    }
+    if (websocketEnabled) {
+      transportPhase = 'injected-websocket-unavailable';
+      const subscriptions = [0, 1, 2].map(client => socketEvidence.filter(row => row.client === client && row.type === 'subscribed').length);
+      const startedAt = Date.now();
+      await localProxy.setWebSocketsBlocked(true);
+      const httpDelivery = Promise.allSettled([studentPage, otherPage].map(async (page, index) => {
+        const response = await page.waitForResponse(response => response.request().method() === 'GET'
+          && new URL(response.url()).pathname === `/api/courses/${instance.id}/projection` && response.status() === 200,
+        { timeout: 30_000 });
+        const body = await response.json();
+        pollingEvidence.push({ client: index + 1, receivedAt: new Date().toISOString(), status: response.status(),
+          projectionVersion: body.projectionVersion ?? body.projection?.projectionVersion });
+      }));
+      await teacherPage.getByRole('button', { name: '上一页', exact: true }).filter({ visible: true }).first().click();
+      for (const page of [studentPage, otherPage]) {
+        await page.locator('[data-teacher-resource-projection] canvas[aria-label="PPT 第 1 页"]').waitFor({ timeout: 30_000 });
+      }
+      const fallbackResponses = await httpDelivery;
+      assert.ok(fallbackResponses.every(row => row.status === 'fulfilled'), fallbackResponses
+        .filter(row => row.status === 'rejected').map(row => String(row.reason)).join('\n'));
+      assert.deepEqual([0, 1, 2].map(client => socketEvidence.filter(row => row.client === client && row.type === 'subscribed').length), subscriptions,
+        'Projection fallback must render while WebSocket reconnection is still unavailable');
+      pollingEvidence.push({ startedAt: new Date(startedAt).toISOString(), renderedAt: new Date().toISOString(),
+        outageElapsedMs: Date.now() - startedAt, websocketUpgradesBlockedDuringDelivery: true });
+      record('three-browser-websocket-outage-http-polling-delivery', '通过', pollingEvidence, 'browser-real-backend');
+      await localProxy.setWebSocketsBlocked(false);
+      await waitForSocketEvidence(() => [0, 1, 2].every(client => socketEvidence.filter(row => row.client === client
+        && row.type === 'subscribed').length > subscriptions[client]), 'HTTP fallback ended without all browsers resubscribing', 35000);
+      transportPhase = 'websocket-restored-after-polling';
+      await teacherPage.getByRole('button', { name: '下一页', exact: true }).filter({ visible: true }).first().click();
+      for (const page of [studentPage, otherPage]) {
+        await page.locator('[data-teacher-resource-projection] canvas[aria-label="PPT 第 2 页"]').waitFor({ timeout: 30_000 });
+      }
+    }
+    const beforeDisconnect = socketEvidence.filter(entry => entry.client === 2 && entry.type === 'subscribed').length;
+    transportPhase = 'injected-disconnect';
+    await second.setOffline(true);
+    if (websocketEnabled) await localProxy.disconnectWebSockets();
+    await teacherPage.getByRole('button', { name: '上一页', exact: true }).filter({ visible: true }).first().click();
+    await studentPage.locator('[data-teacher-resource-projection] canvas[aria-label="PPT 第 1 页"]').waitFor({ timeout: 30_000 });
+    await second.setOffline(false);
+    await otherPage.locator('[data-teacher-resource-projection] canvas[aria-label="PPT 第 1 页"]').waitFor({ timeout: 30_000 });
+    if (websocketEnabled) await waitForSocketEvidence(() => socketEvidence.filter(entry => entry.client === 2
+      && entry.type === 'subscribed').length > beforeDisconnect, '断网恢复后学生未重新订阅真实 WebSocket');
+    transportPhase = 'reconnected';
+    await otherPage.reload({ waitUntil: 'domcontentloaded' });
+    await otherPage.locator('[data-teacher-resource-projection] canvas[aria-label="PPT 第 1 页"]').waitFor({ timeout: 30_000 });
+    await teacherPage.getByRole('button', { name: /^(停止同步|停止投屏|结束投屏)$/ }).filter({ visible: true }).first().click();
+    for (const page of [studentPage, otherPage]) await page.locator('[data-teacher-resource-projection]').waitFor({ state: 'detached', timeout: 30_000 });
+    record('three-browser-projection-pages-stop-offline-and-refresh-recovery', '通过',
+      `1 教师 + 2 学生独立 Cookie；真实上传 PDF 逐页课件、点击投屏、翻页及停止；${websocketEnabled ? '真实 WebSocket TCP 中断后重订阅与持久化追赶' : 'HTTP 轮询恢复'}`, 'browser-real-backend');
+    await teacherPage.getByRole('button', { name: '结束「项目启动」并进入「知识讲授」', exact: true }).click();
+    await teacherPage.getByRole('dialog').getByRole('button', { name: /进入|切换/ }).click();
+    for (const page of [studentPage, otherPage]) await page.getByRole('button', { name: /^(开始答题|Start Quiz)$/ }).waitFor({ timeout: 30_000 });
+    await otherPage.getByRole('button', { name: /^(开始答题|Start Quiz)$/ }).click();
+    await otherPage.getByRole('button', { name: /在相同观察时长下记录日期、地点和鸟类数量/ }).click();
+    await otherPage.getByRole('button', { name: /^(提交答案|Submit Answers)$/ }).click();
+    await otherPage.getByText(question.analysis, { exact: true }).waitFor();
+    await otherPage.reload({ waitUntil: 'domcontentloaded' });
+    await otherPage.getByText(question.analysis, { exact: true }).waitFor({ timeout: 30_000 });
+    await studentPage.getByRole('button', { name: /^(开始答题|Start Quiz)$/ }).waitFor();
+    const linkedLearner = await db.user.findFirstOrThrow({ where: { username: 'prelaunch-linked-student' } });
+    const teacherState = await checkedRequest(teacher, 'GET', `/api/courses/${instance.id}/state`);
+    assert.ok(teacherState.course.aiLearningProgress?.[linkedLearner.id]?.knowledgeLectureAttempts?.length, '教师状态应包含第二学生真实作答');
+    await teacherPage.getByRole('button', { name: '回退到「项目启动」', exact: true }).click();
+    await teacherPage.getByRole('dialog').getByRole('button', { name: /回退|切换/ }).click();
+    for (const page of [studentPage, otherPage]) await page.getByText('联动投屏两页课件', { exact: true }).first().waitFor({ timeout: 30_000 });
+    assert.deepEqual(errors, [], '三会话联动出现未处理浏览器异常');
+    record('three-browser-stage-switch-independent-answers-teacher-progress', '通过', '教师页面切换阶段；第二学生作答与刷新恢复；第一学生仍未作答；教师读取真实进度', 'browser-real-backend');
+    if (websocketEnabled) {
+      await waitForSocketEvidence(() => [0, 1, 2].every(client => socketEvidence.some(entry =>
+        entry.client === client && entry.type === 'course-event')), '三个浏览器未全部收到真实课堂事件');
+      record('three-browser-real-websocket-subscribe-events-and-reconnect', '通过',
+        `真实同源代理及隔离 Redis；${socketEvidence.filter(entry => entry.type === 'subscribed').length} 次订阅确认；${socketEvidence.filter(entry => entry.type === 'course-event').length} 次浏览器收到的课堂事件`, 'browser-real-backend');
+    }
+  } catch (error) {
+    for (const [index, page] of pages.entries()) await page.screenshot({ path: path.join(output, `linked-classroom-${index}-failure.png`) }).catch(() => undefined);
+    record('three-browser-classroom-linkage', '失败', String(error.message).slice(0, 500), 'browser-real-backend');
+  } finally {
+    if (websocketEnabled) {
+      try { await localProxy.setWebSocketsBlocked(false); }
+      catch (error) { record('isolated-proxy-fault-cleanup', '失败', String(error.message)); }
+    }
+    writeFileSync(path.join(output, 'three-browser-polling-fallback-evidence.json'), JSON.stringify(pollingEvidence, null, 2));
+    if (websocketEnabled) writeFileSync(path.join(output, 'three-browser-websocket-evidence.json'), JSON.stringify(socketEvidence, null, 2));
+    await Promise.all(responseReads);
+    writeFileSync(path.join(output, 'three-browser-console-evidence.json'), JSON.stringify(consoleEvidence, null, 2));
+    writeFileSync(path.join(output, 'three-browser-response-evidence.json'), JSON.stringify(responseEvidence, null, 2));
+    await second.setOffline(false);
+    await Promise.all(pages.map(page => page.close()));
+    await second.close();
+    const cleanupCourse = (await checkedRequest(teacher, 'GET', `/api/courses/${instance.id}/state`)).course;
+    await checkedRequest(teacher, 'POST', `/api/courses/${instance.id}/actions`, {
+      requestId: randomUUID(), action: { type: 'SET_UI_STATE', payload: { courseId: instance.id, patch: { resourceProjection: null },
+        projectionControl: { clientId: `prelaunch-cleanup-${randomUUID()}`, takeover: true, baseStageVersion: cleanupCourse.stageVersion ?? 1, stageKey: cleanupCourse.stages[cleanupCourse.currentStageIndex].key } } },
+    });
+  }
+}
+
+async function checkBrowserPractice(teacher, student, offering, chapter) {
+  const learner = await db.user.findFirstOrThrow({ where: { username: 'prelaunch-student' } });
+  const stages = [
+    { key: 'launch', label: '项目启动', view: 'simple-resource', description: '明确任务' },
+    { key: 'ai-learning', label: '知识讲授', view: 'ai-learning', description: '学习方法' },
+    { key: 'make', label: '项目实践', view: 'ai-collaboration', description: '保存并运行自己的成果' },
+    { key: 'showcase', label: '成果汇报与评价', view: 'showcase-reporting', description: '分享成果' },
+    { key: 'reflection', label: '后测', view: 'experiment-posttest', description: '完成反思' },
+  ];
+  const evidence = [];
+  for (const mode of practiceModes) {
+    const page = await student.newPage();
+    const errors = [];
+    const backgroundAi = [];
+    let observedSaves;
+    page.on('pageerror', error => errors.push(error.message));
+    page.on('response', response => {
+      const route = new URL(response.url()).pathname;
+      if (response.status() < 400) return;
+      const body = route === '/api/ai-collaboration/code' ? response.request().postDataJSON() : null;
+      if (route === '/api/ai-collaboration/code' && response.request().method() === 'POST'
+        && (body?.intent === 'proactive-review' || body?.action === 'code-task-starters')) {
+        backgroundAi.push({ status: response.status(), action: body.action || body.intent });
+      } else if (route.startsWith('/api/') || /\.(js|css|woff2?)(\?|$)/.test(response.url())) {
+        errors.push(`${response.status()} ${route}`);
+      }
+    });
+    try {
+      const template = await checkedRequest(teacher, 'POST', '/api/platform/templates', {
+        title: `${mode} 浏览器实践模板`, snapshot: { schemaVersion: 2, kind: 'pbl-course', design: {
+          name: `${mode} 浏览器真实实践`, subject: '信息科技', grade: '七年级', hours: 1, stages,
+          drivingQuestion: '如何保存并验证自己的项目成果？', expectedOutcome: '可恢复、可复核的项目成果',
+          pblConfig: { makeArtifactMode: mode },
+          content: { pblOutline: '在浏览器编辑、保存并验证项目成果。', knowledgePoints: [], lessonOutline: [],
+            evaluationPlan: { dimensions: [], overallRubric: '' } },
+        } },
+      }, 201);
+      const activity = (await checkedRequest(teacher, 'POST', `/api/platform/offerings/${offering.id}/chapters/${chapter.id}/activities`, {
+        type: 'Classroom', title: `${mode} 浏览器真实实践`, templateVersionId: template.versions[0].id,
+      }, 201)).activity;
+      await checkedRequest(teacher, 'PATCH', `/api/platform/activities/${activity.id}`, { isOpen: true });
+      const instance = await db.classroomInstance.findFirstOrThrow({ where: { activityId: activity.id } });
+      await checkedRequest(teacher, 'POST', `/api/platform/classroom-instances/${instance.id}/start`, {});
+      await checkedRequest(student, 'GET', `/api/platform/activities/${activity.id}`);
+      const participation = (await checkedRequest(student, 'POST', `/api/platform/classroom-instances/${instance.id}/enter`, {})).participation;
+      await checkedRequest(teacher, 'POST', `/api/courses/${instance.id}/actions`, {
+        requestId: randomUUID(), action: { type: 'SET_STAGE', payload: { id: instance.id, index: 2 } },
+      });
+      const persisted = async (matches) => {
+        for (let attempt = 0; attempt < 80; attempt++) {
+          const rows = await db.classroomSubmission.findMany({ where: { participationId: participation.id } });
+          const row = rows.find(item => matches(item.payload?.view ?? item.payload));
+          if (row) return row;
+          await delay(250);
+        }
+        throw new Error(`${mode} edited content did not persist in the isolated database`);
+      };
+      observedSaves = observeSubmissionSaveReceipts(page, { origin, courseId: instance.id, studentId: learner.id });
+      const removeConfirmedDraftForReload = async (submission, workspaceKind, marker) => {
+        await confirmSubmissionSave({ page, db, courseId: instance.id, studentId: learner.id,
+          participationId: participation.id, submission, observations: () => observedSaves.entries, marker });
+        // The helper refuses newer/different draft contents. It never removes
+        // an outbox, another scope's draft, identity, telemetry or cache key.
+        await removeAcknowledgedDocumentDrafts(page, { courseId: instance.id, studentId: learner.id, submission, workspaceKind });
+      };
+      const assertTeacherReceives = async (submission) => {
+        const view = submission.payload.view ?? submission.payload;
+        const state = await checkedRequest(teacher, 'GET', `/api/courses/${instance.id}/state`);
+        assert.ok(state.course.submissions.some(item => item.studentId === learner.id && item.content === view.content),
+          'Teacher did not receive the exact persisted student artifact');
+      };
+      const assertTeacherBrowser = async (submission) => {
+        const review = await teacher.newPage();
+        review.on('pageerror', error => errors.push(error.message));
+        try {
+          await review.goto(`${origin}/teacher/teach/${instance.id}/classroom`, { waitUntil: 'domcontentloaded' });
+          await review.getByText('项目实践进度', { exact: true }).waitFor({ timeout: 30_000 });
+          const view = submission.payload.view ?? submission.payload;
+          if (view.type === 'code') {
+            for (const file of JSON.parse(view.content).files) {
+              const preview = review.locator('pre code').filter({ hasText: file.content.trim() });
+              await preview.waitFor({ timeout: 30_000 });
+              assert.equal(await preview.textContent(), file.content);
+            }
+          } else {
+            await review.getByText(view.content.replace(/<[^>]*>/g, ''), { exact: true }).first().waitFor({ timeout: 30_000 });
+            await review.getByText('Word 成果 1 版', { exact: true }).waitFor();
+          }
+          await review.screenshot({ path: path.join(output, `browser-practice-${mode}-teacher.png`), fullPage: true });
+          record(`browser-practice-${mode}-teacher-preview`, '通过', '教师真实页面显示同一学生成果', 'browser-real-backend');
+        } finally { await review.close(); }
+      };
+      await page.goto(`${origin}/student/ai-collaboration/${instance.id}`, { waitUntil: 'domcontentloaded' });
+      await page.getByRole('button', { name: '保存', exact: true }).waitFor({ timeout: 30_000 });
+      if (mode === 'document') {
+        const content = '浏览器实践验收：我们在相同观察时长下记录两个地点的数据，并保留原始记录以便核验。';
+        const editor = page.locator('[data-slate-editor="true"][contenteditable="true"]').first();
+        await editor.waitFor({ timeout: 30_000 });
+        await editor.click({ position: { x: 120, y: 30 } });
+        await editor.press('ControlOrMeta+A');
+        await editor.pressSequentially(content);
+        await editor.getByText(content, { exact: true }).waitFor({ timeout: 10_000 });
+        await page.getByRole('button', { name: '保存', exact: true }).click();
+        const saved = await persisted(view => view?.type === 'document' && view.content?.includes(content));
+        await page.locator('[data-slot="save-status"]').getByText('已保存', { exact: true }).waitFor();
+        // Verify this save's real ACK and remove only its confirmed editor draft.
+        await removeConfirmedDraftForReload(saved, 'document', content);
+        await page.reload({ waitUntil: 'domcontentloaded' });
+        await editor.getByText(content, { exact: true }).waitFor({ timeout: 30_000 });
+        await assertTeacherReceives(saved);
+        record('browser-practice-document-edit-save-server-reload', '通过', '清除本机草稿后从真实数据库恢复', 'browser-real-backend');
+        const finalize = page.waitForResponse(response => new URL(response.url()).pathname === '/api/project-practice/submissions/finalize'
+          && response.request().method() === 'POST', { timeout: 90_000 });
+        await page.getByRole('button', { name: '提交最终版', exact: true }).click();
+        const response = await finalize;
+        const archive = await response.json();
+        assert.equal(response.status(), 200, JSON.stringify(archive).slice(0, 250));
+        assert.equal(archive.sequence, 1);
+        const link = page.getByRole('link', { name: '下载第 1 版 Word', exact: true });
+        await link.waitFor();
+        const downloadEvent = page.waitForEvent('download');
+        await link.click();
+        const download = await downloadEvent;
+        const file = path.join(output, 'browser-practice-document.docx');
+        await download.saveAs(file);
+        const zip = await JSZip.loadAsync(readFileSync(file));
+        assert.ok((await zip.file('word/document.xml').async('string')).includes(content), 'Downloaded Word lost browser edits');
+        const submitted = await db.classroomSubmission.findUniqueOrThrow({ where: { id: saved.id } });
+        assert.equal(submitted.status, 'SUBMITTED');
+        assert.ok(submitted.submittedAt);
+        await assertTeacherReceives(submitted);
+        await assertTeacherBrowser(submitted);
+        await page.reload({ waitUntil: 'domcontentloaded' });
+        await link.waitFor({ timeout: 30_000 });
+        evidence.push({ mode, courseId: instance.id, submissionId: saved.id, status: submitted.status,
+          sequence: archive.sequence, sha256: archive.sha256, download: path.basename(file), restoredWithoutLocalDraft: true });
+        record('browser-practice-document-submit-download-word-and-reload', '通过', '真实归档、下载及提交状态持久化', 'browser-real-backend');
+      } else {
+        const mainPath = mode === 'python' ? 'main.py' : 'main.c';
+        const helperPath = mode === 'python' ? 'helper.py' : 'helper.c';
+        const outputText = `${mode.toUpperCase()}_BROWSER_RESULT 7`;
+        const mainInput = mode === 'python'
+          ? 'from helper import value\nprint("PYTHON_BROWSER_RESULT", value())\n'
+          : '#include <stdio.h>\nint helper(void);\nint main(void) { printf("C_BROWSER_RESULT %d\\n", helper()); return 0; }\n';
+        const helperInput = mode === 'python' ? 'def value():\n    return 7\n' : 'int helper(void) { return 7; }\n';
+        const editor = page.getByRole('textbox', { name: '编辑器内容', exact: true });
+        const edit = async (content, filePath) => {
+          await editor.waitFor({ timeout: 30_000 });
+          await editor.focus();
+          await editor.press('ControlOrMeta+A');
+          await page.keyboard.insertText(content);
+          const actual = await page.evaluate(filePath => window.monaco?.editor.getModels()
+            .find(model => model.uri.toString().endsWith(`/${filePath}`))?.getValue(), filePath);
+          // Monaco may insert automatic indentation for multiline input. Keep
+          // that exact editor result for persistence checks; execution below
+          // independently verifies the Python/C program's behavior.
+          const withoutIndent = value => value.split('\n').map(line => line.trim()).join('\n').trim();
+          assert.equal(withoutIndent(actual), withoutIndent(content));
+          return actual;
+        };
+        const mainContent = await edit(mainInput, mainPath);
+        await page.getByRole('button', { name: '新建代码文件', exact: true }).click();
+        await page.getByRole('textbox', { name: '新文件名' }).fill(helperPath);
+        await page.getByRole('button', { name: '创建文件', exact: true }).click();
+        const helperContent = await edit(helperInput, helperPath);
+        await page.getByRole('button', { name: '保存', exact: true }).click();
+        const saved = await persisted(view => {
+          if (view?.type !== 'code') return false;
+          const artifact = JSON.parse(view.content);
+          return artifact.language === mode && artifact.files.some(file => file.path === mainPath && file.content === mainContent)
+            && artifact.files.some(file => file.path === helperPath && file.content === helperContent);
+        });
+        await page.getByText('已保存', { exact: true }).waitFor();
+        await removeConfirmedDraftForReload(saved, `code:${mode}`, `${mode.toUpperCase()}_BROWSER_RESULT`);
+        await page.reload({ waitUntil: 'domcontentloaded' });
+        for (const [filePath, content] of [[mainPath, mainContent], [helperPath, helperContent]]) {
+          await page.getByRole('button', { name: filePath, exact: true }).click({ timeout: 30_000 });
+          await editor.waitFor({ timeout: 30_000 });
+          await page.waitForFunction(({ filePath, content }) => window.monaco?.editor.getModels()
+            .some(model => model.uri.toString().endsWith(`/${filePath}`) && model.getValue() === content),
+          { filePath, content }, { timeout: 30_000 });
+        }
+        await assertTeacherReceives(saved);
+        record(`browser-practice-${mode}-new-file-edit-save-server-reload`, '通过', '清除本机草稿后恢复真实数据库中的多个文件', 'browser-real-backend');
+        const run = page.waitForResponse(response => new URL(response.url()).pathname === '/api/ai-collaboration/code/run'
+          && response.request().method() === 'POST', { timeout: 30_000 });
+        await page.getByRole('button', { name: '运行', exact: true }).click();
+        const response = await run;
+        const result = await response.json();
+        assert.equal(response.status(), 200, JSON.stringify(result).slice(0, 250));
+        assert.equal(result.status, 'success', JSON.stringify(result).slice(0, 250));
+        assert.equal(result.exitCode, 0);
+        assert.equal(result.stdout.trim(), outputText);
+        await page.locator('pre').filter({ hasText: outputText }).waitFor();
+        await assertTeacherBrowser(saved);
+        evidence.push({ mode, courseId: instance.id, submissionId: saved.id, persistedStatus: saved.status,
+          submissionContract: 'The Save action persists the code submission; this workspace has no separate final-submit action',
+          artifact: (saved.payload.view ?? saved.payload).content, run: result, restoredWithoutLocalDraft: true, backgroundAi });
+        record(`browser-practice-${mode}-real-sandbox-run-and-teacher-submission`, '通过',
+          '浏览器调用真实沙盒；保存即写代码成果，当前产品没有独立提交按钮', 'browser-real-backend');
+      }
+      assert.deepEqual(errors, [], `${mode} unexpected browser or API error`);
+      assert.ok(await page.evaluate(() => document.documentElement.scrollWidth - innerWidth <= 2), `${mode} horizontal overflow`);
+      await page.screenshot({ path: path.join(output, `browser-practice-${mode}.png`), fullPage: true });
+      record(`browser-practice-${mode}-resources-and-layout`, '通过', '', 'browser-real-backend');
+    } catch (error) {
+      await page.screenshot({ path: path.join(output, `browser-practice-${mode}-failure.png`), fullPage: true }).catch(() => undefined);
+      writeFileSync(path.join(output, `browser-practice-${mode}-failure-dom.json`), JSON.stringify(await page.evaluate(() => ({
+        activeElement: document.activeElement?.outerHTML,
+        editors: [...document.querySelectorAll('[data-slate-editor],.monaco-editor')].map(node => node.outerHTML),
+        selection: window.getSelection()?.toString(), text: document.body.innerText,
+      })).catch(() => null), null, 2));
+      record(`browser-practice-${mode}`, '失败', String(error.message).slice(0, 500), 'browser-real-backend');
+      evidence.push({ mode, error: String(error.message), errors, backgroundAi });
+    } finally {
+      await observedSaves?.close();
+      await page.close();
+      writeFileSync(path.join(output, 'browser-practice-evidence.json'), JSON.stringify(evidence, null, 2));
+    }
+  }
+}
+
+async function checkFiveStageClassroom(teacher, student, offering, chapter, invitation) {
+  const stages = [
+    { key: 'launch', label: '项目启动', view: 'simple-resource', description: '明确观察任务' },
+    { key: 'ai-learning', label: '知识讲授', view: 'ai-learning', description: '学习科学观察' },
+    { key: 'make', label: '项目实践', view: 'ai-collaboration', description: '完成记录' },
+    { key: 'showcase', label: '成果汇报与评价', view: 'showcase-reporting', description: '分享成果' },
+    { key: 'reflection', label: '后测', view: 'experiment-posttest', description: '完成后测' },
+  ];
+  const classroomId = `prelaunch-learning-${randomUUID()}`;
+  const timestamp = new Date().toISOString();
+  const question = { id: 'observation-q', type: 'single', question: '为了比较两处绿地的鸟类数量，下列哪种记录方式更可靠？',
+    options: [{ value: 'A', label: '在相同观察时长下记录日期、地点和鸟类数量' }, { value: 'B', label: '仅凭印象判断哪处鸟更多' }],
+    answer: ['A'], analysis: '比较应保持观察时长一致，并保存日期、地点与数量记录，避免仅凭主观印象判断。', points: 1, knowledgePointIds: ['observation-kp'] };
+  mkdirSync(env.CLASSROOM_DATA_DIR, { recursive: true });
+  writeFileSync(path.join(env.CLASSROOM_DATA_DIR, `${classroomId}.json`), JSON.stringify({
+    id: classroomId, revision: 1, stage: { id: classroomId, name: '科学观察', createdAt: timestamp, updatedAt: timestamp },
+    createdAt: timestamp, updatedAt: timestamp,
+    scenes: [{ id: 'observation-scene', stageId: classroomId, outlineId: 'observation-quiz', lectureSectionId: 'observation-section',
+      title: '科学观察检测', type: 'quiz', order: 0, content: { type: 'quiz', questions: [question] }, actions: [] }],
+  }));
+  writeFileSync(path.join(output, 'five-stage-classroom.json'), readFileSync(path.join(env.CLASSROOM_DATA_DIR, `${classroomId}.json`)));
+  const template = await checkedRequest(teacher, 'POST', '/api/platform/templates', {
+    title: '五阶段功能验收模板', snapshot: { schemaVersion: 2, kind: 'pbl-course', design: {
+      name: '五阶段科学观察验收', subject: '科学', grade: '七年级', hours: 1, stages,
+      drivingQuestion: '如何比较两处绿地的鸟类数量？', expectedOutcome: '有原始观察记录支持的比较报告',
+      pblConfig: { makeArtifactMode: 'document' }, aiLearningClassroomId: classroomId,
+      content: { pblOutline: '学生独立完成观察与分析，AI 可协助整理记录和核验表达。',
+        knowledgePoints: [{ id: 'observation-kp', name: '科学观察', description: question.analysis }], lessonOutline: [],
+        knowledgeLectureSections: [{ id: 'observation-section', title: '科学观察', order: 0,
+          quizOutlineId: 'observation-quiz', sceneOutlineIds: [], estimatedMinutes: 3, knowledgePointIds: ['observation-kp'] }],
+        teachingBlueprint: { sections: [{ id: 'observation-section', units: [] }] },
+        evaluationPlan: { dimensions: [], overallRubric: '' } },
+    } },
+  }, 201);
+  writeFileSync(path.join(output, 'five-stage-template.json'), JSON.stringify(template, null, 2));
+  assert.equal(await db.knowledgeExplanationWarmup.count({ where: { courseId: template.id } }), 1, '正式模板发布入口未安排讲解预生成');
+  const publishedWarmup = await db.knowledgeExplanationWarmup.findFirstOrThrow({ where: { courseId: template.id } });
+  record('five-stage-template-publication-queues-explanation-warmup', '通过');
+  const activity = (await checkedRequest(teacher, 'POST', `/api/platform/offerings/${offering.id}/chapters/${chapter.id}/activities`, {
+    type: 'Classroom', title: '五阶段功能验收', templateVersionId: template.versions[0].id,
+    config: { schemaVersion: 1, experiment: { enabled: true,
+      pretest: [{ id: 'pre-observation', type: 'single-choice', prompt: '哪项便于核验观察结果？', options: ['记录日期和时长', '仅凭印象'], correctAnswer: '记录日期和时长' }],
+      posttest: [{ id: 'post-observation', type: 'short-answer', prompt: '比较两处绿地的鸟类数量时需要保持什么条件一致？' }],
+    } },
+  }, 201)).activity;
+  await checkedRequest(teacher, 'PATCH', `/api/platform/activities/${activity.id}`, { isOpen: true });
+  const instance = await db.classroomInstance.findFirstOrThrow({ where: { activityId: activity.id } });
+  await pageCheck(teacher, 'teacher/pbl-classroom-setup', `/teacher/teach/${instance.id}/setup`, '班级配置');
+  await checkedRequest(teacher, 'POST', `/api/platform/classroom-instances/${instance.id}/start`, {});
+  const sharedWarmups = await db.knowledgeExplanationWarmup.findMany({ where: { input: { path: ['classroomId'], equals: classroomId } } });
+  assert.equal(sharedWarmups.length, 1, '发布与开课必须按同一资源内容共用预热任务');
+  assert.equal(sharedWarmups[0].id, publishedWarmup.id);
+  assert.deepEqual(sharedWarmups[0].input, publishedWarmup.input, '开课不能改变已发布资源的预热输入');
+  assert.equal(sharedWarmups[0].status, 'PENDING', '关闭工作器时必须保留待处理任务');
+  assert.equal(sharedWarmups[0].attempts, 0);
+  record('five-stage-start-retains-shared-explanation-warmup-with-worker-disabled', '通过');
+  await checkedRequest(student, 'GET', `/api/platform/activities/${activity.id}`);
+  await checkedRequest(student, 'POST', `/api/platform/classroom-instances/${instance.id}/experiment`, {
+    phase: 'pretest', answers: { 'pre-observation': '记录日期和时长' },
+  });
+  const participation = (await checkedRequest(student, 'POST', `/api/platform/classroom-instances/${instance.id}/enter`, {})).participation;
+  const learner = await db.user.findFirstOrThrow({ where: { username: 'prelaunch-student' } });
+  const setStage = async (index) => {
+    const before = await checkedRequest(teacher, 'GET', `/api/courses/${instance.id}/state`);
+    writeFileSync(path.join(output, `five-stage-before-${index}.json`), JSON.stringify(before, null, 2));
+    await checkedRequest(teacher, 'POST', `/api/courses/${instance.id}/actions`, {
+      requestId: randomUUID(), action: { type: 'SET_STAGE', payload: { id: instance.id, index } },
+    });
+    const state = await checkedRequest(student, 'GET', `/api/courses/${instance.id}/state`);
+    assert.equal(state.course.stages[state.course.currentStageIndex].key, stages[index].key);
+    record(`five-stage-${stages[index].key}-teacher-switch-student-reload`, '通过');
+  };
+  await setStage(0);
+  await pageCheck(student, 'student/five-stage-launch', `/student/classroom/${instance.id}`, '项目启动');
+  await checkLinkedClassroomBrowsers(teacher, student, instance, activity, invitation, question);
+  if (linkageOnly) return;
+  await setStage(1);
+  const player = await student.newPage();
+  const playerErrors = [];
+  let expectedTutorFailure = false;
+  player.on('pageerror', error => playerErrors.push(error.message));
+  player.on('response', response => {
+    if (expectedTutorFailure && response.status() === 503
+      && ['/api/knowledge-lecture', '/api/openmaic/generate/tts'].includes(new URL(response.url()).pathname)) return;
+    if (response.status() >= 400 && (new URL(response.url()).pathname.startsWith('/api/') || /\.(js|css|woff2?)(\?|$)/.test(response.url()))) {
+      playerErrors.push(`${response.status()} ${new URL(response.url()).pathname}`);
+    }
+  });
+  try {
+    // The V2 classroom route loads the authenticated instance into the session
+    // store before mounting its real embedded learning player.
+    await player.goto(`${origin}/student/classroom/${instance.id}`, { waitUntil: 'domcontentloaded' });
+    await player.getByRole('button', { name: /^(开始答题|Start Quiz)$/ }).click({ timeout: 30_000 });
+    await player.getByText(question.question, { exact: true }).waitFor();
+    await player.getByRole('button', { name: /仅凭印象判断哪处鸟更多/ }).click();
+    await player.getByRole('button', { name: /^(提交答案|Submit Answers)$/ }).click();
+    await player.getByText(question.analysis, { exact: true }).waitFor();
+    await player.reload({ waitUntil: 'domcontentloaded' });
+    await player.getByText(question.analysis, { exact: true }).waitFor({ timeout: 30_000 });
+    assert.deepEqual(playerErrors, [], '播放器存在浏览器或资源/API异常');
+    await player.screenshot({ path: path.join(output, 'student-five-stage-learning-player.png'), fullPage: true });
+    record('five-stage-real-learning-player-submit-analysis-refresh-recovery', '通过', '', 'browser-real-backend');
+    expectedTutorFailure = true;
+    let injectedFailures = 0;
+    await player.route('**/api/knowledge-lecture', async route => {
+      if (route.request().postDataJSON()?.action !== 'tutor-explain') return route.continue();
+      injectedFailures++;
+      await route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ error: 'TUTOR_REQUEST_FAILED' }) });
+    });
+    // This fault check never reaches a paid speech provider.
+    await player.route('**/api/openmaic/generate/tts', route => route.fulfill({ status: 503, contentType: 'application/json', body: '{"error":"INJECTED_TTS_UNAVAILABLE"}' }));
+    await player.getByRole('button', { name: '助教讲解', exact: true }).click();
+    await player.getByRole('button', { name: '重试讲解', exact: true }).waitFor({ timeout: 30_000 });
+    await player.getByText('助教讲解暂时无法加载，原题仍可查看。请点击重试讲解重新加载。', { exact: true }).waitFor();
+    await player.getByRole('dialog', { name: '助教题目讲解' }).getByText(question.analysis).first().waitFor();
+    assert.equal(injectedFailures, 1, '首次讲解失败不应无界重试');
+    assert.deepEqual(playerErrors, [], '故障注入后出现非预期浏览器或接口异常');
+    await player.screenshot({ path: path.join(output, 'student-five-stage-tutor-unavailable.png'), fullPage: true });
+    record('five-stage-tutor-503-shows-authored-analysis-and-explicit-retry', '通过', '仅首次AI讲解注入503；作答/评分/学习记录均为真实隔离后端', 'injected-fault');
+  } catch (error) {
+    await player.screenshot({ path: path.join(output, 'student-five-stage-learning-player-failure.png'), fullPage: true }).catch(() => undefined);
+    record('five-stage-real-learning-player-submit-analysis-refresh-recovery', '失败', String(error.message).slice(0, 350), 'browser-real-backend');
+  } finally { await player.close(); }
+  const attemptBody = { action: 'record-attempt', courseId: instance.id, studentId: learner.id,
+    sectionId: 'observation-section', quizOutlineId: 'observation-quiz', runtimeSceneId: 'observation-scene', answers: { 'observation-q': 'B' } };
+  const attempted = await checkedRequest(student, 'POST', '/api/knowledge-lecture', attemptBody);
+  const replay = await checkedRequest(student, 'POST', '/api/knowledge-lecture', attemptBody);
+  assert.equal(replay.attempt.id, attempted.attempt.id);
+  assert.equal(replay.attempt.submittedAt, attempted.attempt.submittedAt);
+  record('five-stage-quiz-real-submit-idempotent-replay', '通过');
+  await pageCheck(student, 'student/five-stage-independent-player',
+    `/student/ai-learning/${classroomId}?courseId=${instance.id}`, question.analysis);
+  if (process.env.PRELAUNCH_CLASSROOM_AI === '1') {
+    const aiRequest = async (context, route, data) => {
+      const response = await context.request.post(`${origin}${route}`, { data, headers: { Origin: origin }, timeout: 180_000 });
+      const result = await response.json();
+      assert.equal(response.status(), 200, `${route}: ${response.status()} ${JSON.stringify(result).slice(0, 250)}`);
+      return result;
+    };
+    const other = await browser.newContext();
+    try {
+      await checkedRequest(other, 'POST', '/api/platform/auth/register', { invitationCode: invitation.code,
+        username: 'prelaunch-second-student', displayName: '第二名验收学生', password, confirmPassword: password }, 201);
+      await checkedRequest(other, 'GET', `/api/platform/activities/${activity.id}`);
+      await checkedRequest(other, 'POST', `/api/platform/classroom-instances/${instance.id}/experiment`, {
+        phase: 'pretest', answers: { 'pre-observation': '记录日期和时长' },
+      });
+      await checkedRequest(other, 'POST', `/api/platform/classroom-instances/${instance.id}/enter`, {});
+      const second = await db.user.findFirstOrThrow({ where: { username: 'prelaunch-second-student' } });
+      const secondAttempt = await checkedRequest(other, 'POST', '/api/knowledge-lecture', { ...attemptBody, studentId: second.id });
+      const explain = { action: 'tutor-explain', courseId: instance.id, studentId: learner.id,
+        attemptId: attempted.attempt.id, questionId: question.id, requestId: randomUUID() };
+      const first = await aiRequest(student, '/api/knowledge-lecture', explain);
+      assert.equal(first.resultSource, 'shared');
+      const cachedBefore = await db.knowledgeExplanation.findMany({ where: { status: 'COMPLETED' }, orderBy: { id: 'asc' } });
+      assert.ok(cachedBefore.length, '共享首次讲解没有持久化');
+      const shared = await aiRequest(other, '/api/knowledge-lecture', { ...explain, studentId: second.id,
+        attemptId: secondAttempt.attempt.id, requestId: randomUUID() });
+      assert.equal(shared.resultSource, 'shared');
+      assert.equal(shared.thread.messages.at(-1).content, first.thread.messages.at(-1).content);
+      const cachedAfter = await db.knowledgeExplanation.findMany({ where: { status: 'COMPLETED' }, orderBy: { id: 'asc' } });
+      for (const before of cachedBefore) assert.equal(cachedAfter.find(row => row.id === before.id)?.updatedAt.toISOString(), before.updatedAt.toISOString());
+      assert.notEqual(shared.thread.messages.at(-1).id, first.thread.messages.at(-1).id);
+      aiSamples.push({ feature: 'shared-explanation', question, answer: 'B', response: first.thread.messages.at(-1).content });
+      record('real-ai-two-students-share-explanation-with-independent-receipts', '通过');
+      const followup = await aiRequest(student, '/api/knowledge-lecture', { ...explain, action: 'tutor-message',
+        requestId: randomUUID(), message: '如果两个地点观察时长不一样，为什么不能直接比较鸟类总数？' });
+      assert.equal(followup.resultSource, 'personalized');
+      assert.ok(followup.thread.messages.length > first.thread.messages.length);
+      aiSamples.push({ feature: 'personal-followup', response: followup.thread.messages.at(-1).content });
+      record('real-ai-personal-followup-after-shared-explanation', '通过');
+      const tutorPage = await student.newPage();
+      try {
+        await tutorPage.goto(`${origin}/student/classroom/${instance.id}`, { waitUntil: 'domcontentloaded' });
+        await tutorPage.getByRole('button', { name: '助教讲解', exact: true }).click({ timeout: 30_000 });
+        const tutorDialog = tutorPage.getByRole('dialog', { name: '助教题目讲解', exact: true });
+        await tutorDialog.getByText(followup.thread.messages.at(-1).content, { exact: true }).waitFor({ timeout: 30_000 });
+        await tutorDialog.getByRole('button', { name: '关闭讲解', exact: true }).click();
+        record('real-ai-saved-explanation-followup-browser-render', '通过', '浏览器打开已保存的真实模型讲解和追问，不新增模型请求', 'browser-real-backend');
+      } finally { await tutorPage.close(); }
+      await checkPublicDiscussionAi(teacher, student, other, instance, learner, aiRequest);
+    } finally { await other.close(); }
+    await setStage(2);
+    await checkPracticeAi(student, instance, learner, aiRequest);
+  } else await setStage(2);
+  await pageCheck(student, 'student/five-stage-document-editor', `/student/ai-collaboration/${instance.id}`, '提交最终版');
+  await setStage(3);
+  await pageCheck(student, 'student/five-stage-showcase', `/student/classroom/${instance.id}`, '成果汇报');
+  await checkedRequest(student, 'POST', `/api/platform/participations/${participation.id}/outcomes`, {
+    action: 'save_artifact', idempotencyKey: randomUUID(), title: '科学观察报告', type: 'HTML', sourceHtml: '<p>同样观察十分钟，记录日期和数量。</p>',
+  });
+  await checkedRequest(teacher, 'POST', `/api/platform/participations/${participation.id}/outcomes`, {
+    action: 'evaluate', idempotencyKey: randomUUID(), type: 'FORMATIVE', score: 90, content: '已记录对比条件。',
+  });
+  await setStage(4);
+  await pageCheck(student, 'student/five-stage-reflection', `/student/classroom/${instance.id}`, '完成课堂后测');
+  const posttestPath = `/api/platform/classroom-instances/${instance.id}/experiment`;
+  const posttestState = await checkedRequest(student, 'GET', `${posttestPath}?phase=posttest`);
+  assert.equal(posttestState.available, true);
+  const posttestBody = { phase: 'posttest', answers: { 'post-observation': '应保持观察时长一致，同时记录日期和地点。' } };
+  await checkedRequest(student, 'PUT', posttestPath, { ...posttestBody, currentPage: 0, version: 0 });
+  assert.equal((await checkedRequest(student, 'GET', `${posttestPath}?phase=posttest`)).draft.answers['post-observation'], posttestBody.answers['post-observation']);
+  const posttestSubmission = await checkedRequest(student, 'POST', posttestPath, posttestBody);
+  assert.equal((await checkedRequest(student, 'POST', posttestPath, posttestBody)).submission.id, posttestSubmission.submission.id);
+  const results = await checkedRequest(teacher, 'GET', `${posttestPath}/results`);
+  assert.equal(results.posttestCount, 1);
+  record('five-stage-pretest-posttest-draft-submit-replay-and-teacher-results', '通过');
+  await checkedRequest(teacher, 'POST', `/api/platform/classroom-instances/${instance.id}/finish`, {});
+  assert.equal((await db.classroomInstance.findUniqueOrThrow({ where: { id: instance.id } })).status, 'FINISHED');
+  assert.ok(await db.classroomParticipation.findUnique({ where: { id: participation.id } }));
+  record('five-stage-sequential-controls-quiz-practice-and-finish', '通过', '阶段控制与持久化验收；完整课堂容量压测另行进行');
+}
+
+try {
+  command('docker', ['run', '--detach', '--rm', '--name', container,
+    '--publish', '127.0.0.1::5432', '--tmpfs', '/var/lib/postgresql/data:rw',
+    '--env', 'POSTGRES_HOST_AUTH_METHOD=trust', 'pgvector/pgvector:0.8.6-pg16']);
+  started = true;
+  for (let i = 0; i < 60; i++) {
+    try { command('docker', ['exec', container, 'pg_isready', '-U', 'postgres'], { timeout: 3000 }); break; }
+    catch { if (i === 59) throw new Error('Disposable database did not become ready'); await delay(500); }
+  }
+  const address = command('docker', ['port', container, '5432/tcp']);
+  assert.match(address, /^127\.0\.0\.1:\d+$/);
+  env.DATABASE_URL = courseReadExperimentPrimaryURL(`postgresql://postgres@${address}/postgres?schema=public`, env);
+  if (resumeSource) {
+    command('docker', ['exec', '-i', container, 'psql', '-U', 'postgres', '-d', 'postgres', '-v', 'ON_ERROR_STOP=1'], {
+      input: readFileSync(path.join(resumeSource, 'isolated-failure-database.sql'), 'utf8'), maxBuffer: 32 * 1024 * 1024,
+    });
+    const classroom = JSON.parse(readFileSync(path.join(resumeSource, 'five-stage-classroom.json'), 'utf8'));
+    mkdirSync(env.CLASSROOM_DATA_DIR, { recursive: true });
+    writeFileSync(path.join(env.CLASSROOM_DATA_DIR, `${classroom.id}.json`), JSON.stringify(classroom));
+    writeFileSync(path.join(output, 'five-stage-classroom.json'), JSON.stringify(classroom));
+    record('isolated-database-restore-previous-synthetic-ai-run', '通过');
+  }
+  command('node', ['scripts/run-prisma.mjs', 'migrate', 'deploy']);
+  db = new PrismaClient({ datasources: { db: { url: env.DATABASE_URL } } });
+  await db.$queryRaw`SELECT 1`;
+  record('isolated-database-migration', '通过');
+  if (incrementalOnly) {
+    await db.$executeRaw`CREATE TABLE "_OpenpblVerification" (marker TEXT PRIMARY KEY)`;
+    await db.$executeRaw`INSERT INTO "_OpenpblVerification" (marker) VALUES (${container})`;
+    env.OPENPBL_VERIFICATION_MARKER = container;
+  }
+  if (courseReadSettings.enabled) {
+    const roleName = `openpbl_course_read_${container.slice('openpbl-prelaunch-'.length).replaceAll('-', '')}`;
+    const password = randomBytes(32).toString('base64url');
+    const provisioned = await provisionCourseReadRole({ db, primaryDatabaseURL: env.DATABASE_URL, roleName, password,
+      workers: courseReadSettings.workers, perWorkerConnections: courseReadSettings.perWorkerConnections });
+    env.OPENPBL_COURSE_READ_DATABASE_URL = provisioned.readDatabaseURL;
+    isolatedCourseReadRole = { roleName, password };
+    record('isolated-course-read-role', '通过', { roleName, workers: courseReadSettings.workers,
+      connectionBudget: courseReadSettings.budget, primaryConnections: courseReadSettings.budget - courseReadSettings.workers * courseReadSettings.perWorkerConnections,
+      readerConnections: courseReadSettings.workers * courseReadSettings.perWorkerConnections, temporaryAllowed: provisioned.proof.temporaryAllowed });
+  }
+  command('docker', ['run', '--detach', '--rm', '--name', redisContainer,
+    '--publish', '127.0.0.1::6379', 'redis:7.4.5-alpine']);
+  redisStarted = true;
+  for (let i = 0; i < 30; i++) {
+    try { if (command('docker', ['exec', redisContainer, 'redis-cli', 'ping']) === 'PONG') break; }
+    catch { if (i === 29) throw new Error('Disposable Redis did not become ready'); await delay(300); }
+  }
+  env.REDIS_URL = `redis://${command('docker', ['port', redisContainer, '6379/tcp'])}/0`;
+  record('isolated-redis-start', '通过');
+  if (process.env.PRELAUNCH_REAL_PROVIDERS === '1') {
+    const configurationSource = new PrismaClient({ datasourceUrl: readFileSync(path.join(root, 'deploy/secrets/database_url.txt'), 'utf8').trim() });
+    try { record('isolated-real-provider-snapshot', '通过', await snapshotAcceptanceProviders(configurationSource, db)); }
+    finally { await configurationSource.$disconnect(); }
+    env.PROVIDER_CONFIG_DATABASE_URL = env.DATABASE_URL;
+    env.PROVIDER_CONFIG_ENCRYPTION_KEY = readFileSync(path.join(root, 'deploy/secrets/provider_encryption_key.txt'), 'utf8').trim();
+    env.PROVIDER_ENCRYPTION_KEY = env.PROVIDER_CONFIG_ENCRYPTION_KEY;
+    env.OPENPBL_OUTBOUND_PROXY = 'http://127.0.0.1:19999';
+  }
+  if (practiceOnly || classroomAcceptance) {
+    const runner = new URL(process.env.PRELAUNCH_CODE_RUNNER_URL || 'http://127.0.0.1:3002');
+    assert.ok(runner.protocol === 'http:' && runner.hostname === '127.0.0.1' && !runner.username && !runner.password,
+      'Practice acceptance may use only the loopback code runner');
+    env.CODE_RUNNER_URL = runner.origin;
+    env.CODE_RUNNER_TOKEN = readFileSync(process.env.PRELAUNCH_CODE_RUNNER_TOKEN_FILE
+      || path.join(root, 'deploy/secrets/monitor_token.txt'), 'utf8').trim();
+    assert.ok(env.CODE_RUNNER_TOKEN, 'Code runner credential is missing');
+  }
+
+  if (!reuseBuild) {
+    command('node', ['scripts/run-next-production.mjs', 'build', '--webpack'], { timeout: 1_200_000, stdio: 'pipe' });
+    record('isolated-production-build', '通过');
+  } else {
+    readFileSync(path.join(root, distDir, 'BUILD_ID'), 'utf8');
+    record('isolated-production-build', '通过', '复用本次验收构建');
+  }
+  verifiedBuildId = readFileSync(path.join(root, distDir, 'BUILD_ID'), 'utf8').trim();
+  command('node', ['scripts/check-generated-css.mjs']);
+  record('isolated-generated-css-integrity', '通过');
+  // Reused production output is read-only, including its traced local data.
+  const sourceStandalone = path.join(root, distDir, 'standalone');
+  for (const directory of [env.UPLOAD_DIR, env.CLASSROOM_DATA_DIR, env.WHITEBOARD_DATA_DIR]) mkdirSync(directory, { recursive: true });
+  const standalone = path.join(temporary, 'runtime');
+  const excluded = ['.openpbl-data', '.openpbl-runtime', '.env', '.env.local', '.env.production', '.env.production.local']
+    .map(name => path.join(sourceStandalone, name));
+  cpSync(sourceStandalone, standalone, { recursive: true, force: true, verbatimSymlinks: true,
+    filter: source => !excluded.some(item => source === item || source.startsWith(`${item}${path.sep}`)) });
+  cpSync(path.join(root, 'public'), path.join(standalone, 'public'), { recursive: true, force: true });
+  cpSync(path.join(root, distDir, 'static'), path.join(standalone, distDir, 'static'), { recursive: true, force: true });
+  if (websocketEnabled) localProxy = await startPrelaunchProxy({ port, appPort, websocketPort: 3199,
+    ...(classroomAcceptance || completionReviewOnly || incrementalOnly ? { tracePath: path.join(output, 'isolated-proxy-http.ndjson') } : {}) });
+  server = spawn(process.execPath, [path.join(standalone, 'server.js')],
+    { cwd: root, env: { ...env, PORT: String(appPort), HOSTNAME: '127.0.0.1' }, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+  observeServer(server);
+  let ready = false;
+  for (let i = 0; i < 180; i++) {
+    if (server.exitCode !== null) throw new Error(`Isolated app exited ${server.exitCode}`);
+    try { const response = await fetch(`${origin}/api/health/live`, { signal: AbortSignal.timeout(1500) }); if (response.ok) { ready = true; break; } }
+    catch { /* still starting */ }
+    await delay(1000);
+  }
+  assert.ok(ready, 'Isolated app did not start');
+  record('isolated-app-start', '通过');
+  browser = await chromium.launch({ ...(browserConfig.executablePath ? { executablePath: browserConfig.executablePath } : {}),
+    ...(completionReviewOnly || incrementalOnly ? { handleSIGINT: false, handleSIGTERM: false, handleSIGHUP: false } : {}) });
+  const teacher = await browser.newContext({ viewport: { width: 1366, height: 768 } });
+  const student = await browser.newContext({ viewport: { width: 1366, height: 768 } });
+  browserIdentity = await inspectBrowserIdentity(browserConfig, teacher);
+  record('browser-identity', '通过', `${browserIdentity.label} ${browserIdentity.version}`, 'browser-real-backend');
+
+  if (incrementalOnly) {
+    const { runIncrementalClassroomAcceptance } = await import('./lib/incremental-classroom-acceptance.mjs');
+    const json = value => JSON.stringify(value, (_key, item) => typeof item === 'bigint' ? item.toString() : item);
+    const sha = value => createHash('sha256').update(value).digest('hex');
+    const fileManifest = (directory, prefix = '') => readdirSync(directory, { withFileTypes: true })
+      .sort((left, right) => left.name.localeCompare(right.name)).flatMap(entry => {
+        const relative = path.join(prefix, entry.name);
+        if (entry.isDirectory()) return fileManifest(path.join(directory, entry.name), relative);
+        assert.ok(entry.isFile(), 'Incremental backup cannot follow symbolic links');
+        const bytes = readFileSync(path.join(directory, entry.name));
+        return [{ path: relative, bytes: bytes.length, sha256: sha(bytes) }];
+      });
+    const { createIncrementalSnapshot } = await import('./lib/incremental-snapshots.mjs');
+    const incrementalSnapshot = createIncrementalSnapshot({ output, root, temporary, container, env, db,
+      Prisma: { Prisma, PrismaClient }, runFileCommand, command, json, sha, fileManifest,
+      stopApplication: async () => { await stopIsolatedApplication(server); server = undefined; },
+    });
+    await runIncrementalClassroomAcceptance({ root, origin, env, output, db, browser, teacher,
+      buildId: verifiedBuildId, request: checkedRequest, record, applicationProcessTreeMemory,
+      restart: async () => {
+        await stopIsolatedApplication(server);
+        server = spawn(process.execPath, [path.join(standalone, 'server.js')],
+          { cwd: root, env: { ...env, PORT: String(appPort), HOSTNAME: '127.0.0.1' }, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+        observeServer(server);
+        for (let attempt = 0; attempt < 90; attempt++) {
+          if (server.exitCode !== null || server.signalCode !== null) throw new Error('Isolated incremental replacement exited during boot');
+          try { if ((await fetch(`${origin}/api/health/ready`, {
+            headers: { Authorization: `Bearer ${env.INTERNAL_MONITOR_TOKEN}` }, signal: AbortSignal.timeout(5000),
+          })).ok) return; } catch { /* wait for the isolated replacement */ }
+          await delay(1000);
+        }
+        throw new Error('Isolated incremental restart did not recover');
+      },
+      snapshot: incrementalSnapshot,
+    });
+    await teacher.close(); await student.close();
+  } else if (completionReviewOnly) {
+    const { runCompletionReviewAcceptance } = await import('./lib/completion-review-acceptance.mjs');
+    await runCompletionReviewAcceptance({ root, origin, env, output, db, password, buildId: verifiedBuildId,
+      courseReadConfiguration: { ...completionReadConfiguration, readerProvisioned: !!isolatedCourseReadRole }, request: checkedRequest,
+      record, applicationProcessTreeMemory });
+    await teacher.close(); await student.close();
+  } else if (browserSuite) {
+    const suiteSecretFile = path.join(temporary, 'browser-jwt-secret.txt');
+    writeFileSync(suiteSecretFile, env.JWT_SECRET, { mode: 0o600 });
+    const suites = browserSuite === 'ui'
+      ? ['lecture-chat', 'prepared-question-explanation', 'student-usability', 'classroom-complete', 'teacher-player-isolation', 'project-workspace', 'teacher-presentation', 'posttest-stage', 'teacher-classroom-editor', 'branded-native-zoom']
+      : ['classroom-reliability', 'code-reliability', 'teacher-error-recovery', 'prelaunch-fault-recovery'];
+    // API fixtures in these tests are explicitly distinct from the real backend
+    // and model checks. The document, CSP and assets come from this build.
+    const result = await new Promise((resolve, reject) => {
+      const child = spawn('pnpm', ['exec', 'playwright', 'test', ...suites.map(name => `e2e/${name}.spec.ts`), '--workers=2', '--reporter=json', `--output=${path.join(output, 'playwright')}`], {
+        cwd: root, env: { ...process.env, OPENPBL_RESOURCE_E2E_BASE_URL: origin,
+          JWT_SECRET: env.JWT_SECRET, OPENPBL_E2E_JWT_SECRET_FILE: suiteSecretFile, LAYOUT_JWT_SECRET_FILE: suiteSecretFile,
+          PLAYWRIGHT_JSON_OUTPUT_FILE: path.join(output, 'playwright.json') }, stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let log = '';
+      for (const stream of [child.stdout, child.stderr]) stream.on('data', chunk => { log += chunk; });
+      child.on('error', reject);
+      child.on('close', code => { writeFileSync(path.join(output, 'playwright.log'), log); resolve(code); });
+    });
+    record(`browser-${browserSuite}-regressions`, result === 0 ? '通过' : '失败', 'Business APIs are explicit browser fixtures; real build assets and browser interaction', 'browser-fixtures');
+    await teacher.close(); await student.close();
+  } else if (classroomAcceptance) {
+    const { runClassroomAcceptance } = await import('./lib/classroom-acceptance.mjs');
+    const soakClasses = Number(process.env.CLASSROOM_ACCEPTANCE_SOAK_CLASSES || 1);
+    assert.ok([1, 3].includes(soakClasses));
+    const lessons = [];
+    classroomSoakReport = soakClasses > 1 ? { status: 'running', classes: [] } : null;
+    for (let sequence = 1; sequence <= soakClasses; sequence++) {
+    const finalClass = sequence === soakClasses;
+    const classOutput = finalClass ? output : path.join(output, 'soak', `class-${sequence}`);
+    mkdirSync(classOutput, { recursive: true });
+    const classTeacher = sequence === 1 ? teacher : await browser.newContext({ viewport: { width: 1366, height: 768 } });
+    const lesson = await runClassroomAcceptance({ root, origin, env, output: classOutput, teacher: classTeacher, browser, db, password,
+      sequence, sustainedOnly: !finalClass,
+      applicationPid: () => server?.pid ?? null,
+      applicationProcessTreeMemory,
+      afterSustainedClass: soakClasses > 1 ? () => observeQuietClassroom({ origin, token: env.INTERNAL_MONITOR_TOKEN,
+        pid: server.pid, applicationProcessTreeMemory, output: classOutput, smoke: process.env.CLASSROOM_ACCEPTANCE_SMOKE === '1' }) : undefined,
+      request: checkedRequest, record: finalClass ? record : (name, status, detail, evidence) => record(`soak-${sequence}-${name}`, status, detail, evidence),
+      runPublicDiscussion: async ({ teacher: actor, students: participants, instance: active, fixture: lesson, record: publish }) => {
+        const send = async (context, route, data) => {
+          const response = await context.request.post(`${origin}${route}`, { data, headers: { Origin: origin }, timeout: 180000 });
+          const result = await response.json(); assert.equal(response.status(), 200, JSON.stringify(result).slice(0, 300)); return result;
+        };
+        await checkPublicDiscussionAi(actor.context, participants[0].context, participants[1].context, active, participants[0].user, send,
+          { knowledgePointId: lesson.designContent.knowledgePoints[0].id, recordResult: publish });
+      },
+      checkpoint: value => {
+        if (finalClass) classroomAcceptanceReport = value;
+        else writeFileSync(path.join(classOutput, 'classroom.json'), JSON.stringify(value, null, 2), { mode: 0o600 });
+        report();
+      },
+      disconnectSockets: async () => { await localProxy.disconnectWebSockets(); },
+      restart: async () => {
+        await stopIsolatedApplication(server);
+        server = spawn(process.execPath, [path.join(standalone, 'server.js')],
+          { cwd: root, env: { ...env, PORT: String(appPort), HOSTNAME: '127.0.0.1' }, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+        observeServer(server);
+        for (let attempt = 0; attempt < 90; attempt++) {
+          if (server.exitCode !== null || server.signalCode !== null) throw new Error('Isolated replacement exited during boot');
+          try { if ((await fetch(`${origin}/api/health/ready`, {
+            headers: { Authorization: `Bearer ${env.INTERNAL_MONITOR_TOKEN}` }, signal: AbortSignal.timeout(5000),
+          })).ok) return; } catch { /* wait for the isolated replacement */ }
+          await delay(1000);
+        }
+        throw new Error('Isolated restart did not recover');
+      },
+      backupRestore: async () => {
+        await captureAiUsageMetrics();
+        await stopIsolatedApplication(server);
+        server = undefined;
+        const snapshotFile = path.join(output, 'isolated-backup.sql');
+        await runFileCommand('docker', ['exec', container, 'pg_dump', '-U', 'postgres', '--dbname', 'postgres'],
+          { outputFile: snapshotFile, env, cwd: root });
+        // Restore into a second database in the disposable container, never
+        // replace the source database or the installed application service.
+        command('docker', ['exec', container, 'createdb', '-U', 'postgres', 'acceptance_restore']);
+        restoredDatabaseCreated = true;
+        await runFileCommand('docker', ['exec', '-i', container, 'psql', '-U', 'postgres', '-d', 'acceptance_restore', '-v', 'ON_ERROR_STOP=1'],
+          { inputFile: snapshotFile, env, cwd: root });
+        for (const [name, directory] of Object.entries({ uploads: env.UPLOAD_DIR, classrooms: env.CLASSROOM_DATA_DIR, whiteboards: env.WHITEBOARD_DATA_DIR, 'ai-audit-outbox': env.AI_AUDIT_OUTBOX_DIR })) {
+          mkdirSync(directory, { recursive: true });
+          const backup = path.join(output, 'backup-files', name);
+          cpSync(directory, backup, { recursive: true, verbatimSymlinks: true });
+          cpSync(backup, path.join(temporary, 'restored-files', name), { recursive: true, verbatimSymlinks: true });
+        }
+        const restored = new PrismaClient({ datasourceUrl: restoredClassroomEnvironment(env, temporary).DATABASE_URL });
+        try {
+          await assertIsolatedRestoreDatabase(db, restored);
+          if (isolatedCourseReadRole) {
+            const restoredEnvironment = restoredClassroomEnvironment(env, temporary);
+            const provisioned = await provisionCourseReadRole({ db: restored, primaryDatabaseURL: restoredEnvironment.DATABASE_URL,
+              ...isolatedCourseReadRole, workers: courseReadSettings.workers, perWorkerConnections: courseReadSettings.perWorkerConnections });
+            assert.equal(provisioned.readDatabaseURL, restoredEnvironment.OPENPBL_COURSE_READ_DATABASE_URL,
+              'Restored readers must target their own restored database');
+            record('isolated-restored-course-read-role', '通过', { roleName: provisioned.roleName, database: 'acceptance_restore',
+              temporaryAllowed: provisioned.proof.temporaryAllowed });
+          }
+          return restored;
+        }
+        catch (error) { await restored.$disconnect(); throw error; }
+      },
+      bootRestored: async () => {
+        assert.equal(server, undefined, 'Source application must stop before booting the restore');
+        const restoredEnvironment = restoredClassroomEnvironment(env, temporary);
+        server = spawn(process.execPath, [path.join(standalone, 'server.js')],
+          { cwd: root, env: { ...restoredEnvironment, PORT: String(appPort), HOSTNAME: '127.0.0.1' }, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+        observeServer(server);
+        for (let attempt = 0; attempt < 90; attempt++) {
+          if (server.exitCode !== null || server.signalCode !== null) throw new Error('Restored application exited during boot');
+          try { if ((await fetch(`${origin}/api/health/live`, { signal: AbortSignal.timeout(1500) })).ok) return; }
+          catch { /* wait for the restored application */ }
+          await delay(1000);
+        }
+        throw new Error('Restored application did not become live');
+      },
+    });
+    lessons.push(lesson);
+    if (classroomSoakReport) {
+      classroomSoakReport.classes.push({ sequence, directory: classOutput, classroomId: lesson.instanceId,
+        actualDurationSeconds: lesson.actualDurationSeconds, quietWindow: lesson.quietWindow });
+      report();
+    }
+    }
+    if (classroomSoakReport) {
+      Object.assign(classroomSoakReport, evaluateClassroomSoak(lessons, { count: soakClasses,
+        minutes: Number(process.env.CLASSROOM_ACCEPTANCE_MINUTES || 90),
+        students: Number(process.env.CLASSROOM_ACCEPTANCE_STUDENTS || 30), smoke: process.env.CLASSROOM_ACCEPTANCE_SMOKE === '1' }));
+      // Keep per-class evidence rather than replacing it with an aggregate count.
+      classroomSoakReport.classEvidence = lessons.map((lesson, index) => ({ ...lesson, sequence: index + 1,
+        buildId: verifiedBuildId, evidenceFile: index + 1 === soakClasses ? 'report.json'
+          : `soak/class-${index + 1}/classroom.json` }));
+      record('three-class-same-process-soak', classroomSoakReport.status === 'failed' ? '失败' : classroomSoakReport.status === 'passed' ? '通过' : '未验证', classroomSoakReport, 'isolated-backend');
+    }
+    // Run protocol probes after all timed classroom work. The final classroom
+    // has booted the restored database, so the proof client must follow it.
+    const proofEnvironment = restoredClassroomEnvironment(env, temporary);
+    const proofClient = new PrismaClient({ datasourceUrl: proofEnvironment.DATABASE_URL });
+    try {
+      const proof = await verifyReadApiBoundaryHttp({ baseURL: origin, jwtSecret: env.JWT_SECRET, db: proofClient,
+        isolation: { nonce: container.slice('openpbl-prelaunch-'.length), containerName: container,
+          databaseURL: proofEnvironment.DATABASE_URL, appPid: server?.pid, appPort,
+          runtimeRoot: standalone, distDir, buildId: verifiedBuildId,
+          classroomDataDir: proofEnvironment.CLASSROOM_DATA_DIR }, output,
+        readAppJournal: async () => readFileSync(path.join(output, 'isolated-app-requests.ndjson'), 'utf8')
+          .split('\n').filter(Boolean).map(line => JSON.parse(line)),
+      });
+      record('read-api-native-protocol', '通过', { buildId: proof.buildId, checks: proof.checks,
+        requestCount: proof.requests.length, restoration: proof.restoration, evidence: proof.evidence,
+        contractVersion: proof.contractVersion, protocolMode: proof.protocolMode,
+        coveredRoutes: proof.coveredRoutes, httpIdentity: proof.httpIdentity });
+    } catch (error) {
+      record('read-api-native-protocol', '失败', String(error.message).slice(0, 500));
+    } finally { await proofClient.$disconnect(); }
+    await student.close();
+  } else if (linkageOnly || practiceOnly) {
+    assert.ok(!linkageOnly || websocketEnabled, 'Linkage-only acceptance requires real WebSocket transport');
+    assert.notEqual(process.env.PRELAUNCH_REAL_PROVIDERS, '1', 'Scoped acceptance does not require paid providers');
+    await checkedRequest(teacher, 'POST', '/api/platform/auth/teacher-register', {
+      username: 'prelaunch-teacher', displayName: '联动验收教师', password, confirmPassword: password,
+    }, 201);
+    const offering = (await checkedRequest(teacher, 'POST', '/api/platform/offerings', {
+      name: practiceOnly ? '浏览器项目实践验收' : '浏览器真实 WebSocket 联动验收', description: '隔离数据库验收数据', term: '2026 秋季',
+    }, 201)).offering;
+    await checkedRequest(teacher, 'PATCH', `/api/platform/offerings/${offering.id}`, { status: 'open' });
+    const invitation = (await checkedRequest(teacher, 'POST', `/api/platform/offerings/${offering.id}/invitation`, {})).invitation;
+    const chapter = (await checkedRequest(teacher, 'POST', `/api/platform/offerings/${offering.id}/chapters`, { title: '项目启动' }, 201)).chapter;
+    await checkedRequest(teacher, 'PATCH', `/api/platform/chapters/${chapter.id}`, { isOpen: true });
+    await checkedRequest(student, 'POST', '/api/platform/auth/register', {
+      invitationCode: invitation.code, username: 'prelaunch-student', displayName: '上线验收学生', password, confirmPassword: password,
+    }, 201);
+    if (practiceOnly) await checkBrowserPractice(teacher, student, offering, chapter);
+    else await checkFiveStageClassroom(teacher, student, offering, chapter, invitation);
+    await teacher.close();
+    await student.close();
+  } else if (resumeSource) {
+    const learner = await db.user.findFirstOrThrow({ where: { username: 'prelaunch-student' } });
+    await db.user.update({ where: { id: learner.id }, data: { passwordHash: await hash(password) } });
+    await db.enrollment.updateMany({ where: { userId: learner.id }, data: { status: 'ACTIVE', withdrawnAt: null } });
+    await db.courseOffering.updateMany({ data: { status: 'OPEN', archivedAt: null } });
+    let instance;
+    if (resumePublicDiscussion) {
+      const savedCourse = JSON.parse(readFileSync(path.join(resumeSource, 'five-stage-before-2.json'), 'utf8')).course;
+      instance = await db.classroomInstance.findUniqueOrThrow({ where: { id: savedCourse.id } });
+      // Restore only the synthetic classroom's access and stage. Its model
+      // replies, attempts and discussion records remain unchanged.
+      instance = await db.classroomInstance.update({ where: { id: instance.id }, data: {
+        status: 'TEACHING', endedAt: null, runtimeConfig: { ...instance.runtimeConfig, currentStageIndex: 1 },
+      } });
+    } else instance = await db.classroomInstance.findFirstOrThrow({ where: { status: 'TEACHING' } });
+    await checkedRequest(student, 'POST', '/api/platform/auth/login', { username: 'prelaunch-student', password });
+    const aiRequest = async (context, route, data) => {
+      const response = await context.request.post(`${origin}${route}`, { data, headers: { Origin: origin }, timeout: 180_000 });
+      const result = await response.json();
+      assert.equal(response.status(), 200, `${route}: ${response.status()} ${JSON.stringify(result).slice(0, 250)}`);
+      return result;
+    };
+    if (resumePublicDiscussion) {
+      const observer = await browser.newContext({ viewport: { width: 1366, height: 768 } });
+      try {
+        for (const [context, username, route] of [[teacher, 'prelaunch-teacher', 'teacher-login'], [observer, 'prelaunch-second-student', 'login']]) {
+          const account = await db.user.findFirstOrThrow({ where: { username } });
+          await db.user.update({ where: { id: account.id }, data: { passwordHash: await hash(password) } });
+          await db.enrollment.updateMany({ where: { userId: account.id }, data: { status: 'ACTIVE', withdrawnAt: null } });
+          await checkedRequest(context, 'POST', `/api/platform/auth/${route}`, { username, password });
+        }
+        await checkSavedPublicDiscussion(teacher, student, observer, instance, aiRequest);
+      } finally { await observer.close(); }
+    } else await checkPracticeAi(student, instance, learner, aiRequest);
+    await teacher.close();
+    await student.close();
+  } else {
+  await checkedRequest(teacher, 'POST', '/api/platform/auth/teacher-register', {
+    username: 'prelaunch-teacher', displayName: '上线验收教师', password, confirmPassword: password,
+  }, 201);
+  record('teacher-register-real-login-cookie', '通过');
+  if (process.env.PRELAUNCH_REAL_PROVIDERS === '1' && process.env.PRELAUNCH_SKIP_PROVIDER_CHECK !== '1') await checkConfiguredProviders(teacher);
+  const textbookZip = new JSZip();
+  textbookZip.file('docProps/core.xml', '<cp:coreProperties xmlns:cp="urn:cp" xmlns:dc="urn:dc"><dc:title>上线验收教材</dc:title><dc:creator>验收教师</dc:creator></cp:coreProperties>');
+  textbookZip.file('word/styles.xml', '<w:styles xmlns:w="urn:w"><w:style w:type="paragraph" w:styleId="h"><w:name w:val="heading 1"/><w:outlineLvl w:val="0"/></w:style><w:style w:type="paragraph" w:styleId="h2"><w:name w:val="heading 2"/><w:outlineLvl w:val="1"/></w:style><w:style w:type="paragraph" w:styleId="h3"><w:name w:val="heading 3"/><w:outlineLvl w:val="2"/></w:style></w:styles>');
+  textbookZip.file('word/document.xml', '<w:document xmlns:w="urn:w"><w:body>'
+    + '<w:p><w:pPr><w:pStyle w:val="h"/></w:pPr><w:r><w:t>第一章 社区生态调查</w:t></w:r></w:p>'
+    + '<w:p><w:pPr><w:pStyle w:val="h2"/></w:pPr><w:r><w:t>第一节 观察与行动</w:t></w:r></w:p>'
+    + '<w:p><w:pPr><w:pStyle w:val="h3"/></w:pPr><w:r><w:t>一、社区生态证据</w:t></w:r></w:p>'
+    + '<w:p><w:r><w:t>观察社区树木与鸟类，记录环境变化并形成有证据支持的行动方案。</w:t></w:r></w:p>'
+    + '<w:p><w:pPr><w:pStyle w:val="h3"/></w:pPr><w:r><w:t>二、行动方案方法</w:t></w:r></w:p>'
+    + '<w:p><w:r><w:t>比较两处绿地的物种记录，例如按观察日期统计鸟类数量。</w:t></w:r></w:p>'
+    + '</w:body></w:document>');
+  const textbookBytes = await textbookZip.generateAsync({ type: 'nodebuffer' });
+  const textbookUpload = await teacher.request.post(`${origin}/api/textbooks`, {
+    multipart: { file: { name: 'prelaunch.docx', mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', buffer: textbookBytes }, title: '上线验收教材' },
+    headers: { Origin: origin }, timeout: 90_000,
+  });
+  const textbookUploadBody = await textbookUpload.json();
+  assert.equal(textbookUpload.status(), 201, `textbook upload: ${JSON.stringify(textbookUploadBody).slice(0, 300)}`);
+  const textbook = textbookUploadBody.textbook;
+  assert.ok(textbook?.id);
+  let textbookDetails;
+  for (let i = 0; i < 50; i++) {
+    textbookDetails = await checkedRequest(teacher, 'GET', `/api/textbooks/${textbook.id}`);
+    if (textbookDetails.sections?.length && textbookDetails.sourceBlocks?.length && textbookDetails.concepts?.length) break;
+    await delay(500);
+  }
+  assert.ok(textbookDetails?.sections?.length && textbookDetails?.sourceBlocks?.length, '教材解析未保存章节和正文');
+  assert.equal(textbookDetails.concepts.length, 2, '教材二级标题未生成知识点');
+  assert.ok(textbookDetails.concepts.some((concept) => concept.name === '社区生态证据' && concept.evidence?.some((item) => item.quote.includes('社区树木'))), '知识点缺少原文证据');
+  assert.ok(textbookDetails.relations?.length, '教材知识点未生成关系');
+  const textbookSearch = await checkedRequest(teacher, 'GET', `/api/textbooks/${textbook.id}/search?q=${encodeURIComponent('社区树木')}`);
+  assert.ok(textbookSearch.hits?.length, '教材关键词检索未返回已解析正文');
+  record('textbook-docx-upload-parse-search-persistence', '通过');
+  await pageCheck(teacher, 'teacher/textbook-reader', `/teacher/textbooks/${textbook.id}`, '社区生态调查');
+  try {
+    const graphPage = await teacher.newPage();
+    await graphPage.goto(`${origin}/teacher/textbooks/${textbook.id}?view=graph`, { waitUntil: 'domcontentloaded' });
+    const graph = graphPage.locator('[data-graph-ready]');
+    await graph.waitFor({ timeout: 30_000 });
+    await graphPage.waitForFunction(() => document.querySelector('[data-graph-ready]')?.getAttribute('data-graph-ready') === 'true', null, { timeout: 30_000 });
+    const firstChapter = textbookDetails.sections.find((section) => section.kind === 'CHAPTER');
+    assert.ok(firstChapter?.id);
+    await graphPage.goto(`${origin}/teacher/textbooks/${textbook.id}?view=graph&section=${encodeURIComponent(firstChapter.id)}`, { waitUntil: 'domcontentloaded' });
+    await graphPage.waitForFunction(() => {
+      const graph = document.querySelector('[data-graph-ready]');
+      return graph?.getAttribute('data-graph-ready') === 'true' && Number(graph.getAttribute('data-visible-node-count')) >= 2;
+    }, null, { timeout: 30_000 });
+    await graphPage.getByText('以列表浏览当前节点').click();
+    await graphPage.getByRole('button', { name: '社区生态证据', exact: true }).waitFor();
+    await graphPage.screenshot({ path: path.join(output, 'teacher-textbook-real-graph.png') });
+    await graphPage.reload({ waitUntil: 'domcontentloaded' });
+    await graphPage.waitForFunction(() => {
+      const graph = document.querySelector('[data-graph-ready]');
+      return graph?.getAttribute('data-graph-ready') === 'true' && Number(graph.getAttribute('data-visible-node-count')) >= 2;
+    }, null, { timeout: 30_000 });
+    assert.equal((await checkedRequest(teacher, 'GET', `/api/textbooks/${textbook.id}`)).concepts.length, 2);
+    record('textbook-real-docx-graph-and-evidence-persisted', '通过', '2 个知识点与原文证据，浏览器图谱绘制后刷新保持');
+    await graphPage.close();
+  } catch (error) { record('textbook-real-docx-graph-and-evidence-persisted', '失败', String(error.message).slice(0, 300)); }
+  const pdf = await PDFDocument.create();
+  pdf.addPage([600, 400]);
+  const pdfBytes = Buffer.from(await pdf.save());
+  const uploadedPdfResponse = await teacher.request.post(`${origin}/api/uploads`, {
+    multipart: { file: { name: 'prelaunch.pdf', mimeType: 'application/pdf', buffer: pdfBytes }, title: '上线验收 PDF' },
+    headers: { Origin: origin },
+  });
+  assert.equal(uploadedPdfResponse.status(), 201);
+  const uploadedPdf = await uploadedPdfResponse.json();
+  const downloadedPdf = await teacher.request.get(`${origin}${uploadedPdf.url}`, { headers: { Range: 'bytes=0-15' } });
+  assert.equal(downloadedPdf.status(), 206);
+  assert.equal((await downloadedPdf.body()).toString(), pdfBytes.subarray(0, 16).toString());
+  record('pdf-upload-download-range-and-isolated-storage', '通过');
+  try {
+    const sampleRate = 16_000;
+    const wav = Buffer.alloc(44 + sampleRate * 2);
+    wav.write('RIFF', 0); wav.writeUInt32LE(wav.length - 8, 4); wav.write('WAVEfmt ', 8);
+    wav.writeUInt32LE(16, 16); wav.writeUInt16LE(1, 20); wav.writeUInt16LE(1, 22);
+    wav.writeUInt32LE(sampleRate, 24); wav.writeUInt32LE(sampleRate * 2, 28);
+    wav.writeUInt16LE(2, 32); wav.writeUInt16LE(16, 34);
+    wav.write('data', 36); wav.writeUInt32LE(sampleRate * 2, 40);
+    for (let sample = 0; sample < sampleRate; sample++) wav.writeInt16LE(Math.round(Math.sin(2 * Math.PI * 440 * sample / sampleRate) * 1000), 44 + sample * 2);
+    const recorder = await browser.newContext({ recordVideo: { dir: path.join(temporary, 'recorded-video'), size: { width: 320, height: 180 } } });
+    const recordedPage = await recorder.newPage();
+    await recordedPage.setContent('<body style="background:#173b3c;color:white"><h1>CoTeach 媒体验收</h1></body>');
+    await recordedPage.waitForTimeout(1200);
+    await recordedPage.close();
+    const webm = readFileSync(await recordedPage.video().path());
+    await recorder.close();
+    assert.ok(webm.length > 1000, '测试视频录制为空');
+    const assets = [];
+    for (const [kind, filename, mimeType, bytes] of [
+      ['audio', 'prelaunch.wav', 'audio/wav', wav], ['video', 'prelaunch.webm', 'video/webm', webm],
+    ]) {
+      const response = await teacher.request.post(`${origin}/api/uploads`, {
+        multipart: { file: { name: filename, mimeType, buffer: bytes }, title: `上线验收 ${kind}` }, headers: { Origin: origin }, timeout: 30_000,
+      });
+      const uploaded = await response.json();
+      assert.equal(response.status(), 201, `${filename} upload: ${JSON.stringify(uploaded).slice(0, 200)}`);
+      const download = await teacher.request.get(`${origin}${uploaded.url}`);
+      assert.equal(download.status(), 200);
+      assert.deepEqual(await download.body(), bytes);
+      assets.push({ kind, url: uploaded.url });
+    }
+    const mediaPage = await teacher.newPage();
+    await mediaPage.goto(`${origin}/teacher/classes`, { waitUntil: 'domcontentloaded' });
+    for (const asset of assets) {
+      await mediaPage.evaluate(({ kind, url }) => {
+        const media = document.createElement(kind);
+        media.id = `prelaunch-${kind}`; media.src = url; media.controls = true;
+        const button = document.createElement('button');
+        button.id = `play-${kind}`; button.textContent = `播放 ${kind}`;
+        button.addEventListener('click', () => { void media.play().catch((error) => { document.body.dataset.mediaError = String(error); }); });
+        document.body.append(media, button);
+      }, asset);
+      await mediaPage.locator(`#play-${asset.kind}`).click();
+      await mediaPage.waitForFunction((kind) => {
+        const media = document.querySelector(`#prelaunch-${kind}`);
+        return media?.currentTime > 0.1 || Boolean(document.body.dataset.mediaError);
+      }, asset.kind, { timeout: 15_000 });
+      assert.equal(await mediaPage.evaluate(() => document.body.dataset.mediaError || ''), '', `${asset.kind} playback failed`);
+      assert.ok(await mediaPage.locator(`#prelaunch-${asset.kind}`).evaluate((media) => media.currentTime > 0.1));
+    }
+    await mediaPage.close();
+    record('audio-video-upload-download-browser-playback', '通过', 'Synthetic sine-wave WAV and recorded WebM; currentTime advances after a browser click', 'browser-media');
+  } catch (error) {
+    record('audio-video-upload-download-browser-playback', '失败', String(error.message).slice(0, 350));
+  }
+  try {
+    const resourceTemplate = (await checkedRequest(teacher, 'POST', '/api/platform/templates/pbl', {
+      name: '上线验收资源包课程', subject: '生态学', grade: '本科一年级', hours: 3,
+    }, 201)).templateId;
+    assert.ok(resourceTemplate);
+    const metadata = (resourceType) => `---\nhandoffFormatVersion: 1\nprojectId: "prelaunch-ecology"\nresourceType: ${resourceType}\nresourceVersion: 1\npackageId: "prelaunch-package"\npresentationVersion: 1\n---`;
+    const knowledge = `${metadata('KNOWLEDGE')}\n\n# 城市生态调查\n\n## 学习范围\n\n### 1. 城市生态证据\n\n- ID：urban-ecology\n- 范围：观察社区树木和鸟类。\n- 证据状态：SUPPORTED\n\n#### 观察记录\n\n- ID：observation\n- 内容：按时间和位置记录真实观察。\n- 来源：KB:1\n`;
+    const stages = [
+      ['教师导入', 'INTRODUCTION', 15], ['学生与AI讲师学习', 'AI_LEARNING', 30],
+      ['小组项目实践', 'PROJECT_WORK', 60], ['成果展示', 'SHOWCASE', 20], ['反思评价', 'REFLECTION', 10],
+    ].map(([title, id, minutes], index) => `### ${index + 1}. ${title}\n\n- ID：${id}\n- 时间与课次：第1课时，${minutes}分钟\n\n#### 教师行动\n\n- 引导观察并检查证据。\n\n#### 学生行动\n\n- 独立记录社区生态证据。\n\n#### AI职责\n\n- 提示观察维度，不代替学生判断。\n\n#### 阶段产出\n\n- 个人观察记录。\n\n#### 课次检查点\n\n- 保存当前观察记录。\n\n#### 观察与介入\n\n- 检查记录能否追溯来源。`).join('\n\n');
+    const lesson = `${metadata('LESSON_PLAN')}\n\n# 城市生态调查：初步教案设计\n\n## 本课概览\n\n- 课程：城市生态调查\n- 授课对象：本科一年级\n- 项目周期：3节课\n- 授课时间：3课时，每课时45分钟\n- 驱动问题：怎样用可复查的观察证据解释社区生态？\n- 成果形式：个人生态调查报告。\n- 完成方式：个人独立完成\n\n## 教学目标\n\n- 能够记录可追溯的生态观察证据。\n\n## 组织安排\n\n- AI使用原则：仅用于提示观察维度，不代替学生判断。\n\n## 课堂实施\n\n${stages}\n\n## 评价安排\n\n依据观察证据的准确性评价。\n\n## 学生反思\n\n1. 哪条证据最可靠？\n`;
+    const pptx = new PptxGenJS();
+    pptx.layout = 'LAYOUT_WIDE';
+    pptx.addSlide().addText('城市生态调查：项目启动', { x: 0.8, y: 0.8, w: 10, h: 1, fontSize: 28 });
+    const pptxBytes = Buffer.from(await pptx.write({ outputType: 'nodebuffer' }));
+    const archive = new JSZip();
+    archive.file('知识点.md', knowledge); archive.file('教案.md', lesson); archive.file('项目启动.pptx', pptxBytes);
+    const archiveBytes = await archive.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
+    const uploadResponse = await teacher.request.post(`${origin}/api/uploads`, {
+      multipart: { file: { name: 'prelaunch-package.zip', mimeType: 'application/zip', buffer: archiveBytes }, courseId: resourceTemplate, purpose: 'course-resource-package' },
+      headers: { Origin: origin }, timeout: 90_000,
+    });
+    const uploadedArchive = await uploadResponse.json();
+    assert.equal(uploadResponse.status(), 201, `resource upload: ${JSON.stringify(uploadedArchive).slice(0, 250)}`);
+    assert.ok(uploadedArchive.id);
+    await checkedRequest(teacher, 'POST', `/api/courses/${resourceTemplate}/resource-package`, { uploadId: uploadedArchive.id }, 202);
+    let resourceJob;
+    for (let attempt = 0; attempt < 90; attempt++) {
+      resourceJob = (await checkedRequest(teacher, 'GET', `/api/courses/${resourceTemplate}/resource-package`)).job;
+      if (['ready', 'failed', 'blocked', 'needs_selection'].includes(resourceJob?.status)) break;
+      await delay(1000);
+    }
+    assert.equal(resourceJob?.status, 'ready', `resource package processing: ${resourceJob?.status} ${resourceJob?.message || resourceJob?.error || ''}`);
+    assert.equal(resourceJob.package?.draft?.courseName, '城市生态调查');
+    assert.equal(resourceJob.package?.draft?.knowledgePoints?.length, 1);
+    assert.equal(resourceJob.package?.draft?.stages?.length, 5);
+    assert.ok(resourceJob.package?.launchResourceId);
+    const preview = await teacher.request.get(`${origin}/api/uploads/${resourceJob.package.launchResourceId}?variant=classroom`);
+    assert.equal(preview.status(), 200);
+    assert.equal((await PDFDocument.load(await preview.body())).getPageCount(), 1);
+    const requiredPlanningIssues = resourceJob.package.planningIssues?.filter((issue) => issue.requiresAcknowledgement).map((issue) => issue.id) ?? [];
+    const confirmed = (await checkedRequest(teacher, 'PATCH', `/api/courses/${resourceTemplate}/resource-package`, {
+      action: 'confirm', revision: resourceJob.package.revision, draft: resourceJob.package.draft,
+      ...(requiredPlanningIssues.length ? { acknowledgement: { issueVersion: resourceJob.package.planningIssueVersion, issueIds: requiredPlanningIssues } } : {}),
+    })).job;
+    assert.ok(confirmed?.package?.confirmedAt);
+    assert.ok((await checkedRequest(teacher, 'GET', `/api/courses/${resourceTemplate}/resource-package`)).job?.package?.confirmedAt);
+    await pageCheck(teacher, 'teacher/resource-package-verified', `/teacher/prepare/${resourceTemplate}/verify`, '城市生态调查');
+    record('resource-package-real-zip-pptx-parse-pdf-confirm-persistence', '通过', `1 PPTX 页，${resourceJob.package.draft.stages.length} 阶段`);
+  } catch (error) {
+    record('resource-package-real-zip-pptx-parse-pdf-confirm-persistence', '失败', String(error.message).slice(0, 350));
+  }
+  const offering = (await checkedRequest(teacher, 'POST', '/api/platform/offerings', {
+    name: '上线验收课程：城市生态调查', description: '隔离数据库验收数据', term: '2026 秋季',
+  }, 201)).offering;
+  assert.ok(offering?.id);
+  await checkedRequest(teacher, 'PATCH', `/api/platform/offerings/${offering.id}`, { status: 'open' });
+  const invitation = (await checkedRequest(teacher, 'POST', `/api/platform/offerings/${offering.id}/invitation`, {})).invitation;
+  const chapter = (await checkedRequest(teacher, 'POST', `/api/platform/offerings/${offering.id}/chapters`, { title: '项目启动' }, 201)).chapter;
+  assert.ok(invitation?.code && chapter?.id);
+  await checkedRequest(teacher, 'PATCH', `/api/platform/chapters/${chapter.id}`, { isOpen: true });
+  record('teacher-course-chapter-invite-persistence', '通过');
+
+  const configs = {
+    Assignment: { schemaVersion: 1, prompt: '记录社区观察证据' },
+    Quiz: { schemaVersion: 1, questions: [{ id: 'q1', title: '写出一条证据', required: true }] },
+    Form: { schemaVersion: 1, questions: [{ id: 'q1', title: '你发现了什么？', type: 'short-text', required: true }] },
+    Resource: { schemaVersion: 1, content: '阅读社区生态调查材料' },
+  };
+  const activities = {};
+  for (const [type, config] of Object.entries(configs)) {
+    activities[type] = (await checkedRequest(teacher, 'POST', `/api/platform/offerings/${offering.id}/chapters/${chapter.id}/activities`,
+      { type, title: `${type} 验收`, config }, 201)).activity;
+    await checkedRequest(teacher, 'PATCH', `/api/platform/activities/${activities[type].id}`, { isOpen: true });
+  }
+  record('teacher-four-activity-types-created', '通过');
+
+  await checkedRequest(student, 'POST', '/api/platform/auth/invite', { code: invitation.code });
+  await checkedRequest(student, 'POST', '/api/platform/auth/register', {
+    invitationCode: invitation.code, username: 'prelaunch-student', displayName: '上线验收学生', password, confirmPassword: password,
+  }, 201);
+  record('student-invite-register-real-login-cookie', '通过');
+  for (const legacyAuth of ['/api/auth/login', '/api/auth/register', '/api/auth/join']) {
+    const retired = await checkedRequest(student, 'POST', legacyAuth, {}, 410);
+    assert.equal(retired.code, 'V2_AUTH_REQUIRED');
+  }
+  record('legacy-account-api-explicitly-retired', '通过');
+  await checkedRequest(student, 'GET', '/api/platform/offerings', undefined, 401);
+  await checkedRequest(teacher, 'GET', '/api/platform/courses', undefined, 401);
+  await checkedRequest(student, 'GET', `/api/platform/activities/${randomUUID()}`, undefined, 404);
+  record('role-boundaries-and-invalid-activity', '通过');
+  for (const [type, activity] of Object.entries(activities)) {
+    const data = type === 'Assignment' ? { answer: '我观察到社区河流变清了。' }
+      : type === 'Resource' ? { answer: '已阅读资料' }
+      : { answers: { q1: '我观察到社区河流变清了。' } };
+    await checkedRequest(student, 'POST', `/api/platform/activities/${activity.id}/submit`, data);
+    const loaded = await checkedRequest(student, 'GET', `/api/platform/activities/${activity.id}`);
+    assert.equal(loaded.activity.progress.status, 'completed');
+    assert.equal(await db.activitySubmission.count({ where: { activityId: activity.id } }), 1);
+    record(`student-${type.toLowerCase()}-submit-reload`, '通过');
+  }
+  for (const [type, activity] of Object.entries(activities)) {
+    const page = await student.newPage();
+    try {
+      await page.goto(`${origin}/student/activities/${activity.id}`, { waitUntil: 'domcontentloaded' });
+      await page.getByRole('heading', { name: `${type} 验收` }).waitFor();
+      if (type === 'Resource') {
+        await page.getByText('阅读社区生态调查材料').waitFor();
+        await page.getByText('已学习', { exact: true }).waitFor();
+      } else {
+        const revised = `页面修改后保存：${type} 社区生态证据`;
+        await page.locator('textarea').first().fill(revised);
+        await page.getByRole('button', { name: type === 'Form' ? '更新回答' : '更新提交' }).click();
+        await page.getByRole('status').filter({ hasText: type === 'Form' ? '回答已经保存' : '已保存' }).waitFor();
+        await page.reload({ waitUntil: 'domcontentloaded' });
+        await page.locator('textarea').first().waitFor();
+        assert.equal(await page.locator('textarea').first().inputValue(), revised);
+        const stored = await checkedRequest(student, 'GET', `/api/platform/activities/${activity.id}`);
+        assert.equal(stored.activity.progress.status, 'completed');
+      }
+      record(`student-${type.toLowerCase()}-browser-edit-reload`, '通过');
+    } catch (error) {
+      await page.screenshot({ path: path.join(output, `student-${type.toLowerCase()}-browser-edit-failure.png`) }).catch(() => undefined);
+      record(`student-${type.toLowerCase()}-browser-edit-reload`, '失败', String(error.message).slice(0, 300));
+    } finally { await page.close(); }
+  }
+  const survey = await checkedRequest(teacher, 'GET', `/api/platform/activities/${activities.Form.id}/survey-results`);
+  assert.equal(survey.analytics.submittedCount, 1);
+  record('teacher-survey-sees-student-submission', '通过');
+
+  const template = await checkedRequest(teacher, 'POST', '/api/platform/templates', {
+    title: '上线验收课堂模板', snapshot: { schemaVersion: 1, title: '城市生态调查课堂' },
+  }, 201);
+  assert.ok(template?.versions?.[0]?.id);
+  const secondVersion = (await checkedRequest(teacher, 'POST', `/api/platform/templates/${template.id}/versions`, {
+    snapshot: { schemaVersion: 1, title: '城市生态调查课堂（第二版）' },
+  }, 201)).version;
+  assert.equal(secondVersion.version, 2);
+  assert.equal((await db.classroomTemplateVersion.count({ where: { templateId: template.id } })), 2);
+  record('teacher-template-version-published-and-persisted', '通过');
+  let pblCreatePage;
+  try {
+    pblCreatePage = await teacher.newPage();
+    await pblCreatePage.goto(`${origin}/teacher/templates/pbl/new`, { waitUntil: 'domcontentloaded' });
+    await pblCreatePage.getByRole('textbox', { name: '课程名称' }).fill('上线验收 PBL 创建草稿');
+    await pblCreatePage.getByRole('textbox', { name: '学科' }).fill('科学');
+    await pblCreatePage.getByRole('textbox', { name: '年级' }).fill('七年级');
+    await pblCreatePage.getByRole('spinbutton', { name: '课时' }).fill('1');
+    await pblCreatePage.getByRole('button', { name: '创建并进入备课' }).click();
+    await pblCreatePage.waitForURL(/\/teacher\/prepare\/[^/]+\/verify$/, { timeout: 30_000 });
+    const pblCreatedId = new URL(pblCreatePage.url()).pathname.split('/')[3];
+    const pblCreated = await db.classroomTemplate.findUniqueOrThrow({ where: { id: pblCreatedId } });
+    assert.equal(pblCreated.title, '上线验收 PBL 创建草稿');
+    await pblCreatePage.reload({ waitUntil: 'domcontentloaded' });
+    await pblCreatePage.getByText('上线验收 PBL 创建草稿').first().waitFor();
+    await pblCreatePage.screenshot({ path: path.join(output, 'teacher-pbl-draft-created.png') });
+    record('teacher-pbl-browser-create-draft-persisted', '通过');
+  } catch (error) {
+    await pblCreatePage?.screenshot({ path: path.join(output, 'teacher-pbl-create-failure.png') }).catch(() => undefined);
+    record('teacher-pbl-browser-create-draft-persisted', '失败', String(error.message).slice(0, 350));
+  } finally { await pblCreatePage?.close(); }
+  if (process.env.PRELAUNCH_REAL_PROVIDERS === '1' && process.env.PRELAUNCH_COURSE_GENERATION === '1') {
+    let generationPage;
+    try {
+      const generatedTitle = '上线验收 AI 生成课程';
+      generationPage = await teacher.newPage();
+      await generationPage.goto(`${origin}/teacher/templates/new`, { waitUntil: 'domcontentloaded' });
+      await generationPage.getByRole('textbox', { name: '课程名称' }).fill(generatedTitle);
+      await generationPage.getByRole('textbox', { name: '学科领域' }).fill('科学');
+      await generationPage.getByRole('textbox', { name: '适用年级' }).fill('七年级');
+      await generationPage.getByRole('spinbutton', { name: '课程时长（分钟）' }).fill('20');
+      await generationPage.getByRole('textbox', { name: '教学要求' }).fill('围绕社区树木与鸟类观察设计一节二十分钟的科学课，学生记录证据并提出一项可执行的保护行动。');
+      await generationPage.route('**/api/platform/templates/generate', route => route.fulfill({
+        status: 503, contentType: 'application/json', body: JSON.stringify({ message: '验收注入的临时故障，请重试' }),
+      }), { times: 1 });
+      await generationPage.getByRole('button', { name: '生成课程方案' }).click();
+      await generationPage.getByRole('alert').getByText('验收注入的临时故障，请重试').waitFor();
+      assert.equal(await generationPage.getByRole('textbox', { name: '课程名称' }).inputValue(), generatedTitle);
+      await generationPage.reload({ waitUntil: 'domcontentloaded' });
+      await generationPage.waitForFunction((title) =>
+        Array.from(document.querySelectorAll('input')).some((input) => input.value === title), generatedTitle);
+      assert.equal(await generationPage.getByRole('textbox', { name: '课程名称' }).inputValue(), generatedTitle);
+      let generated = false;
+      for (let attempt = 0; attempt < 2 && !generated; attempt++) {
+        const responseReady = generationPage.waitForResponse(response =>
+          new URL(response.url()).pathname === '/api/platform/templates/generate' && response.request().method() === 'POST',
+        { timeout: 150_000 });
+        await generationPage.getByRole('button', { name: '生成课程方案' }).click();
+        const response = await responseReady;
+        generated = response.ok();
+        if (!generated && attempt === 1) throw new Error(`真实课程生成连续失败，末次 HTTP ${response.status()}`);
+      }
+      await generationPage.getByRole('heading', { name: '完善课程内容' }).waitFor({ timeout: 150_000 });
+      assert.ok((await generationPage.getByRole('textbox', { name: '课程简介' }).inputValue()).trim());
+      await generationPage.getByRole('button', { name: '预览课程' }).click();
+      await generationPage.getByText('03 / 发布确认').waitFor();
+      await generationPage.getByRole('button', { name: '发布到课程库' }).click();
+      await generationPage.waitForURL('**/teacher/templates?created=1', { timeout: 30_000 });
+      await generationPage.getByText(generatedTitle).first().waitFor();
+      const generatedTemplate = await db.classroomTemplate.findFirstOrThrow({
+        where: { title: generatedTitle }, include: { versions: { orderBy: { version: 'desc' }, take: 1 } },
+      });
+      assert.ok(generatedTemplate.versions[0]?.snapshot?.outline?.length, 'AI 生成内容未保存到模板版本');
+      await generationPage.reload({ waitUntil: 'domcontentloaded' });
+      await generationPage.getByText(generatedTitle).first().waitFor();
+      await generationPage.screenshot({ path: path.join(output, 'teacher-normal-ai-generated-published.png') });
+      record('teacher-normal-ai-generation-failure-retry-publish-persisted', '通过');
+    } catch (error) {
+      await generationPage?.screenshot({ path: path.join(output, 'teacher-normal-ai-generation-failure.png') }).catch(() => undefined);
+      record('teacher-normal-ai-generation-failure-retry-publish-persisted', '失败', String(error.message).slice(0, 350));
+    } finally { await generationPage?.close(); }
+  }
+  let editorPage;
+  try {
+    const editorId = `prelaunch-editor-${randomUUID()}`;
+    const editorClassroomId = `prelaunch-classroom-${randomUUID()}`;
+    const timestamp = Date.now();
+    const now = new Date(timestamp).toISOString();
+    const editorCourse = {
+      id: editorId, name: '上线验收真实课堂编辑', subject: '科学', grade: '七年级', hours: 1,
+      summary: '', drivingQuestion: '怎样记录社区生态证据？', status: 'draft', stages: [],
+      currentStageIndex: 0, students: [], resources: [], groups: [],
+      aiLearningClassroomId: editorClassroomId,
+      content: { pblOutline: '', knowledgePoints: [], lessonOutline: [], evaluationPlan: { dimensions: [], overallRubric: '' } },
+      createdAt: now, updatedAt: now, version: 1,
+    };
+    await checkedRequest(teacher, 'POST', `/api/courses/${editorId}/actions`, {
+      requestId: randomUUID(), action: { type: 'CREATE_COURSE', payload: editorCourse },
+    });
+    const editorResource = {
+      id: editorClassroomId, createdAt: now, updatedAt: now, revision: 1,
+      stage: { id: editorClassroomId, name: '社区生态 AI 课堂', createdAt: timestamp, updatedAt: timestamp },
+      scenes: [{
+        id: `scene-${randomUUID()}`, stageId: editorClassroomId, title: '观察社区生态', type: 'slide', order: 0,
+        createdAt: timestamp, updatedAt: timestamp,
+        content: { type: 'slide', schemaVersion: 1, canvas: {
+          id: `canvas-${randomUUID()}`, viewportSize: 1000, viewportRatio: 0.5625,
+          elements: [], background: { type: 'solid', color: '#ffffff' },
+          theme: { backgroundColor: '#ffffff', themeColors: ['#344a6a'], fontColor: '#243447', fontName: 'Noto Sans SC',
+            outline: { color: '#344a6a', width: 2, style: 'solid' }, shadow: { h: 0, v: 0, blur: 0, color: '#000000' } },
+        } },
+        actions: [{ id: `speech-${randomUUID()}`, type: 'speech', text: '观察社区树木和鸟类。' }],
+      }],
+    };
+    mkdirSync(env.CLASSROOM_DATA_DIR, { recursive: true });
+    writeFileSync(path.join(env.CLASSROOM_DATA_DIR, `${editorClassroomId}.json`), JSON.stringify(editorResource));
+    editorPage = await teacher.newPage();
+      await editorPage.goto(`${origin}/teacher/prepare/${editorId}/classroom-editor`, { waitUntil: 'domcontentloaded' });
+      await editorPage.getByRole('button', { name: '添加白板', exact: true }).waitFor({ timeout: 30_000 });
+      await editorPage.getByRole('button', { name: '添加白板', exact: true }).click();
+      const dialog = editorPage.getByRole('dialog', { name: '编辑白板', exact: true });
+      await dialog.getByRole('textbox', { name: '板书内容', exact: true }).fill('持久保存的社区观察要点');
+      await dialog.getByRole('button', { name: '完成编辑', exact: true }).click();
+      await editorPage.getByRole('button', { name: '保存课堂', exact: true }).click();
+      await editorPage.getByText(/^所有修改已保存/).waitFor({ timeout: 30_000 });
+      const saved = (await checkedRequest(teacher, 'GET', `/api/courses/${editorId}/classroom-resource`)).classroom;
+      assert.ok(saved.revision > editorResource.revision, '课堂修订号未推进');
+      assert.ok(saved.scenes[0].actions.some((action) => action.type === 'wb_draw_text' && action.content === '持久保存的社区观察要点'));
+      await editorPage.reload({ waitUntil: 'domcontentloaded' });
+      await editorPage.getByRole('button', { name: '编辑白板内容与讲解', exact: true }).click();
+      await editorPage.getByRole('dialog', { name: '编辑白板', exact: true })
+        .getByRole('textbox', { name: '板书内容', exact: true }).waitFor();
+      assert.equal(await editorPage.getByRole('dialog', { name: '编辑白板', exact: true })
+        .getByRole('textbox', { name: '板书内容', exact: true }).inputValue(), '持久保存的社区观察要点');
+      const storedCourse = await db.classroomTemplate.findUniqueOrThrow({ where: { id: editorId }, include: { versions: { orderBy: { version: 'desc' }, take: 1 } } });
+      assert.equal(storedCourse.versions[0].snapshot.design.aiLearningClassroomId, editorClassroomId);
+      await editorPage.screenshot({ path: path.join(output, 'teacher-classroom-editor-real-saved.png') });
+      record('teacher-classroom-editor-browser-save-storage-reload', '通过', `资源修订号 ${saved.revision}`);
+  } catch (error) {
+    await editorPage?.screenshot({ path: path.join(output, 'teacher-classroom-editor-real-failure.png') }).catch(() => undefined);
+    record('teacher-classroom-editor-browser-save-storage-reload', '失败', String(error.message).slice(0, 350));
+  } finally { await editorPage?.close(); }
+  const classroomActivity = (await checkedRequest(teacher, 'POST', `/api/platform/offerings/${offering.id}/chapters/${chapter.id}/activities`, {
+    type: 'Classroom', title: '课堂验收', templateVersionId: template.versions[0].id, config: { schemaVersion: 1 },
+  }, 201)).activity;
+  await checkedRequest(teacher, 'PATCH', `/api/platform/activities/${classroomActivity.id}`, { isOpen: true });
+  const instance = await db.classroomInstance.findFirstOrThrow({ where: { activityId: classroomActivity.id } });
+  await pageCheck(teacher, 'teacher/compatible-classroom-setup', `/teacher/teach/${instance.id}/setup`, '课堂工作台');
+  await checkedRequest(teacher, 'POST', `/api/platform/classroom-instances/${instance.id}/start`, {});
+  const entered = await checkedRequest(student, 'POST', `/api/platform/classroom-instances/${instance.id}/enter`, {});
+  const participationId = entered.participation?.id;
+  assert.ok(participationId);
+  await pageCheck(teacher, 'teacher/legacy-template-setup', `/teacher/teach/${template.id}/setup`, '上线验收课堂模板');
+  const disabledDiscussion = [/^404 \/api\/courses\/[^/]+\/public-discussion(?:\/settings)?$/];
+  await pageCheck(teacher, 'teacher/live-classroom', `/teacher/teach/${instance.id}/classroom`, '课堂数据速览', disabledDiscussion);
+  await pageCheck(student, 'student/live-classroom', `/student/classroom/${instance.id}`, '当前学习任务', disabledDiscussion);
+  await checkedRequest(student, 'PATCH', `/api/platform/participations/${participationId}`, {
+    version: 0, idempotencyKey: randomUUID(), document: '城市生态调查报告', code: 'print("你好，CoTeach")', stageKey: 'make',
+  });
+  const reloadedWorkspace = await checkedRequest(student, 'GET', `/api/platform/participations/${participationId}`);
+  assert.equal(reloadedWorkspace.workspace.projectState.document, '城市生态调查报告');
+  assert.equal(reloadedWorkspace.workspace.projectState.code, 'print("你好，CoTeach")');
+  record('classroom-create-start-enter-and-workspace-reload', '通过');
+  if (process.env.PRELAUNCH_REAL_PROVIDERS === '1' && process.env.PRELAUNCH_CLASSROOM_AI !== '1') {
+    try {
+      const created = await checkedRequest(student, 'POST', `/api/platform/participations/${participationId}/ai`, {
+        op: 'create_conversation', idempotencyKey: randomUUID(), title: '社区生态调查证据讨论',
+      });
+      const conversation = created.conversations.find((item) => item.title === '社区生态调查证据讨论');
+      assert.ok(conversation?.id, 'AI 会话未保存');
+      const reply = await student.request.post(`${origin}/api/platform/participations/${participationId}/ai`, {
+        data: { op: 'send_message', idempotencyKey: randomUUID(), conversationId: conversation.id, content: '请用一句话建议如何记录社区鸟类观察证据。' },
+        headers: { Origin: origin }, timeout: 120_000,
+      });
+      const answered = await reply.json();
+      assert.equal(reply.status(), 200, `AI message: ${JSON.stringify(answered).slice(0, 300)}`);
+      const persisted = await checkedRequest(student, 'GET', `/api/platform/participations/${participationId}/ai`);
+      const messages = persisted.conversations.find((item) => item.id === conversation.id)?.messages ?? [];
+      assert.ok(messages.some((message) => message.role === 'user'));
+      assert.ok(messages.some((message) => message.role === 'assistant' && message.content?.trim()), 'AI 组员未返回并保存真实答复');
+      assert.ok(await db.aiMessage.count({ where: { conversationId: conversation.id, role: 'assistant' } }));
+      record('student-ai-real-reply-consumed-and-persisted', '通过');
+    } catch (error) { record('student-ai-real-reply-consumed-and-persisted', '失败', String(error.message).slice(0, 350)); }
+  }
+  const artifact = (await checkedRequest(student, 'POST', `/api/platform/participations/${participationId}/outcomes`, {
+    action: 'save_artifact', idempotencyKey: randomUUID(), title: '生态调查成果', type: 'HTML', sourceHtml: '<h1>城市生态调查</h1>',
+  })).outcome;
+  assert.ok(artifact?.id);
+  await checkedRequest(student, 'POST', `/api/platform/participations/${participationId}/outcomes`, {
+    action: 'submit_stage', idempotencyKey: randomUUID(), stageKey: 'make', payload: { summary: '调查完成' },
+  });
+  await checkedRequest(student, 'POST', `/api/platform/participations/${participationId}/outcomes`, {
+    action: 'reflect', idempotencyKey: randomUUID(), content: '我学会了比较社区生态证据。',
+  });
+  const outcomes = await checkedRequest(teacher, 'GET', `/api/platform/participations/${participationId}/outcomes`);
+  assert.equal(outcomes.artifacts.length, 1);
+  assert.equal(outcomes.submissions.length, 1);
+  assert.equal(outcomes.reflections.length, 1);
+  await checkedRequest(teacher, 'POST', `/api/platform/participations/${participationId}/outcomes`, {
+    action: 'evaluate', idempotencyKey: randomUUID(), type: 'FORMATIVE', score: 86, content: '证据充分，继续完善方案。',
+  });
+  assert.equal((await checkedRequest(student, 'GET', `/api/platform/participations/${participationId}/outcomes`)).evaluations.length, 1);
+  await checkedRequest(teacher, 'POST', `/api/platform/classroom-instances/${instance.id}/finish`, {});
+  assert.equal((await db.classroomInstance.findUniqueOrThrow({ where: { id: instance.id } })).status.toLowerCase(), 'finished');
+  record('classroom-artifact-stage-reflection-evaluation-finish', '通过');
+  try { await checkFiveStageClassroom(teacher, student, offering, chapter, invitation); }
+  catch (error) { record('five-stage-classroom-functional', '失败', String(error.message).slice(0, 500)); }
+
+  await pageCheck(teacher, 'teacher/classes', '/teacher/classes', '上线验收课程');
+  await pageCheck(teacher, 'teacher/course-detail', `/teacher/classes/${offering.id}`, '上线验收课程');
+  await pageCheck(teacher, 'teacher/students', `/teacher/classes/${offering.id}/students`, '上线验收学生');
+  await pageCheck(teacher, 'teacher/survey', `/teacher/surveys/${activities.Form.id}`, '你发现了什么');
+  await pageCheck(teacher, 'teacher/templates', '/teacher/templates', '上线验收课堂模板');
+  await pageCheck(teacher, 'teacher/template-create', '/teacher/templates/new', '创建课程');
+  await pageCheck(teacher, 'teacher/pbl-create', '/teacher/templates/pbl/new', '创建 PBL 课程');
+  await pageCheck(teacher, 'teacher/textbook-library', '/teacher/textbooks', '教材库');
+  await pageCheck(teacher, 'teacher/experiment', `/teacher/classes/${offering.id}/activities/${classroomActivity.id}/experiment`, '前后测配置');
+  await pageCheck(student, 'student/courses', '/student?all=1', '上线验收课程');
+  await pageCheck(student, 'student/course-detail', `/student/courses/${offering.id}`, '上线验收课程');
+  await pageCheck(student, 'student/profile', '/student/profile', '上线验收学生');
+  await pageCheck(student, 'student/assignment', `/student/activities/${activities.Assignment.id}`, 'Assignment 验收');
+  await pageCheck(student, 'student/survey', `/student/activities/${activities.Form.id}`, 'Form 验收');
+  await pageCheck(student, 'student/invalid-activity-recovery', `/student/activities/${randomUUID()}`, '暂时无法打开活动', [/^404 \/api\/platform\/activities\/[^/]+$/]);
+  await pageCheck(student, 'student/participation', `/student/participations/${participationId}`, '城市生态调查');
+  await pageCheck(teacher, 'teacher/participation', `/teacher/participations/${participationId}`, '城市生态调查');
+  await pageCheck(teacher, 'teacher/classroom-record', `/teacher/classrooms/${instance.id}`, '上线验收学生');
+  await pageCheck(teacher, 'teacher/legacy-classroom-history', `/teacher/teach/${instance.id}/history`, '历史开课记录');
+  const historyPage = await student.newPage();
+  await historyPage.goto(`${origin}/student/courses/${offering.id}`);
+  await historyPage.getByRole('heading', { name: /上线验收课程/ }).first().waitFor();
+  await historyPage.goto(`${origin}/student/activities/${activities.Assignment.id}`);
+  await historyPage.getByRole('heading', { name: 'Assignment 验收' }).waitFor();
+  await historyPage.goBack();
+  await historyPage.getByRole('heading', { name: /上线验收课程/ }).first().waitFor();
+  await historyPage.goForward();
+  await historyPage.getByRole('heading', { name: 'Assignment 验收' }).waitFor();
+  await historyPage.close();
+  record('student-deep-link-back-forward-new-tab', '通过');
+  const redirects = [
+    [teacher, '/teacher', '/teacher/classes'],
+    [teacher, `/teacher/classes/${offering.id}/access`, `/teacher/classes/${offering.id}`],
+    [student, '/student', `/student/courses/${offering.id}`],
+  ];
+  for (const [context, route, destination] of redirects) {
+    const page = await context.newPage();
+    await page.goto(`${origin}${route}`, { waitUntil: 'domcontentloaded' });
+    await page.waitForURL(`${origin}${destination}`, { timeout: 20_000 });
+    await page.close();
+    record(`redirect-${route}`, '通过', destination);
+  }
+  const anonymous = await browser.newContext();
+  for (const [route, login] of [['/teacher/classes', '/teacher/login'], ['/student/profile', '/student/login']]) {
+    const page = await anonymous.newPage();
+    await page.goto(`${origin}${route}`, { waitUntil: 'domcontentloaded' });
+    assert.equal(new URL(page.url()).pathname, login);
+    await page.close();
+    record(`anonymous-${route}-login-return`, '通过', login);
+  }
+  await anonymous.close();
+
+  const teacherOfferings = await checkedRequest(teacher, 'GET', '/api/platform/offerings');
+  assert.ok(teacherOfferings.offerings.some((entry) => entry.id === offering.id));
+  const studentCourses = await checkedRequest(student, 'GET', '/api/platform/courses');
+  assert.ok(studentCourses.courses.some((entry) => entry.id === offering.id));
+  record('teacher-and-student-reload-persisted-course', '通过');
+
+  const enrollment = await db.enrollment.findFirstOrThrow({ where: { offeringId: offering.id } });
+  const reset = await checkedRequest(teacher, 'POST', `/api/platform/offerings/${offering.id}/reset-password`, { enrollmentId: enrollment.id }, 201);
+  assert.ok(reset.token);
+  await pageCheck(student, 'student/reset-password', `/student/reset-password?token=${reset.token}`, '设置新密码');
+  const newPassword = `${password}New`;
+  await checkedRequest(student, 'POST', '/api/platform/auth/reset-password', { token: reset.token, password: newPassword });
+  await checkedRequest(student, 'GET', '/api/platform/courses', undefined, 401);
+  const expiredPage = await student.newPage();
+  await expiredPage.goto(`${origin}/student/courses/${offering.id}`);
+  await expiredPage.waitForURL('**/student/login**');
+  await expiredPage.close();
+  record('expired-student-deep-link-redirects-to-login', '通过');
+  const relogged = await browser.newContext();
+  await checkedRequest(relogged, 'POST', '/api/platform/auth/login', { username: 'prelaunch-student', password: newPassword });
+  assert.ok((await checkedRequest(relogged, 'GET', '/api/platform/courses')).courses.some((entry) => entry.id === offering.id));
+  record('student-password-reset-invalidates-session-and-relogin', '通过');
+  try {
+    const anotherTab = await relogged.newPage();
+    await anotherTab.goto(`${origin}/student/courses/${offering.id}`, { waitUntil: 'domcontentloaded' });
+    await anotherTab.getByText('上线验收课程').first().waitFor();
+    await anotherTab.reload({ waitUntil: 'domcontentloaded' });
+    await anotherTab.getByText('上线验收课程').first().waitFor();
+    await relogged.setOffline(true);
+    try { await anotherTab.reload({ waitUntil: 'domcontentloaded', timeout: 10_000 }); }
+    catch { /* The browser shows its own offline page when no HTML can load. */ }
+    await relogged.setOffline(false);
+    await anotherTab.reload({ waitUntil: 'domcontentloaded' });
+    await anotherTab.getByText('上线验收课程').first().waitFor();
+    await anotherTab.close();
+    record('student-new-tab-shares-real-session-and-recovers-offline-reload', '通过');
+  } catch (error) { record('student-new-tab-shares-real-session-and-recovers-offline-reload', '失败', String(error.message).slice(0, 300)); }
+  try {
+    const enrollment = await db.enrollment.findFirstOrThrow({ where: { offeringId: offering.id } });
+    const exportResponse = await teacher.request.post(`${origin}/api/platform/offerings/${offering.id}/students/export`, {
+      data: { enrollmentIds: [enrollment.id], sections: ['summary', 'activity_submissions', 'classrooms', 'summary_csv'] },
+      headers: { Origin: origin }, timeout: 90_000,
+    });
+    assert.equal(exportResponse.status(), 200, `student export: ${exportResponse.status()}`);
+    const exportedZip = await JSZip.loadAsync(await exportResponse.body());
+    assert.ok(Object.keys(exportedZip.files).some((name) => name.endsWith('.csv')));
+    record('teacher-student-records-real-zip-export', '通过');
+
+    const expiringInvitation = (await checkedRequest(teacher, 'POST', `/api/platform/offerings/${offering.id}/invitation`, {
+      expiresAt: new Date(Date.now() + 3000).toISOString(),
+    })).invitation;
+    assert.ok(expiringInvitation.code);
+    const visitor = await browser.newContext();
+    await checkedRequest(visitor, 'POST', '/api/platform/auth/invite', { code: expiringInvitation.code });
+    await delay(3300);
+    const expiredPreview = await checkedRequest(visitor, 'POST', '/api/platform/auth/invite', { code: expiringInvitation.code }, 404);
+    assert.equal(expiredPreview.code, 'INVITE_CODE_INVALID');
+    const expiredRegistration = await checkedRequest(visitor, 'POST', '/api/platform/auth/register', {
+      invitationCode: expiringInvitation.code, username: 'expired-invite-student', displayName: '过期邀请码学生', password, confirmPassword: password,
+    }, 404);
+    assert.equal(expiredRegistration.code, 'INVITE_CODE_INVALID');
+    await visitor.close();
+    assert.equal(await db.user.count({ where: { username: 'expired-invite-student' } }), 0);
+    record('teacher-invitation-expiry-blocks-preview-and-registration', '通过');
+
+    const disabledInvitation = (await checkedRequest(teacher, 'POST', `/api/platform/offerings/${offering.id}/invitation`, { disabled: true })).invitation;
+    assert.equal(disabledInvitation.status.toLowerCase(), 'disabled');
+    const disabledVisitor = await browser.newContext();
+    const invalidInvite = await disabledVisitor.request.post(`${origin}/api/platform/auth/invite`, {
+      data: { code: disabledInvitation.code }, headers: { Origin: origin },
+    });
+    assert.ok(invalidInvite.status() >= 400, `disabled invitation accepted: ${invalidInvite.status()}`);
+    await disabledVisitor.close();
+    record('teacher-invitation-disable-rejects-new-join', '通过');
+
+    await checkedRequest(teacher, 'PATCH', `/api/platform/offerings/${offering.id}`, { status: 'finished' });
+    assert.equal((await db.courseOffering.findUniqueOrThrow({ where: { id: offering.id } })).status.toLowerCase(), 'finished');
+    assert.ok((await checkedRequest(relogged, 'GET', '/api/platform/courses')).courses.some((entry) => entry.id === offering.id && entry.status.toLowerCase() === 'finished'));
+    await checkedRequest(teacher, 'PATCH', `/api/platform/offerings/${offering.id}`, { status: 'archived' });
+    assert.equal((await db.courseOffering.findUniqueOrThrow({ where: { id: offering.id } })).status.toLowerCase(), 'archived');
+    record('teacher-finish-and-archive-course-persisted', '通过');
+
+    const withdrawn = await checkedRequest(teacher, 'DELETE', `/api/platform/offerings/${offering.id}/students/${enrollment.id}`);
+    assert.equal(withdrawn.status, 'withdrawn');
+    assert.equal((await db.enrollment.findUniqueOrThrow({ where: { id: enrollment.id } })).status.toLowerCase(), 'withdrawn');
+    assert.ok(!(await checkedRequest(relogged, 'GET', '/api/platform/courses')).courses.some((entry) => entry.id === offering.id));
+    record('teacher-withdraw-student-revokes-course-access', '通过');
+  } catch (error) { record('teacher-course-access-and-member-lifecycle', '失败', String(error.message).slice(0, 300)); }
+  await relogged.close();
+  const logout = await teacher.request.post(`${origin}/api/auth/logout`, { headers: { Origin: origin, 'X-OpenPBL-Role': 'teacher' } });
+  assert.equal(logout.status(), 200);
+  await checkedRequest(teacher, 'GET', '/api/platform/offerings', undefined, 401);
+  record('teacher-logout-invalidates-session', '通过');
+  await teacher.close();
+  await student.close();
+  }
+  // Run after the classroom and browser scenarios so this protocol/cache proof
+  // cannot prewarm the simultaneous student resource-loading measurements.
+  if (!completionReviewOnly && !incrementalOnly) record('static-runtime-http-and-browser-cache', '通过', await verifyStaticRuntime({
+    root, baseURL: origin, browser, browserIdentity, output,
+  }), 'browser-real-backend');
+} catch (error) {
+  record('fatal', '失败', String(error.message).slice(0, 500));
+  const diagnostics = serverOutput.split('\n').filter((line) => /Error:|Module not found|Cannot find module/.test(line)).slice(-5);
+  if (diagnostics.length) record('server-diagnostics', '失败', diagnostics.join(' | ').replace(/postgres(?:ql)?:\/\/\S+/g, '[database]'));
+  process.exitCode = 1;
+} finally {
+  if (signalCleanup) await signalCleanup;
+  if (server && server.exitCode === null && server.signalCode === null) await captureAiUsageMetrics();
+  writeFileSync(path.join(output, 'ai-samples.json'), JSON.stringify(aiSamples, null, 2));
+  report();
+  await browser?.close();
+  try { await localProxy?.close(); }
+  catch (error) { record('isolated-proxy-close', '失败', String(error.message)); process.exitCode = 1; report(); }
+  await db?.$disconnect();
+  if (server?.pid) {
+    try { process.kill(-server.pid, 'SIGTERM'); } catch { /* exited */ }
+    await delay(1000);
+    if (server.exitCode === null) try { process.kill(-server.pid, 'SIGKILL'); } catch { /* exited */ }
+  }
+  try { await appRequestJournal?.close(); }
+  catch { record('isolated-app-request-journal', '失败', 'Diagnostic journal incomplete'); process.exitCode = 1; report(); }
+  if (started && results.some(entry => entry.status === '失败')) {
+    await preserveFailureDatabases();
+    report();
+  }
+  if (started) try { command('docker', ['rm', '--force', container]); } catch { /* exited */ }
+  if (redisStarted) try { command('docker', ['rm', '--force', redisContainer]); } catch { /* exited */ }
+  rmSync(temporary, { recursive: true, force: true });
+  // The isolated dev build never owns the deployed production directory.
+  if (!reuseBuild) rmSync(path.join(root, distDir), { recursive: true, force: true });
+  // Next adds every temporary dist to tsconfig includes. Remove only our two
+  // entries so a disposable acceptance run leaves the working tree unchanged.
+  const tsconfigFile = path.join(root, 'tsconfig.json');
+  const tsconfig = readFileSync(tsconfigFile, 'utf8');
+  const generatedIncludes = `,\n    ${JSON.stringify(`${distDir}/types/**/*.ts`)},\n    ${JSON.stringify(`${distDir}/dev/types/**/*.ts`)}`;
+  if (!reuseBuild && tsconfig.includes(generatedIncludes)) {
+    writeFileSync(tsconfigFile, tsconfig.replace(generatedIncludes, ''));
+  }
+  if (results.some((entry) => entry.status === '失败')) process.exitCode = 1;
+}

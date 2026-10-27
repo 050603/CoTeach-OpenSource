@@ -1,0 +1,206 @@
+# Timing only: no cookies, credentials, query strings or request bodies.
+# Docker rotates stdout logs using the existing 50 MiB x 5 policy.
+log_format classroom_action_timing escape=json
+    '{"kind":"classroom-action-timing","at":"$msec","requestId":"$request_id",'
+    '"status":$status,"requestSeconds":$request_time,"upstreamSeconds":"$upstream_response_time",'
+    '"connectSeconds":"$upstream_connect_time","headerSeconds":"$upstream_header_time",'
+    '"serverTiming":"$upstream_http_server_timing"}';
+
+# CoTeach HTTP gateway for the single current host service.
+
+# The application and realtime server run as systemd user services on the host.
+upstream openpbl_new_app {
+    server 127.0.0.1:3000;
+    keepalive 256;
+    keepalive_timeout 60s;
+}
+
+upstream openpbl_new_ws {
+    server 127.0.0.1:3001;
+    keepalive 32;
+}
+
+# A whole classroom commonly shares one campus NAT address. Application-level
+# limits key authenticated writes by user and course; this edge limit is only
+# a broad abuse ceiling. Leave room for 40 browsers fetching pages, profiles,
+# course data and Next.js navigation prefetches together (up to 30 per browser).
+limit_req_zone $binary_remote_addr zone=general:10m rate=300r/s;
+limit_req_zone $binary_remote_addr zone=uploads:10m rate=10r/s;
+limit_req_zone $binary_remote_addr zone=projection_reads:10m rate=300r/s;
+limit_req_zone $binary_remote_addr zone=media_reads:10m rate=300r/s;
+# HTTP/2 resource streams must not consume the campus application limit.
+# Empty keys leave public JS/CSS/fonts and branding out of this counter.
+map $uri $application_connection_key {
+    default $binary_remote_addr;
+    ~^/(_next/static|brand)/ "";
+}
+limit_conn_zone $application_connection_key zone=per_ip_application:10m;
+# A WebSocket must not consume the HTTP request budget for every campus user.
+limit_conn_zone $binary_remote_addr zone=per_ip_websocket:10m;
+
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    '' close;
+}
+
+# Next.js supplies SAMEORIGIN only for the isolated resource runtime. Avoid a
+# conflicting edge DENY there while preserving it for every other URI.
+map $uri $openpbl_frame_options {
+    default "DENY";
+    /internal/resource-player "";
+}
+
+gzip on;
+gzip_vary on;
+gzip_proxied any;
+gzip_comp_level 5;
+gzip_min_length 1024;
+gzip_types text/plain text/css application/json application/javascript application/xml image/svg+xml application/wasm;
+
+client_body_buffer_size 1m;
+client_max_body_size 501m;
+client_header_timeout 15s;
+client_body_timeout 600s;
+send_timeout 60s;
+server_tokens off;
+
+# 注:原模板的 8080 Docker 内部监控监听已移除 —— host 网络模式下 8080 已被
+# 宿主机其他服务占用;监控指标通过 Docker 内部网络获取的方案不适用于本机。
+
+server {
+    listen 80 default_server;
+    server_name ${PUBLIC_HOST} _;
+
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options $openpbl_frame_options always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    add_header Permissions-Policy "camera=(), microphone=(self), geolocation=()" always;
+    # Pass through the application's request-specific Content-Security-Policy.
+    # A static edge copy can block the self-hosted WASM and sandboxed runtimes.
+
+    proxy_hide_header X-Powered-By;
+    proxy_http_version 1.1;
+    # Reuse the configured upstream keepalive pool for ordinary HTTP.
+    # WebSocket locations explicitly override this with their upgrade header.
+    proxy_set_header Connection "";
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto http;
+    proxy_set_header X-Forwarded-Host $host;
+    proxy_set_header X-Request-Id $request_id;
+    proxy_connect_timeout 10s;
+    # 42 cold browsers issue multiple concurrent API/RSC requests per page.
+    limit_conn per_ip_application 1024;
+
+    location = /healthz {
+        access_log off;
+        add_header Content-Type text/plain;
+        return 200 "ok\n";
+    }
+
+    location = /api/metrics { return 404; }
+    location = /api/health/ready { return 404; }
+
+    location = /api/health/live {
+        access_log off;
+        proxy_pass http://openpbl_new_app;
+    }
+
+    location /ws {
+        limit_conn per_ip_websocket 150;
+        proxy_pass http://openpbl_new_ws;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto http;
+        proxy_read_timeout 90s;
+        proxy_send_timeout 90s;
+        proxy_buffering off;
+    }
+
+    location ~ ^/api/courses/[^/]+/actions$ {
+        access_log /dev/stdout classroom_action_timing;
+        include /etc/nginx/openpbl-edge-location/*.conf;
+        limit_req zone=general burst=1200 nodelay;
+        proxy_pass http://openpbl_new_app;
+    }
+
+    # Projection recovery polls are intentionally frequent. Keep them out of
+    # the shared catch-all bucket used by the rest of the classroom page.
+    location ~ ^/api/courses/[^/]+/projection$ {
+        limit_req zone=projection_reads burst=600 nodelay;
+        proxy_pass http://openpbl_new_app;
+        proxy_buffering off;
+    }
+
+    # Agent tools can be silent while regenerating a slide; this is SSE too.
+    location ~* ^/api/(.*/stream|openmaic/(chat|agent/edit)|chat/.*)$ {
+        limit_req zone=general burst=1200 nodelay;
+        proxy_pass http://openpbl_new_app;
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+        gzip off;
+    }
+
+    location = /api/uploads {
+        limit_req zone=uploads burst=80 nodelay;
+        client_max_body_size 501m;
+        client_body_timeout 600s;
+        proxy_request_buffering off;
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
+        proxy_pass http://openpbl_new_app;
+    }
+
+    # Thirty students can issue Range requests at once when a video opens or
+    # seeks. Isolate those reads from API traffic while retaining an edge cap.
+    location ~ ^/api/uploads/[0-9a-fA-F-]+$ {
+        limit_req zone=media_reads burst=600 nodelay;
+        proxy_pass http://openpbl_new_app;
+        proxy_set_header X-OpenPBL-Accel-Redirect 1;
+        proxy_buffering off;
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
+    }
+
+    location ^~ /_openpbl_uploads/ {
+        internal;
+        alias /srv/openpbl/uploads/;
+        sendfile on;
+        aio threads;
+        tcp_nopush on;
+    }
+
+    location ^~ /_next/static/ {
+        proxy_pass http://openpbl_new_app;
+        # Preserve Next's immutable successes and no-store errors unchanged.
+        access_log off;
+    }
+
+    # Stable parser URLs must revalidate, including after a release switch.
+    location ^~ /vendor/ {
+        proxy_pass http://openpbl_new_app;
+        access_log off;
+    }
+
+    location /_next/image {
+        proxy_pass http://openpbl_new_app;
+        proxy_set_header Accept $http_accept;
+        add_header Cache-Control "public, max-age=86400";
+        access_log off;
+    }
+
+    location / {
+        limit_req zone=general burst=1200 nodelay;
+        proxy_pass http://openpbl_new_app;
+        proxy_buffering off;
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+    }
+}

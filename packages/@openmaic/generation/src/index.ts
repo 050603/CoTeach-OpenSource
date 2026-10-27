@@ -1,0 +1,132 @@
+export type {
+  AICallFn,
+  AgentInfo,
+  GeneratedSlideData,
+  GenerationResult,
+  SceneGenerationContext,
+} from './pipeline-types.js';
+
+export {
+  extractInteractiveElements,
+  extractWidgetConfig,
+  generateSceneActions,
+  generateSceneContent,
+  generateWidgetContent,
+  PBLGenerationError,
+  resolveImageIds,
+} from './scene-generator.js';
+export type {
+  SceneActionsOptions,
+  SceneContentFailure,
+  SceneContentFailureCode,
+  SceneContentOptions,
+} from './scene-generator.js';
+export { compileTextComponents, TextLayoutError } from './text-layout-compiler.js';
+export type { TextMeasure, TextMeasureInput, TextMeasureResult, TextBoxComponent, LabelGridComponent } from './text-layout-compiler.js';
+export { AuthoringContentError, resolveAuthoringContent, assertAuthoringContentCoverage, validateAuthoringContent } from './authoring-content.js';
+export type { AuthoringContentItem, AuthoringContentReference } from './authoring-content.js';
+export { adoptChartPresentationTypography } from './chart-presentation-typography.js';
+export type { ChartPresentationTypography } from './chart-presentation-typography.js';
+export { compileDiagramComponent, isDiagramComponent } from './diagram-compiler.js';
+export type { DiagramComponent, DiagramCompilerOptions } from './diagram-compiler.js';
+export type { DiagramPlan, DiagramSequenceGroup } from './outline-types.js';
+export { buildCompleteScene } from './scene-builder.js';
+export type { BuildCompleteSceneOptions } from './scene-builder.js';
+export {
+  isAbortError,
+  isRetryableGenerationError,
+  withGenerationRetry,
+} from './generation-retry.js';
+export type { GenerationRetryEvent, GenerationRetryOptions } from './generation-retry.js';
+export { parseActionsFromStructuredOutput } from './action-parser.js';
+export { postProcessInteractiveHtml } from './interactive-post-processor.js';
+export { generatePBLV2ProjectSingleCall } from './pbl/planner-single-call.js';
+export type { PlannerSingleCallFn } from './pbl/planner-single-call.js';
+export type { PBLPlannerV2Input, PriorQuizResult } from './pbl/types.js';
+export {
+  MAX_SYNTHESIS_STAGES,
+  PlannerV2Error,
+  SCENARIO_SCHEMA_VERSION,
+  applyPlannerProficiency,
+  buildPlannerSystemPrompt,
+  buildScenarioDesignBlock,
+  emptyProject,
+  instructorProjectAnchor,
+  newId,
+  normalizeSynthesisChecks,
+  plannerCompletionGaps,
+} from './pbl/planner-core.js';
+export type { PlannerV2Callbacks, PlannerV2ProgressEvent } from './pbl/planner-core.js';
+export { loadPBLV2Prompt } from './pbl/prompts/loader.js';
+export {
+  MAX_ENGAGEMENT_EVENTS,
+  capEngagementEvents,
+  microtaskEngagement,
+  milestoneSynthesisSatisfied,
+  recordEvent,
+} from './pbl/operations/kernel/engagement.js';
+export * from './pbl/operations/kernel/proficiency.js';
+export * from './pbl/operations/kernel/progress.js';
+export * from './pbl/operations/kernel/runtime-events.js';
+export * from './pbl/operations/kernel/task-completion.js';
+export type {
+  CompleteScene,
+  CompleteSceneContent,
+  GeneratedInteractiveContent,
+  GeneratedPBLContent,
+  GeneratedQuizContent,
+  GeneratedSceneContent,
+  GeneratedSlideContent,
+  ScientificModel,
+  WidgetConfig,
+} from './scene-types.js';
+
+export {
+  DEFAULT_LANGUAGE_DIRECTIVE,
+  applyOutlineFallbacks,
+  buildOutlinePrompt,
+  generateSceneOutlinesFromRequirements,
+  sanitizeProceduralSkillOutline,
+} from './outline-generator.js';
+export type {
+  OutlineFallbackOptions,
+  OutlineGenerationOptions,
+  OutlinePromptContext,
+} from './outline-generator.js';
+export { changeOutlineType } from './outline-type.js';
+export { uniquifyMediaElementIds } from './outline-media.js';
+export { partitionImagesForVision } from './outline-formatters.js';
+export type { VisionImagePartition } from './outline-formatters.js';
+export { parseJsonResponse } from './json-repair.js';
+export type { JsonParsingOptions } from './json-repair.js';
+export { noopGenerationLogger } from './logger.js';
+export type { GenerationLogger } from './logger.js';
+export {
+  buildCourseContext,
+  buildLanguageText,
+  buildVisionUserContent,
+  formatAgentsForPrompt,
+  formatImageDescription,
+  formatImagePlaceholder,
+  formatTeacherPersonaForPrompt,
+} from './prompt-formatters.js';
+export type {
+  ImageMapping,
+  MediaGenerationRequest,
+  PdfImage,
+  SceneVisualIntent,
+  SceneOutline,
+  UserRequirements,
+  VisualRepresentation,
+  VisualResourceReference,
+  WidgetOutline,
+  WidgetType,
+} from './outline-types.js';
+
+export * from './prompts/index.js';
+
+export { compileFlowLayout } from './flow-layout-compiler.js';
+export type { FlowLayout, FlowBlock, FlowGroup, FlowLeaf, CompiledFlowPage } from './flow-layout-compiler.js';
+export { compileMeasuredDiagramComponent, measureDiagramAllocations, resolveDiagramSequenceGroups, DiagramAllocationError } from './diagram-compiler.js';
+export { previousUnmeasuredDiagramPrompt } from './restored-component-authoring-contract.js';
+export type { DiagramAllocation, DiagramAllocationBounds, MeasuredDiagramCompilerOptions } from './diagram-compiler.js';

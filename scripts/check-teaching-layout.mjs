@@ -1,0 +1,435 @@
+// Internal teaching UI audit using browser-only fixtures. No business API or
+// WebSocket reaches the server; only compiled pages and static runtime assets do.
+// Run after building: node scripts/check-teaching-layout.mjs [--assert]
+// Filters: TEACHING_SCENARIOS=preparation,code,player TEACHING_DEVICES=phone-portrait
+// TEACHING_NATIVE_ZOOM=1 uses real browser zoom with a fixed outer window.
+// Without it, TEACHING_ZOOM only models equivalent CSS viewports, not acceptance.
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { chromium, firefox, webkit } from '@playwright/test';
+import { SignJWT } from 'jose';
+import katex from 'katex';
+import { browserLearningEventReceipt, createBrowserActionReceipts } from './lib/classroom-acceptance-action-receipts.mjs';
+import { desktopSizes, selectLayoutCases, runLayoutCases, deployedLayoutBuild, settleLayoutAssets, openLayoutContext, measureLayoutEnvironment, captureLayoutScreenshot, resizeLayoutWindow } from './lib/layout-browser.mjs';
+
+const baseURL = process.env.LAYOUT_BASE_URL || 'http://127.0.0.1:3000';
+if (!['127.0.0.1', 'localhost', '[::1]'].includes(new URL(baseURL).hostname)) throw new Error('Only local instances are supported');
+const browserName = process.env.TEACHING_BROWSER || 'chromium';
+if (!['chromium', 'firefox', 'webkit'].includes(browserName)) throw new Error('TEACHING_BROWSER must be chromium, firefox or webkit');
+const executablePath = process.env.TEACHING_EXECUTABLE_PATH;
+const browserLabel = process.env.TEACHING_BROWSER_LABEL || browserName;
+if (executablePath && browserName !== 'chromium') throw new Error('TEACHING_EXECUTABLE_PATH is supported only for chromium');
+if (!/^[a-z0-9-]+$/i.test(browserLabel)) throw new Error('TEACHING_BROWSER_LABEL must contain only letters, numbers or hyphens');
+const zoom = Number(process.env.TEACHING_ZOOM || 1);
+if (!Number.isFinite(zoom) || zoom < 0.8 || zoom > 2) throw new Error('TEACHING_ZOOM must be between 0.8 and 2');
+const nativeZoom = process.env.TEACHING_NATIVE_ZOOM === '1';
+const dpr = Number(process.env.TEACHING_DPR || (nativeZoom ? 1 : zoom));
+if (!Number.isFinite(dpr) || dpr < 0.8 || dpr > 3) throw new Error('TEACHING_DPR must be between 0.8 and 3');
+const health = await fetch(`${baseURL}/api/health/live`, { signal: AbortSignal.timeout(5000) });
+if (!health.ok) throw new Error(`Local service is not ready (${health.status})`);
+const output = process.env.TEACHING_OUTPUT_DIR ? path.resolve(process.env.TEACHING_OUTPUT_DIR) : fs.mkdtempSync(path.join(os.tmpdir(), 'openpbl-teaching-'));
+fs.mkdirSync(output, { recursive: true });
+const title = '社区生态调查与跨学科项目实践：从真实问题到有证据支持的行动方案';
+const stages = [
+  { key: 'launch', label: '项目启动', view: 'simple-resource' },
+  { key: 'ai-learning', label: '知识讲授', view: 'ai-learning' },
+  { key: 'make', label: '项目实践', view: 'ai-collaboration' },
+  { key: 'showcase', label: '成果汇报与评价', view: 'showcase-reporting' },
+  { key: 'reflection', label: '学习反思', view: 'reflection-survey' },
+];
+const scene = {
+  id: 'layout-scene', type: 'slide', title: '如何开展社区生态调查', order: 0, actions: [], stageKey: 'ai-learning', audience: 'student', generationPurpose: 'knowledge-teaching',
+  content: { type: 'slide', canvas: { id: 'layout-slide', viewportSize: 1000, viewportRatio: 0.5625, theme: { backgroundColor: '#ffffff', themeColors: ['#344A6A'], fontColor: '#1F2933', fontName: 'Noto Sans SC' }, background: { type: 'solid', color: '#ffffff' }, elements: [
+    { id: 'title', type: 'text', left: 48, top: 50, width: 860, height: 80, rotate: 0, defaultFontName: 'Noto Sans SC', defaultColor: '#1F2933', content: '<p style="font-size:36px">如何开展社区生态调查</p>' },
+    { id: 'body', type: 'text', left: 48, top: 155, width: 400, height: 180, rotate: 0, defaultFontName: 'Noto Sans SC', defaultColor: '#1F2933', content: '<p style="font-size:24px">观察真实社区，记录环境变化，分析证据并形成可实践的行动方案。</p>' },
+    { id: 'image', type: 'image', src: '/brand/coteach/horizontal-color.png', left: 48, top: 385, width: 240, height: 70, rotate: 0, fixedRatio: true },
+    { id: 'chart', type: 'chart', left: 500, top: 150, width: 440, height: 330, rotate: 0, chartType: 'line', themeColors: ['#2563eb', '#16a34a'], data: { labels: ['调查前', '调查后'], legends: ['观察记录', '分析证据'], series: [[35, 80], [45, 90]] } },
+    { id: 'formula', type: 'latex', left: 48, top: 475, width: 380, height: 45, rotate: 0, color: '#1F2933', latex: '\\bar{x}=\\frac{1}{n}\\sum_{i=1}^{n}x_i', html: katex.renderToString('\\bar{x}=\\frac{1}{n}\\sum_{i=1}^{n}x_i', { throwOnError: true }) },
+  ] } },
+};
+const fixtureCourse = {
+  id: 'layout-teaching', name: title, subject: '跨学科科学', grade: '初中', hours: 3,
+  status: 'teaching', systemMode: 'new', generationMode: 'detailed',
+  summary: '以真实社区为研究对象，通过观察记录与团队讨论形成有证据支持的方案。', drivingQuestion: '我们如何通过生态调查改善社区环境？',
+  createdAt: '2026-09-01T00:00:00Z', updatedAt: '2026-09-01T00:00:00Z', stages, currentStageIndex: 0,
+  content: { pblOutline: '开展社区调查', knowledgePoints: [], lessonOutline: [], evaluationPlan: { dimensions: [], overallRubric: '基于证据开展分析' }, _openmaicSceneOutlines: [{ id: scene.id, type: 'slide', stageKey: 'ai-learning', audience: 'student', title: scene.title, description: '课堂说明', keyPoints: [], order: 0, estimatedDuration: 60 }] },
+  students: [{ id: 'layout-student', name: '布局测试学生', joinedAt: '2026-09-01T00:00:00Z', stageProgress: {} }],
+  resources: [], groups: [], submissions: [], activityLog: [], uiState: {},
+  aiLearningClassroomId: 'layout-player', pblConfig: { makeArtifactMode: 'python' },
+};
+const profiles = [
+  ...desktopSizes.map(([width, height]) => [`desktop-${width}x${height}`, width, height, false]),
+  ['desktop-split', 768, 576, false], ['desktop-laptop', 1024, 576, false], ['desktop', 1440, 900, false], ['desktop-4k', 3840, 2160, false], ['pad-portrait', 768, 1024, true], ['pad-landscape', 1024, 768, true],
+  ['phone-portrait', 390, 844, true], ['phone-landscape', 844, 390, true], ['phone-small', 320, 568, true], ['phone-small-landscape', 568, 320, true],
+];
+const scenarios = [
+  ['student-player', '/student/classroom/layout-teaching', '[aria-label="AI 授课字幕与播放控制"]', async page => {
+    const close = page.getByRole('button', { name: '收起页面目录' });
+    if ((await page.evaluate(() => innerWidth)) <= 1023) {
+      await close.waitFor({ state: 'hidden', timeout: 5000 });
+      const open = page.getByRole('button', { name: '展开页面目录' });
+      if (await open.count()) await open.waitFor({ state: 'visible', timeout: 5000 });
+    }
+    else if (await close.isVisible()) await close.click();
+  }],
+  ['student-standalone-player', '/student/ai-learning/layout-player?courseId=layout-teaching', '[aria-label="AI 授课字幕与播放控制"]', async page => {
+    return page.evaluate(async () => {
+      const families = ['SourceHanSans', 'SourceHanSerif', 'LXGWWenKai', 'ZhuQueFangSong', 'WenDingPLKaiTi', 'ZcoolHappy'];
+      let timer;
+      try {
+        return await Promise.race([
+          Promise.all(families.map(async family => {
+            const faces = await document.fonts.load(`16px "${family}"`, '中文课程 Aa');
+            const loaded = faces.length > 0 && faces.every(face => face.status === 'loaded') && document.fonts.check(`16px "${family}"`, '中文课程 Aa');
+            if (!loaded) throw new Error(`The original slide font did not load: ${family}`);
+            return { family, faces: faces.length, loaded };
+          })),
+          new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('Original slide fonts did not load within 15s')), 15_000); }),
+        ]);
+      } finally { clearTimeout(timer); }
+    });
+  }],
+  ['teacher-classroom', '/teacher/teach/layout-teaching/classroom', 'button[aria-label="在线学生"]', async page => {
+    await page.getByRole('button', { name: '在线学生', exact: true }).filter({ visible: true }).click();
+    await page.getByText('0 在线 / 12 总数', { exact: true }).filter({ visible: true }).waitFor();
+  }],
+  ['teacher-knowledge-analytics', '/teacher/teach/layout-teaching/classroom', 'text=全班知识讲授学情', async page => {
+    const chart = page.locator('[aria-labelledby="knowledge-section-chart-title"]');
+    await chart.evaluate(element => element.scrollIntoView({ block: 'center', behavior: 'instant' }));
+    await chart.locator('.recharts-surface').waitFor({ state: 'visible' });
+    await settleLayoutAssets(page);
+    await page.waitForFunction(() => {
+      const curves = [...document.querySelectorAll('[aria-labelledby="knowledge-section-chart-title"] .recharts-line-curve')];
+      return curves.length === 2 && curves.every(curve => {
+        if (!/^M/.test(curve.getAttribute('d') || '') || /NaN|Infinity/.test(curve.getAttribute('d') || '')) return false;
+        // Recharts draws the entire path before revealing it with animated
+        // stroke-dasharray. Geometry alone therefore accepts half-drawn lines.
+        // Wait for the final solid/dashed strokes, after the reveal finishes.
+        const dash = curve.getAttribute('stroke-dasharray');
+        return curve.getAttribute('stroke') === '#10b981' ? dash === null : dash === '4 5';
+      });
+    });
+    // Section scores are authored points (6/10, 8/10), not percentages.
+    // Keep exact completion and score assertions alongside the rendered curves.
+    await chart.getByRole('img', { name: '知识讲授第1节：完成率100%，均分6/10分；知识讲授第2节：完成率100%，均分8/10分', exact: true }).waitFor({ state: 'visible' });
+    const overflow = await chart.getByRole('img').evaluate(element => element.scrollWidth - element.clientWidth);
+    if (overflow > 2) throw new Error(`The two-section learning chart requires horizontal scrolling (${overflow}px)`);
+    const tickGeometry = await chart.locator('.recharts-surface').evaluate(svg => {
+      const surface = svg.getBoundingClientRect();
+      const sectionLabels = [...svg.querySelectorAll('.cursor-help text')];
+      // Recharts places tick text in a shared SVG z-index layer, outside the
+      // axis-line group; inspect the actual rendered label groups.
+      const axisGroups = [...svg.querySelectorAll('.recharts-yAxis-tick-labels')];
+      const axisLabels = axisGroups.flatMap(axis => [...axis.querySelectorAll('.recharts-cartesian-axis-tick-value')]);
+      const labels = [...sectionLabels, ...axisLabels];
+      const dots = [...svg.querySelectorAll('.recharts-line-dot')].map(dot => dot.getBoundingClientRect());
+      const overlaps = (a, b) => Math.min(a.right, b.right) - Math.max(a.left, b.left) > 0.5 && Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top) > 0.5;
+      return {
+        titles: sectionLabels.map(label => label.closest('g').querySelector('title')?.textContent),
+        axisLabelCounts: axisGroups.map(axis => axis.querySelectorAll('.recharts-cartesian-axis-tick-value').length),
+        dots: dots.length,
+        minimumFontSize: Math.min(...labels.map(label => parseFloat(getComputedStyle(label).fontSize))),
+        invalid: labels.flatMap(label => {
+          const bounds = label.getBoundingClientRect();
+          const clipped = bounds.left < surface.left - 1 || bounds.right > surface.right + 1 || bounds.top < surface.top - 1 || bounds.bottom > surface.bottom + 1;
+          const smallFont = parseFloat(getComputedStyle(label).fontSize) < 10;
+          const overlappingDot = dots.some(dot => overlaps(bounds, dot));
+          return clipped || smallFont || overlappingDot ? [{ text: label.textContent, clipped, smallFont, overlappingDot, bounds: bounds.toJSON(), surface: surface.toJSON() }] : [];
+        }),
+        overlappingTitles: sectionLabels.some((label, index) => sectionLabels.slice(index + 1).some(other => overlaps(label.getBoundingClientRect(), other.getBoundingClientRect()))),
+      };
+    });
+    if (tickGeometry.titles.join(';') !== '知识讲授第1节;知识讲授第2节' || tickGeometry.axisLabelCounts.length !== 2 || tickGeometry.axisLabelCounts.some(count => count < 2) || tickGeometry.dots !== 4 || tickGeometry.invalid.length || tickGeometry.overlappingTitles) {
+      throw new Error(`Learning chart labels or axes are missing, clipped, too small or overlapping: ${JSON.stringify(tickGeometry)}`);
+    }
+    return tickGeometry;
+  }],
+  ['quick-preparation', '/teacher/prepare/layout-teaching/verify', 'text=课程资料导入', async () => {}],
+  ['generate-redirect', '/teacher/prepare/layout-teaching/generate', 'text=课程资料导入', async page => { await page.waitForURL('**/teacher/prepare/layout-teaching/verify'); }],
+  ['resources-empty', '/teacher/prepare/layout-teaching/resources', 'h1', async page => { await page.getByText('暂无教师授课资源。').waitFor(); }],
+  ['preparation', '/teacher/prepare/layout-teaching/verify/edit', '[aria-label="课程设计环节"]', async page => {
+    const picker = page.getByRole('combobox', { name: '当前设计环节' });
+    if (await picker.isVisible()) { await picker.selectOption('stage-plan'); await picker.selectOption('materials'); }
+    else { const steps = page.locator('[aria-label="课程设计环节"] button'); await steps.nth(1).click(); await steps.nth(0).click(); }
+  }],
+  ['dashboard-popover', '/student/classroom/layout-teaching', 'button[aria-label="个人信息"]', async page => {
+    await page.getByRole('button', { name: '个人信息', exact: true }).click();
+    await page.getByText('当前身份：学生端').waitFor();
+  }],
+  ['code', '/student/ai-collaboration/layout-teaching', '.monaco-editor', async page => {
+    await page.getByRole('button', { name: '新建代码文件', exact: true }).click();
+    await page.getByRole('textbox', { name: '新文件名' }).fill('community_analysis.py');
+    await page.getByRole('button', { name: '取消新建' }).click();
+    await page.getByRole('button', { name: 'AI 组员', exact: true }).click();
+    await page.locator('[class*="memberPanel"]').waitFor();
+  }],
+  ['player', '/teacher/prepare/layout-teaching/preview?view=content&stage=ai-learning', '[role="tablist"]', async page => {
+    await page.locator('[data-stage-host-mode="teacher-preview"]').waitFor({ state: 'visible' });
+    await page.getByLabel('AI 授课字幕与播放控制').waitFor({ state: 'visible' });
+    const close = page.getByRole('button', { name: '收起页面目录' });
+    // The course detail provides its own page directory; the embedded player
+    // starts collapsed and can still be expanded deliberately.
+    if (await close.isVisible()) await close.click();
+    await close.waitFor({ state: 'hidden', timeout: 5000 });
+    await page.getByRole('button', { name: '展开页面目录' }).waitFor({ state: 'visible', timeout: 5000 });
+  }],
+];
+const select = (items, env) => selectLayoutCases(items, env, item => item[0]);
+const secret = process.env.LAYOUT_JWT_SECRET || fs.readFileSync(process.env.LAYOUT_JWT_SECRET_FILE || 'deploy/secrets/jwt_secret.txt', 'utf8').trim();
+const cookies = await Promise.all(['teacher', 'student'].map(async role => ({
+  name: `openpbl_${role}`, url: baseURL,
+  value: await new SignJWT({ role, sv: 1, username: 'layout', displayName: '布局测试', userId: `layout-${role}`, studentName: '布局测试' })
+    .setProtectedHeader({ alg: 'HS256' }).setSubject(`layout-${role}`).setIssuer('openpbl').setAudience('openpbl-app').setExpirationTime('1h').sign(new TextEncoder().encode(secret)),
+})));
+const buildId = await deployedLayoutBuild(baseURL);
+const browser = nativeZoom ? null : await ({ chromium, firefox, webkit })[browserName].launch(executablePath ? { executablePath } : {});
+const reports = [];
+try {
+  const jobs = select(profiles, process.env.TEACHING_DEVICES).flatMap(([device, physicalWidth, physicalHeight, touch]) =>
+    select(scenarios, process.env.TEACHING_SCENARIOS).map(([id, route, ready, exercise]) => ({ device, physicalWidth, physicalHeight, touch, id, route, ready, exercise })));
+  await runLayoutCases(jobs, Number(process.env.TEACHING_WORKERS || 1), async ({ device, physicalWidth, physicalHeight, touch, id, route, ready, exercise }) => {
+    const width = Math.floor(physicalWidth / zoom), height = Math.floor(physicalHeight / zoom);
+      const session = await openLayoutContext({ browser, engine: browserName, executablePath, label: browserLabel,
+        viewport: { width: physicalWidth, height: physicalHeight }, ...(browserName === 'firefox' ? {} : { isMobile: touch && width < 1024 }),
+        hasTouch: touch, dpr, zoom, nativeZoom, reducedMotion: 'reduce', serviceWorkers: 'block' });
+      const { context, identity } = session;
+      try {
+      await context.addCookies(cookies);
+      await context.routeWebSocket('**/*', ws => ws.close());
+      const page = await context.newPage();
+      await context.tracing.start({ screenshots: true, snapshots: true });
+      page.setDefaultTimeout(20000);
+      const errors = [], missingFixtures = [], failedResources = [], interceptedWrites = [];
+      page.on('pageerror', error => errors.push(error.message));
+      page.on('requestfailed', request => {
+        const failure = request.failure()?.errorText;
+        if (!['net::ERR_ABORTED', 'NS_BINDING_ABORTED', 'Load request cancelled'].includes(failure)) failedResources.push({ url: request.url(), type: request.resourceType(), error: failure });
+      });
+      page.on('response', response => {
+        const pathname = new URL(response.url()).pathname;
+        if (response.status() >= 400 && (!pathname.startsWith('/api/') || pathname.startsWith('/api/openmaic/interactive-runtime/'))) {
+          failedResources.push(`${response.status()} ${response.url()}`);
+        }
+      });
+      const role = route.startsWith('/teacher') ? 'teacher' : 'student';
+      const course = structuredClone(fixtureCourse);
+      const actionReceipts = createBrowserActionReceipts(course.id, course.createdAt);
+      if (id === 'teacher-classroom') course.students = Array.from({ length: 12 }, (_, index) => ({ ...course.students[0], id: `layout-student-${index}`, name: `跨学科项目测试学生${index + 1}` }));
+      if (id === 'code') course.currentStageIndex = 2;
+      if (id === 'student-player' || id === 'student-standalone-player') course.currentStageIndex = 1;
+      if (id === 'teacher-knowledge-analytics') {
+        course.currentStageIndex = 1;
+        course.content.knowledgeLectureSections = [0, 1].map(index => ({ id: `section-${index}`, title: `知识讲授第${index + 1}节`, order: index, knowledgePointIds: [], sceneOutlineIds: [], quizOutlineId: `quiz-${index}` }));
+        course.aiLearningProgress = { 'layout-student': { classroomId: course.aiLearningClassroomId, knowledgeLectureAttempts: [0, 1].map(index => ({ id: `attempt-${index}`, sectionId: `section-${index}`, quizOutlineId: `quiz-${index}`, submittedAt: '2026-09-25T00:00:00Z', gradingSource: 'server', knowledgePointIds: [], questions: [{ questionId: `question-${index}`, prompt: '请选择正确解释', knowledgePointIds: [], gradingStatus: 'graded', points: 10, earned: index ? 8 : 6, correct: false, feedback: '核对证据' }] })) } };
+      }
+      course.uiState.classroomTiming = {
+        schemaVersion: 1, status: 'paused', sessionStartedAt: course.createdAt, pausedAt: course.createdAt,
+        activeStageKey: course.stages[course.currentStageIndex].key, updatedAt: course.updatedAt,
+        stages: course.stages.map((stage, index) => ({ stageKey: stage.key, label: stage.label,
+          basePlannedSec: 600, adjustmentSec: 0, elapsedSec: 0,
+          status: index === course.currentStageIndex ? 'active' : index < course.currentStageIndex ? 'completed' : 'pending' })),
+      };
+      const state = { courses: [course], hydrated: true, user: { role, name: '布局测试' }, studentId: 'layout-student', studentName: '布局测试学生', joinedCourseId: course.id };
+      await context.route('**/api/**', async intercepted => {
+        const request = intercepted.request(), pathname = new URL(request.url()).pathname;
+        if (request.method() === 'GET' && pathname.startsWith('/api/openmaic/interactive-runtime/')) return intercepted.continue();
+        let body;
+        if (pathname === '/api/courses') body = state;
+        else if (pathname === '/api/auth/me') body = { user: { id: `layout-${role}`, role, displayName: '布局测试', username: 'layout' } };
+        else if (pathname.endsWith('/presence')) body = { members: [] };
+        else if (pathname.endsWith('/events')) body = { events: [], nextCursor: 0 };
+        else if (pathname.endsWith('/state')) body = { course, eventCursor: '0' };
+        else if (pathname.endsWith('/projection')) body = { courseId: course.id, courseVersion: 0, projectionVersion: 0, projectionUpdatedAt: course.updatedAt, serverTime: new Date().toISOString() };
+        else if (pathname.endsWith('/public-discussion')) body = { enabled: false, session: null };
+        else if (pathname.endsWith('/design-workspace')) body = { course, sections: [], statuses: Object.fromEntries(['materials', 'stage-plan', 'knowledge', 'timing', 'blueprint', 'classroom'].map(key => [key, 'missing'])), pendingUpdates: [], publication: { latestVersion: null, publishedVersion: null, draftVersion: null }, jobs: { design: null, classroom: null } };
+        else if (pathname.endsWith('/actions')) {
+          const envelope = request.postDataJSON();
+          const previous = actionReceipts.lookup(envelope);
+          if (previous) return intercepted.fulfill({ status: previous.status, contentType: 'application/json', body: JSON.stringify(previous.body) });
+          const action = envelope.action;
+          let submissionVersion;
+          if (action?.type === 'UPDATE_COURSE' && action.payload?.patch) Object.assign(course, action.payload.patch);
+          else if (action?.type === 'SET_UI_STATE') Object.assign(course.uiState, action.payload?.patch);
+          else if (action?.type === 'UPSERT_SUBMISSION' && action.payload?.submission) {
+            const saved = action.payload.submission;
+            submissionVersion = (course.submissions.find(item => item.id === saved.id)?.version ?? 0) + 1;
+            course.submissions = [...course.submissions.filter(item => item.id !== saved.id), { ...saved, version: submissionVersion }];
+          } else missingFixtures.push(`${pathname}: ${action?.type}`);
+          course.version = (course.version ?? 0) + 1;
+          body = actionReceipts.remember(envelope, { courseVersion: course.version, ...(submissionVersion ? { submissionVersion } : {}), updatedAt: course.updatedAt });
+        }
+        else if (pathname.endsWith('/design-generation')) body = { job: null };
+        else if (pathname.endsWith('/generation')) body = { backgroundEnabled: false, job: null };
+        else if (pathname.endsWith('/resource-repair')) body = { issues: [] };
+        else if (pathname === '/api/ai-collaboration/code') body = { messages: [], commentThreads: [], starters: [] };
+        else if (pathname === '/api/ai-collaboration/memory') body = { memories: [], continuation: null };
+        else if (pathname === '/api/openmaic/classroom') body = { success: true, classroom: { stage: { id: 'layout-player', name: title, createdAt: 1, updatedAt: 1 }, scenes: [scene] } };
+        else if (pathname === '/api/openmaic/progress') body = { data: { progress: {} } };
+        else if (pathname.endsWith('/lecture-chat') && request.method() === 'GET') body = { thread: { id: 'layout-lecture-chat', page: { classroomId: 'layout-player', sceneId: scene.id }, pageTitle: scene.title, messages: [] }, requests: [], writable: true };
+        else if (pathname === '/api/textbooks') body = { items: [] };
+        else if (pathname.endsWith('/resource-package')) body = { job: null };
+        else if (/provider|server-providers/.test(pathname)) body = { providers: [], models: [], success: true };
+        else if (pathname === '/api/learning-events' && request.method() === 'POST') {
+          const receipt = browserLearningEventReceipt(request.postDataJSON(), Date.now());
+          return intercepted.fulfill({ status: receipt.status, contentType: 'application/json', body: JSON.stringify(receipt.body) });
+        }
+        else if (pathname.includes('learning-events') || pathname.includes('learning-analytics') || pathname.includes('/learning/')) body = { success: true };
+        else { if (!missingFixtures.includes(pathname)) missingFixtures.push(pathname); body = {}; }
+        if (!['GET', 'HEAD'].includes(request.method())) interceptedWrites.push(pathname);
+        await intercepted.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
+      });
+      const report = { id, device, buildId, identity, browser: browserLabel, engine: browserName, dpr, zoom, physicalWidth, physicalHeight, width, height, sourceCss: process.argv.includes('--source-css'), errors, missingFixtures, failedResources, interceptedWrites };
+      report.userAgent = await page.evaluate(() => navigator.userAgent);
+      try {
+        await page.goto(baseURL + route, { waitUntil: 'load' });
+        await page.locator(ready).filter({ visible: true }).first().waitFor();
+        const exerciseEvidence = await exercise(page);
+        if (id === 'student-standalone-player') report.loadedSlideFonts = exerciseEvidence;
+        Object.assign(report, await measureLayoutEnvironment(page, { zoom, dpr, nativeZoom, physicalWidth, physicalHeight }));
+        if (id === 'teacher-knowledge-analytics' && device === 'desktop-1366x768' && zoom === 1 && dpr === 1) {
+          const previousSize = nativeZoom ? await page.evaluate(() => ({ width: outerWidth, height: outerHeight })) : page.viewportSize();
+          try {
+            await resizeLayoutWindow(page, { width: 1024, height: 576 }, nativeZoom);
+            await exercise(page);
+            const otherTab = await context.newPage();
+            await otherTab.bringToFront();
+            await page.bringToFront();
+            await otherTab.close();
+          } finally { await resizeLayoutWindow(page, previousSize, nativeZoom); }
+          await exercise(page);
+          report.dynamicResizeAndTabReturn = true;
+        }
+        if (id === 'teacher-knowledge-analytics') {
+          report.renderedSectionChart = await page.locator('[aria-labelledby="knowledge-section-chart-title"]').evaluate(root => ({
+            width: root.querySelector('.recharts-surface').getBoundingClientRect().width,
+            curves: root.querySelectorAll('.recharts-line-curve').length,
+            scores: root.querySelector('[role="img"]').getAttribute('aria-label'),
+          }));
+          report.renderedSectionChart.tickGeometry = exerciseEvidence;
+        }
+        if (process.argv.includes('--source-css')) {
+          await page.evaluate(() => {
+            document.querySelector('main > .pbl-wide-container')?.classList.add('teaching-audit-viewport');
+            for (const panel of document.querySelectorAll('.pbl-glass')) {
+              if (panel.textContent.includes('在线学生')) {
+                panel.style.maxHeight = innerWidth < 768 ? 'calc(100dvh - 6rem)' : 'calc(100dvh - 5rem)';
+                panel.style.overflowY = 'auto';
+              }
+            }
+            const switcher = document.querySelector('header button:has(.lucide-graduation-cap)');
+            if (switcher) {
+              switcher.classList.add('teaching-audit-switcher');
+              switcher.children[0]?.classList.add('teaching-audit-switcher-icon');
+              switcher.children[2]?.classList.add('teaching-audit-switcher-status');
+            } else if ([...document.querySelectorAll('header button')].some(el => el.textContent.includes('离开课堂'))) {
+              [...document.querySelectorAll('header p')].find(el => el.getAttribute('title'))?.parentElement?.classList.add('teaching-audit-identity');
+            }
+            const preview = document.querySelector('[data-stage-host-mode="teacher-preview"]');
+            if (preview) {
+              const h1 = document.querySelector('main header h1');
+              const row = h1?.parentElement?.parentElement;
+              row?.classList.add('teaching-audit-preview-grid');
+              h1?.classList.add('teaching-audit-preview-title');
+              row?.lastElementChild?.classList.add('teaching-audit-preview-actions');
+            }
+
+            const dock = document.querySelector('[aria-label="AI 授课字幕与播放控制"]');
+            const grid = dock?.closest('[class*="xl:grid-cols-"]');
+            if (grid) {
+              grid.classList.add('teaching-audit-grid');
+              [...grid.children].find(el => el.contains(dock))?.classList.add('teaching-audit-rail');
+              dock.classList.add('teaching-audit-dock');
+            }
+          });
+          await page.addStyleTag({ content:
+            fs.readFileSync('src/components/openmaic/edit/playback-responsive.module.css', 'utf8').replaceAll('.landscapeGrid', '.teaching-audit-grid').replaceAll('.landscapeRail', '.teaching-audit-rail')
+            + fs.readFileSync('src/components/openmaic/roundtable/lecture-subtitle-dock.module.css', 'utf8').replaceAll('.dock', '.teaching-audit-dock')
+            + `
+              .teaching-audit-switcher{width:100%;gap:.5rem;padding-inline:.5rem}
+              @media(min-width:1024px){.teaching-audit-switcher{gap:.75rem;padding-inline:1rem}}
+              @media(max-width:1279px){.teaching-audit-switcher-status{display:none}}
+              @media(max-width:1023px){.teaching-audit-viewport{max-width:100%!important}.teaching-audit-switcher-icon{display:none}[data-stage-host-mode="teacher-preview"]{min-height:520px}}
+              @media(min-width:768px) and (max-width:1023px){.teaching-audit-identity{display:block}}
+              @media(max-width:639px){.teaching-audit-preview-grid{display:grid;grid-template-columns:auto minmax(0,1fr)}.teaching-audit-preview-actions{grid-column:span 2}.teaching-audit-preview-title{font-size:20px;line-height:1.375;white-space:normal;overflow:visible;text-overflow:clip;overflow-wrap:break-word}}
+            `
+          });
+        }
+
+        if (id === 'teacher-classroom') {
+          const lastStudent = page.getByText('跨学科项目测试学生12', { exact: true }).filter({ visible: true });
+          await lastStudent.scrollIntoViewIfNeeded();
+          if (!await lastStudent.evaluate(el => { const r = el.getBoundingClientRect(); return r.top >= 0 && r.bottom <= innerHeight; })) throw new Error('The final student is outside the visible viewport');
+        }
+        await settleLayoutAssets(page);
+        if (['student-player', 'student-standalone-player', 'player'].includes(id)) {
+          // The player shell can load while its lazy slide renderer stays blank.
+          // Check the actual main slide, not the thumbnails in the scene list.
+          const canvas = page.locator('[class~="group/canvas"]').filter({ visible: true }).first();
+          await canvas.locator('[data-slide-element-id="title"]').getByText(scene.title, { exact: true }).waitFor();
+          const chart = canvas.locator('[data-slide-element-id="chart"] .chart svg');
+          await chart.waitFor({ state: 'visible' });
+          await page.waitForFunction(() => {
+            const root = document.querySelector('[class~="group/canvas"] [data-slide-element-id="chart"] .chart svg');
+            return root && root.querySelectorAll('path').length > 0 && root.textContent.includes('调查前') && root.textContent.includes('调查后');
+          });
+          const formula = canvas.locator('[data-slide-element-id="formula"] .katex-html');
+          await formula.waitFor({ state: 'visible' });
+          report.renderedSlide = await canvas.evaluate(root => {
+            const chart = root.querySelector('[data-slide-element-id="chart"] .chart svg');
+            const formula = root.querySelector('[data-slide-element-id="formula"] .katex-html');
+            const image = root.querySelector('[data-slide-element-id="image"] img');
+            return { chartPaths: chart.querySelectorAll('path').length, chartLabels: chart.textContent, formulaWidth: formula.getBoundingClientRect().width, imageLoaded: !!image?.naturalWidth };
+          });
+          if (report.renderedSlide.formulaWidth <= 0 || !report.renderedSlide.imageLoaded) throw new Error('Slide formula or image did not render');
+          const dock = page.locator('[aria-label="AI 授课字幕与播放控制"]');
+          const speed = dock.getByRole('button', { name: '切换播放倍速', exact: true });
+          const initialSpeed = await speed.innerText();
+          await speed.click();
+          if (await speed.innerText() === initialSpeed) throw new Error('Playback speed control did not respond');
+          await dock.getByRole('button', { name: '静音', exact: true }).click();
+          await dock.getByRole('button', { name: '打开声音', exact: true }).click();
+          report.playbackControls = { speedChanged: true, muteToggled: true };
+        }
+        await page.waitForTimeout(250);
+        Object.assign(report, await page.evaluate(() => {
+          const visible = el => !el.closest('[hidden],[inert],[aria-hidden="true"]')
+            && el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden';
+          const panels = [...document.querySelectorAll('[class*="memberPanel"],.pbl-glass,[role=dialog]')].filter(visible).map(el => {
+            const r = el.getBoundingClientRect(); return { className: String(el.className), left: r.left, right: r.right, top: r.top, bottom: r.bottom, clipped: r.left < -1 || r.right > innerWidth + 1 || r.top < -1 || r.bottom > innerHeight + 1 };
+          });
+          const headingIssues = [...document.querySelectorAll('h1,h2,h3')].filter(visible).filter(el => {
+            const style = getComputedStyle(el), width = el.getBoundingClientRect().width;
+            return (style.textOverflow !== 'ellipsis' && el.scrollWidth > el.clientWidth + 2) || (el.textContent.trim().length >= 8 && width < parseFloat(style.fontSize) * 4);
+          }).map(el => el.textContent.slice(0, 100));
+          const controlIssues = [...document.querySelectorAll('[data-subtitle-controls] button')].filter(visible).filter(el => {
+            const r = el.getBoundingClientRect(), dock = el.closest('[aria-label="AI 授课字幕与播放控制"]').getBoundingClientRect();
+            return el.scrollHeight > el.clientHeight + 2 || el.scrollWidth > el.clientWidth + 2 || r.right > dock.right + 1 || r.left < dock.left - 1 || r.bottom > dock.bottom + 1;
+          }).map(el => el.getAttribute('aria-label') || el.textContent.trim());
+          const canvasBoxes = [...document.querySelectorAll('[class~="group/canvas"]')].filter(visible).map(el => {
+            const r = el.getBoundingClientRect(); return { width: r.width, height: r.height };
+          });
+          const narrowText = [...document.querySelectorAll('main p,main h1,main h2,main h3')].filter(visible).filter(el => {
+            if (el.closest('[class~="group/canvas"], [data-testid="scene-list"]')) return false;
+            const style = getComputedStyle(el), r = el.getBoundingClientRect();
+            return el.textContent.trim().length >= 8 && style.textOverflow !== 'ellipsis' && r.width < parseFloat(style.fontSize) * 4 && r.height > parseFloat(style.fontSize) * 3;
+          }).map(el => el.textContent.slice(0, 100));
+          return { scrollWidth: document.documentElement.scrollWidth, viewportWidth: innerWidth, panels, headingIssues, narrowText, canvasBoxes, controlIssues, brokenImages: [...document.images].filter(img => visible(img) && (!img.complete || !img.naturalWidth)).map(img => img.src) };
+        }));
+      } catch (error) { report.scenarioError = error.message; report.body = (await page.locator('body').innerText({ timeout: 3000 }).catch(() => 'Page text unavailable')).slice(0, 800); }
+      report.failed = !!(report.scenarioError || errors.length || missingFixtures.length || failedResources.length || report.scrollWidth > (report.viewportWidth ?? width) + 2 || report.panels?.some(panel => panel.clipped) || report.headingIssues?.length || report.narrowText?.length || report.controlIssues?.length || report.canvasBoxes?.some(box => box.height < 120 || box.width < 200) || report.brokenImages?.length);
+      report.screenshot = path.join(output, `${browserLabel}-${id}-${device}-dpr${dpr}-zoom${zoom}.png`);
+      try { await captureLayoutScreenshot(page, report.screenshot, nativeZoom); }
+      catch (error) { errors.push(`Screenshot: ${error.message}`); report.failed = true; }
+      report.trace = report.failed ? path.join(output, `${browserLabel}-${id}-${device}-dpr${dpr}-zoom${zoom}.zip`) : undefined;
+      await context.tracing.stop(report.trace ? { path: report.trace } : undefined);
+      reports.push(report);
+      fs.writeFileSync(path.join(output, 'report.json'), JSON.stringify(reports, null, 2));
+      console.log(`${report.failed ? 'FAIL' : 'PASS'} ${id}@${device}`);
+      } finally { await session.close(); }
+  });
+} finally { await browser?.close(); }
+const summary = { output, buildId, nativeZoom, browser: browserLabel, engine: browserName, browserVersion: reports[0]?.identity.version ?? browser?.version(), executablePath, userAgent: reports[0]?.userAgent, dpr, zoom, checks: reports.length, failures: reports.filter(r => r.failed).length, failedChecks: reports.filter(r => r.failed).map(r => `${r.id}@${r.device}`) };
+fs.writeFileSync(path.join(output, 'summary.json'), JSON.stringify(summary, null, 2));
+console.log(JSON.stringify(summary));
+if (process.argv.includes('--assert') && reports.some(report => report.failed)) process.exitCode = 1;

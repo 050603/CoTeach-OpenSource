@@ -1,0 +1,436 @@
+{
+  "point": {
+    "id": "kp-scaffolding-anchored",
+    "name": "支架式与抛锚式教学法",
+    "description": "对比两种教学法：支架式侧重教师提供临时支持以促独立能力；抛锚式侧重基于宏观情境的问题解决。",
+    "keyInfo": "支架式教学法：基于最近发展区，教师提供可调节、渐消的支架，流程包括搭脚手架→进入情境→独立探索→协作学习→效果评价。抛锚式教学法：以真实复杂问题为“锚”，强调情境真实、教师辅助、合作学习，流程包括创设情境→抛锚→自主探索→拓展延伸→讨论交流→效果评价。适用场景：支架式适合技能习得初期，抛锚式适合综合应用阶段。",
+    "masteryBoundary": "能区分支架式与抛锚式教学法的核心和实施流程，并能针对不同AI教学内容选择合适的方法。",
+    "objectiveIndexes": [
+      2
+    ],
+    "level": "application",
+    "teachingDepth": "detailed",
+    "evidenceItemIds": [
+      "4d98376c-4655-5531-a2ed-e7e177e088b6",
+      "d1af1eee-7a82-5455-8843-49cd84223412",
+      "bae94478-a90e-5645-b9c6-bfd865a4b94d",
+      "17eb3389-128a-57a1-8b69-976c18afa150"
+    ],
+    "relatedIds": [
+      "kp-concept-differentiation",
+      "kp-teaching-mode"
+    ],
+    "parentKnowledgePointIds": [],
+    "sourceKnowledgePointIds": [
+      "topic-支架式与抛锚式教学法",
+      "topic-6-item-支架式教学法的核心",
+      "topic-6-item-抛锚式教学法的特征",
+      "topic-6-item-两种方法的适用场景对比"
+    ],
+    "groupId": "section-method",
+    "groupName": "具体教学法"
+  },
+  "evidence": {
+    "version": 2,
+    "warnings": [],
+    "createdAt": "2000-01-01T00:00:00.000Z",
+    "selections": [
+      {
+        "primary": true,
+        "revisionId": "84a7c02b-7ed2-51e4-a270-b66d360b6061",
+        "sectionIds": []
+      }
+    ],
+    "fingerprint": "synthetic-teaching-evidence-v1",
+    "retrievalMode": "hybrid",
+    "schemaVersion": 2,
+    "mappings": [],
+    "items": [
+      {
+        "id": "d1af1eee-7a82-5455-8843-49cd84223412",
+        "kind": "source-block",
+        "title": "合成活动的教学理论与方法 / 合成教学方法比较 / 支架式教学法 / 支架式教学法的教学过程",
+        "source": {
+          "quote": "1. 搭脚手架",
+          "sectionId": "e618d107-5bb8-5fdb-91ef-8044d7dc0094",
+          "revisionId": "84a7c02b-7ed2-51e4-a270-b66d360b6061",
+          "textbookId": "24b84a72-45dd-5d47-896b-ece887581edc",
+          "sectionPath": [
+            "合成活动的教学理论与方法",
+            "合成教学方法比较",
+            "支架式教学法",
+            "支架式教学法的教学过程"
+          ],
+          "sourceBlockId": "14d9ee49-17c7-5910-b7a2-562a1990cb3f",
+          "textbookTitle": "合成教学活动手册（测试专用）",
+          "sourceBlockIds": [
+            "14d9ee49-17c7-5910-b7a2-562a1990cb3f",
+            "eb1e1617-b398-5174-aee3-bce17b60a33f",
+            "3639a974-8eb7-57b3-a7f3-d5bdb52f590f",
+            "ff541807-433f-50a4-a574-c41e0b799da7",
+            "f4857952-904e-5ff0-ba8b-737fd246acca",
+            "82dfa51d-0ae8-5897-876c-5c2310e5c3ef",
+            "f02d8d2a-b4db-5343-9eab-66ed0c9d0726",
+            "f28b718f-1a33-5270-8cb2-5799e6a62d14",
+            "8d623c46-e5da-57d2-abbe-f2fba678e489",
+            "fb69fdc1-e591-50ea-8db9-0d44f10996a4",
+            "2dbc377c-50b3-5f34-83b5-23528624b0fd"
+          ],
+          "revisionVersion": 1,
+          "sectionPosition": 349,
+          "sectionHierarchy": [
+            {
+              "id": "d5aa8902-4e1c-5007-b08f-144120b2d60b",
+              "kind": "CHAPTER",
+              "level": 0,
+              "title": "合成活动的教学理论与方法"
+            },
+            {
+              "id": "ffca15f3-6820-5791-96a1-6a8b8e6c4e53",
+              "kind": "SECTION",
+              "level": 1,
+              "title": "合成教学方法比较"
+            },
+            {
+              "id": "3edd15a6-7fd4-59bc-8a3a-a9634a2f8fbc",
+              "kind": "SUBSECTION",
+              "level": 2,
+              "title": "支架式教学法"
+            },
+            {
+              "id": "e618d107-5bb8-5fdb-91ef-8044d7dc0094",
+              "kind": "SUBSECTION",
+              "level": 3,
+              "title": "支架式教学法的教学过程"
+            }
+          ],
+          "sourceBlockPosition": 350
+        },
+        "content": "1. 搭脚手架\n先用模拟读数了解已有经验，再把任务分为记录、比较和解释三部分，准备可选的提示卡。\n2. 进入情境\n给出虚构花坛的湿度记录，让学生说明需要观察哪些变量，并比较一份合成记录范例。\n3. 独立探索\n学生独立选择检查办法并记录发现，教师按具体困难提供帮助，已能完成的操作逐步撤去提示。\n4. 协作学习\n各组交换记录，解释差异并质疑不一致的测量条件，共同修订对数据的理解。\n5. 效果评价\n通过自评、互评和教师反馈说明独立完成的部分、合作贡献以及下一次仍需练习的内容。",
+        "figureIds": [],
+        "figureRefs": [],
+        "retrievalScore": 0.031100324975892,
+        "figureSequences": [],
+        "sourceSequences": [
+          {
+            "kind": "ordered-steps",
+            "steps": [
+              {
+                "label": "搭脚手架",
+                "excerpt": "先用模拟读数了解已有经验，再把任务分为记录、比较和解释三部分，准备可选的提示卡。",
+                "sourceBlockId": "14d9ee49-17c7-5910-b7a2-562a1990cb3f",
+                "excerptBlockId": "14d9ee49-17c7-5910-b7a2-562a1990cb3f"
+              },
+              {
+                "label": "进入情境",
+                "excerpt": "给出虚构花坛的湿度记录，让学生说明需要观察哪些变量，并比较一份合成记录范例。",
+                "sourceBlockId": "3639a974-8eb7-57b3-a7f3-d5bdb52f590f",
+                "excerptBlockId": "3639a974-8eb7-57b3-a7f3-d5bdb52f590f"
+              },
+              {
+                "label": "独立探索",
+                "excerpt": "学生独立选择检查办法并记录发现，教师按具体困难提供帮助，已能完成的操作逐步撤去提示。",
+                "sourceBlockId": "f4857952-904e-5ff0-ba8b-737fd246acca",
+                "excerptBlockId": "f4857952-904e-5ff0-ba8b-737fd246acca"
+              },
+              {
+                "label": "协作学习",
+                "excerpt": "各组交换记录，解释差异并质疑不一致的测量条件，共同修订对数据的理解。",
+                "sourceBlockId": "f02d8d2a-b4db-5343-9eab-66ed0c9d0726",
+                "excerptBlockId": "f02d8d2a-b4db-5343-9eab-66ed0c9d0726"
+              },
+              {
+                "label": "效果评价",
+                "excerpt": "通过自评、互评和教师反馈说明独立完成的部分、合作贡献以及下一次仍需练习的内容。",
+                "sourceBlockId": "8d623c46-e5da-57d2-abbe-f2fba678e489",
+                "excerptBlockId": "8d623c46-e5da-57d2-abbe-f2fba678e489"
+              }
+            ],
+            "anchorSourceBlockId": "14d9ee49-17c7-5910-b7a2-562a1990cb3f"
+          }
+        ],
+        "figureSequencesResolved": true,
+        "sourceSequencesResolved": true,
+        "sourceSequencePolicyVersion": 2
+      },
+      {
+        "id": "bae94478-a90e-5645-b9c6-bfd865a4b94d",
+        "kind": "source-block",
+        "title": "合成活动的教学理论与方法 / 合成教学方法比较 / 抛锚式教学法 / 抛锚式教学法的教学过程",
+        "source": {
+          "quote": "1. 创设情境",
+          "sectionId": "ce9d7db4-dad0-5181-880f-c1f9a146e117",
+          "revisionId": "84a7c02b-7ed2-51e4-a270-b66d360b6061",
+          "textbookId": "24b84a72-45dd-5d47-896b-ece887581edc",
+          "sectionPath": [
+            "合成活动的教学理论与方法",
+            "合成教学方法比较",
+            "抛锚式教学法",
+            "抛锚式教学法的教学过程"
+          ],
+          "sourceBlockId": "b0ded17a-70b4-5d6f-b8c5-36ac29bdd9f8",
+          "textbookTitle": "合成教学活动手册（测试专用）",
+          "sourceBlockIds": [
+            "b0ded17a-70b4-5d6f-b8c5-36ac29bdd9f8",
+            "06dab7aa-1491-58d0-8e04-5861c305aaa6",
+            "9d6a441c-b9c3-54f9-95db-d4cbf755532b",
+            "3c6d26f5-6778-5336-9826-9bee58e3422a",
+            "4ec8ca94-c2ab-5cc7-bb2c-b353cad1f003",
+            "29e35a03-83e6-56bc-a663-e172039a0446",
+            "75ec547b-a90f-569b-8519-7651912a4804",
+            "db20e0b9-7fb5-5c27-84e4-7c0e06f71041",
+            "e04f7a1f-34b4-51c3-b088-d7b6c695b47e",
+            "86b72266-be20-5daf-b65c-b0fc4b3860ef",
+            "d094159d-5a7f-5b57-bf99-9706834280a0",
+            "f310ce0e-5663-5f60-91b1-b7469cb149ac",
+            "f9f18152-3694-54cf-ad28-ad97a8ef051e"
+          ],
+          "revisionVersion": 1,
+          "sectionPosition": 375,
+          "sectionHierarchy": [
+            {
+              "id": "d5aa8902-4e1c-5007-b08f-144120b2d60b",
+              "kind": "CHAPTER",
+              "level": 0,
+              "title": "合成活动的教学理论与方法"
+            },
+            {
+              "id": "ffca15f3-6820-5791-96a1-6a8b8e6c4e53",
+              "kind": "SECTION",
+              "level": 1,
+              "title": "合成教学方法比较"
+            },
+            {
+              "id": "d6b1650a-f82e-5d43-870a-5575266f6466",
+              "kind": "SUBSECTION",
+              "level": 2,
+              "title": "抛锚式教学法"
+            },
+            {
+              "id": "ce9d7db4-dad0-5181-880f-c1f9a146e117",
+              "kind": "SUBSECTION",
+              "level": 3,
+              "title": "抛锚式教学法的教学过程"
+            }
+          ],
+          "sourceBlockPosition": 376
+        },
+        "content": "1. 创设情境\n用合成示意图展示花坛位置、供水条件和维护困难，让学生先理解问题背景，记录已知条件与需要调查的信息。\n2. 进行“抛锚”\n将中心问题确定为有限预算下减少浪费并保证植物需水，明确约束和评价要求，允许不同小组选择不同的合理方案。\n3. 自主探索\n学生选择测量、计算或模拟办法搜集证据，核查读数并提出初步方案；教师提供工具、资料和必要线索，保留学生作决定的空间。\n4. 拓展延伸\n更换花坛面积或维护频率，检查原方案是否仍成立，说明条件改变后哪些推理需要重新验证以及需要补充什么知识。\n5. 讨论交流\n各组解释方案依据和代价，回应同伴对成本、读数或维护的质疑，比较不同选择，在证据不足时修改原先的判断。\n6. 效果评价\n结合过程记录和最终说明，评价证据使用、问题界定与小组合作，反馈已取得的进展以及仍需核实的限制。",
+        "figureIds": [],
+        "figureRefs": [],
+        "retrievalScore": 0.02899259663865546,
+        "figureSequences": [],
+        "sourceSequences": [
+          {
+            "kind": "ordered-steps",
+            "steps": [
+              {
+                "label": "创设情境",
+                "excerpt": "用合成示意图展示花坛位置、供水条件和维护困难，让学生先理解问题背景，记录已知条件与需要调查的信息。",
+                "sourceBlockId": "b0ded17a-70b4-5d6f-b8c5-36ac29bdd9f8",
+                "excerptBlockId": "06dab7aa-1491-58d0-8e04-5861c305aaa6"
+              },
+              {
+                "label": "进行“抛锚”",
+                "excerpt": "将中心问题确定为有限预算下减少浪费并保证植物需水，明确约束和评价要求，允许不同小组选择不同的合理方案。",
+                "sourceBlockId": "9d6a441c-b9c3-54f9-95db-d4cbf755532b",
+                "excerptBlockId": "3c6d26f5-6778-5336-9826-9bee58e3422a"
+              },
+              {
+                "label": "自主探索",
+                "excerpt": "学生选择测量、计算或模拟办法搜集证据，核查读数并提出初步方案；教师提供工具、资料和必要线索，保留学生作决定的空间。",
+                "sourceBlockId": "4ec8ca94-c2ab-5cc7-bb2c-b353cad1f003",
+                "excerptBlockId": "29e35a03-83e6-56bc-a663-e172039a0446"
+              },
+              {
+                "label": "拓展延伸",
+                "excerpt": "更换花坛面积或维护频率，检查原方案是否仍成立，说明条件改变后哪些推理需要重新验证以及需要补充什么知识。",
+                "sourceBlockId": "75ec547b-a90f-569b-8519-7651912a4804",
+                "excerptBlockId": "db20e0b9-7fb5-5c27-84e4-7c0e06f71041"
+              },
+              {
+                "label": "讨论交流",
+                "excerpt": "各组解释方案依据和代价，回应同伴对成本、读数或维护的质疑，比较不同选择，在证据不足时修改原先的判断。",
+                "sourceBlockId": "e04f7a1f-34b4-51c3-b088-d7b6c695b47e",
+                "excerptBlockId": "86b72266-be20-5daf-b65c-b0fc4b3860ef"
+              },
+              {
+                "label": "效果评价",
+                "excerpt": "结合过程记录和最终说明，评价证据使用、问题界定与小组合作，反馈已取得的进展以及仍需核实的限制。",
+                "sourceBlockId": "d094159d-5a7f-5b57-bf99-9706834280a0",
+                "excerptBlockId": "f310ce0e-5663-5f60-91b1-b7469cb149ac"
+              }
+            ],
+            "anchorSourceBlockId": "b0ded17a-70b4-5d6f-b8c5-36ac29bdd9f8"
+          }
+        ],
+        "figureSequencesResolved": true,
+        "sourceSequencesResolved": true,
+        "sourceSequencePolicyVersion": 2
+      },
+      {
+        "id": "17eb3389-128a-57a1-8b69-976c18afa150",
+        "kind": "source-block",
+        "title": "合成活动的教学理论与方法 / 合成教学方法比较 / 抛锚式教学法 / 抛锚式教学法的概念",
+        "source": {
+          "quote": "抛锚式教学法是围绕一个有现实意义、需要综合判断的问题情境组织学习的方法。锚不是单个名词或一道记忆题，而是让学生持续调查和作出选择的中心问题。本组合成情境要求为虚构的校园花坛制定用水改进方案，同时考虑植物需求、传感器读数和有限预算。确定这个锚后，资料搜集、方案试验与讨论都要回应这些约束，教学方向由问题统领。情境可以模拟现实，但应给出足够信息让学生检查假设，并通过新的条件促进知识迁移。",
+          "sectionId": "8a415071-b227-58f7-ab2e-9d362c72d793",
+          "revisionId": "84a7c02b-7ed2-51e4-a270-b66d360b6061",
+          "textbookId": "24b84a72-45dd-5d47-896b-ece887581edc",
+          "sectionPath": [
+            "合成活动的教学理论与方法",
+            "合成教学方法比较",
+            "抛锚式教学法",
+            "抛锚式教学法的概念"
+          ],
+          "sourceBlockId": "8d4e9798-5242-581e-bae3-48aa05f65054",
+          "textbookTitle": "合成教学活动手册（测试专用）",
+          "sourceBlockIds": [
+            "8d4e9798-5242-581e-bae3-48aa05f65054",
+            "4835dcf6-1a78-5924-aa89-919aafcf7f71",
+            "cbfdc9e0-86f5-5eb3-ba65-e0a739077c70",
+            "d20aab44-bab3-5b0b-a21f-610f31b9723a",
+            "7919353a-acec-57a3-8b2b-2e05e677209a",
+            "91fe9e49-fc7f-5fac-931b-14289841da99",
+            "264b921d-7c4a-548f-b6bc-59f3c4f015e3",
+            "fb64b3c9-5121-597b-8627-0a6cecd46ea7",
+            "598ecade-337a-56e9-8830-f866f44c67b5",
+            "2e1459a1-3d62-50f3-8298-87e39c30bcb3",
+            "1833cd4f-e4e9-5963-9a6d-837a0635bf56"
+          ],
+          "revisionVersion": 1,
+          "sectionPosition": 363,
+          "sectionHierarchy": [
+            {
+              "id": "d5aa8902-4e1c-5007-b08f-144120b2d60b",
+              "kind": "CHAPTER",
+              "level": 0,
+              "title": "合成活动的教学理论与方法"
+            },
+            {
+              "id": "ffca15f3-6820-5791-96a1-6a8b8e6c4e53",
+              "kind": "SECTION",
+              "level": 1,
+              "title": "合成教学方法比较"
+            },
+            {
+              "id": "d6b1650a-f82e-5d43-870a-5575266f6466",
+              "kind": "SUBSECTION",
+              "level": 2,
+              "title": "抛锚式教学法"
+            },
+            {
+              "id": "8a415071-b227-58f7-ab2e-9d362c72d793",
+              "kind": "SUBSECTION",
+              "level": 3,
+              "title": "抛锚式教学法的概念"
+            }
+          ],
+          "sourceBlockPosition": 364
+        },
+        "content": "抛锚式教学法是围绕一个有现实意义、需要综合判断的问题情境组织学习的方法。锚不是单个名词或一道记忆题，而是让学生持续调查和作出选择的中心问题。本组合成情境要求为虚构的校园花坛制定用水改进方案，同时考虑植物需求、传感器读数和有限预算。确定这个锚后，资料搜集、方案试验与讨论都要回应这些约束，教学方向由问题统领。情境可以模拟现实，但应给出足够信息让学生检查假设，并通过新的条件促进知识迁移。\n1. 教学情境的真实性\n合成案例包含合理的需水、成本和维护条件，学生用知识处理有意义的判断，而非凭空猜测一个标准答案。\n2. 教师角色的辅助性\n教师提供资料入口并追问理由，将方案选择交给学生；发现学习困难时调整支持，不代替全部调查与判断。\n3. 学生合作的重要性\n学生分工测量和核算，还要相互核对证据并讨论冲突；协作不等于把作业切成互不交流的几个部分。\n4. 教学实施的灵活性\n不同小组可以采用不同调查路径，发现新约束后允许调整计划，评价关注修改的依据以及解释是否充分。\n5. 学习空间的延展性\n通过模型和模拟数据补充课堂信息，再将方案放到另一组条件中检查，说明哪些结论能够迁移以及适用边界。",
+        "figureIds": [],
+        "figureRefs": [],
+        "retrievalScore": 0.02985174626865672,
+        "figureSequences": [],
+        "sourceSequences": [
+          {
+            "kind": "ordered-steps",
+            "steps": [
+              {
+                "label": "教学情境的真实性",
+                "excerpt": "合成案例包含合理的需水、成本和维护条件，学生用知识处理有意义的判断，而非凭空猜测一个标准答案。",
+                "sourceBlockId": "4835dcf6-1a78-5924-aa89-919aafcf7f71",
+                "excerptBlockId": "cbfdc9e0-86f5-5eb3-ba65-e0a739077c70"
+              },
+              {
+                "label": "教师角色的辅助性",
+                "excerpt": "教师提供资料入口并追问理由，将方案选择交给学生；发现学习困难时调整支持，不代替全部调查与判断。",
+                "sourceBlockId": "d20aab44-bab3-5b0b-a21f-610f31b9723a",
+                "excerptBlockId": "7919353a-acec-57a3-8b2b-2e05e677209a"
+              },
+              {
+                "label": "学生合作的重要性",
+                "excerpt": "学生分工测量和核算，还要相互核对证据并讨论冲突；协作不等于把作业切成互不交流的几个部分。",
+                "sourceBlockId": "91fe9e49-fc7f-5fac-931b-14289841da99",
+                "excerptBlockId": "264b921d-7c4a-548f-b6bc-59f3c4f015e3"
+              },
+              {
+                "label": "教学实施的灵活性",
+                "excerpt": "不同小组可以采用不同调查路径，发现新约束后允许调整计划，评价关注修改的依据以及解释是否充分。",
+                "sourceBlockId": "fb64b3c9-5121-597b-8627-0a6cecd46ea7",
+                "excerptBlockId": "598ecade-337a-56e9-8830-f866f44c67b5"
+              },
+              {
+                "label": "学习空间的延展性",
+                "excerpt": "通过模型和模拟数据补充课堂信息，再将方案放到另一组条件中检查，说明哪些结论能够迁移以及适用边界。",
+                "sourceBlockId": "2e1459a1-3d62-50f3-8298-87e39c30bcb3",
+                "excerptBlockId": "1833cd4f-e4e9-5963-9a6d-837a0635bf56"
+              }
+            ],
+            "anchorSourceBlockId": "4835dcf6-1a78-5924-aa89-919aafcf7f71"
+          }
+        ],
+        "figureSequencesResolved": true,
+        "sourceSequencesResolved": true,
+        "sourceSequencePolicyVersion": 2
+      },
+      {
+        "id": "4d98376c-4655-5531-a2ed-e7e177e088b6",
+        "kind": "concept",
+        "title": "支架式教学法",
+        "source": {
+          "quote": "支架式教学法通过可调整的暂时支持，帮助学生完成尚不能独立完成的任务；学生逐步掌握方法后，教师按实际表现撤去各项帮助。",
+          "sectionId": "3edd15a6-7fd4-59bc-8a3a-a9634a2f8fbc",
+          "quoteStart": 0,
+          "revisionId": "84a7c02b-7ed2-51e4-a270-b66d360b6061",
+          "textbookId": "24b84a72-45dd-5d47-896b-ece887581edc",
+          "sectionPath": [
+            "合成活动的教学理论与方法",
+            "合成教学方法比较",
+            "支架式教学法"
+          ],
+          "sourceBlockId": "092ccf13-2fe2-5117-87fa-0a19f10be852",
+          "textbookTitle": "合成教学活动手册（测试专用）",
+          "sourceBlockIds": [
+            "092ccf13-2fe2-5117-87fa-0a19f10be852"
+          ],
+          "revisionVersion": 1,
+          "sectionPosition": 338,
+          "sectionHierarchy": [
+            {
+              "id": "d5aa8902-4e1c-5007-b08f-144120b2d60b",
+              "kind": "CHAPTER",
+              "level": 0,
+              "title": "合成活动的教学理论与方法"
+            },
+            {
+              "id": "ffca15f3-6820-5791-96a1-6a8b8e6c4e53",
+              "kind": "SECTION",
+              "level": 1,
+              "title": "合成教学方法比较"
+            },
+            {
+              "id": "3edd15a6-7fd4-59bc-8a3a-a9634a2f8fbc",
+              "kind": "SUBSECTION",
+              "level": 2,
+              "title": "支架式教学法"
+            }
+          ],
+          "sourceBlockPosition": 339
+        },
+        "aliases": [],
+        "content": "支架式教学法通过可调整的暂时支持，帮助学生完成尚不能独立完成的任务；学生逐步掌握方法后，教师按实际表现撤去各项帮助。",
+        "figureIds": [],
+        "figureRefs": [],
+        "retrievalScore": 0.03278788524590164,
+        "figureSequences": [],
+        "sourceSequences": [],
+        "figureSequencesResolved": true,
+        "sourceSequencesResolved": true,
+        "sourceSequencePolicyVersion": 2
+      }
+    ]
+  },
+  "provenance": "Synthetic regression fixture: source prose and scenarios authored for these tests; structural contracts retained. See README.md."
+}

@@ -1,0 +1,75 @@
+# Run from this directory: promtool test rules static-resource.rules.test.yml
+rule_files:
+  - alerts.yml
+evaluation_interval: 15s
+tests:
+  - name: completed static responses above one second alert after five minutes
+    interval: 15s
+    input_series:
+      - series: 'openpbl_static_resource_duration_seconds_bucket{job="openpbl",instance="app",method="GET",route="/_next/static/openpbl-runtime/monaco/:version/:fingerprint/:path",outcome="completed",le="1"}'
+        values: '0+0x40'
+      - series: 'openpbl_static_resource_duration_seconds_bucket{job="openpbl",instance="app",method="GET",route="/_next/static/openpbl-runtime/monaco/:version/:fingerprint/:path",outcome="completed",le="2"}'
+        values: '0+10x40'
+      - series: 'openpbl_static_resource_duration_seconds_bucket{job="openpbl",instance="app",method="GET",route="/_next/static/openpbl-runtime/monaco/:version/:fingerprint/:path",outcome="completed",le="+Inf"}'
+        values: '0+10x40'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: OpenPblStaticResourceP95High
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: OpenPblStaticResourceP95High
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              measurement: node-parsed-to-response-finish
+              job: openpbl
+              instance: app
+              method: GET
+              route: /_next/static/openpbl-runtime/monaco/:version/:fingerprint/:path
+            exp_annotations:
+              summary: CoTeach static resource p95 exceeds 1 second for /_next/static/openpbl-runtime/monaco/:version/:fingerprint/:path
+              description: Native Node parsed-request to response finish; includes body streaming, excludes pre-Node waiting and browser receipt/rendering. Aborts are counted separately; missing or zero-traffic series are unknown.
+  - name: completed fast static HEAD responses do not alert
+    interval: 15s
+    input_series:
+      - series: 'openpbl_static_resource_duration_seconds_bucket{method="HEAD",route="/_next/static/openpbl-runtime/monaco/:version/:fingerprint/:path",outcome="completed",le="0.5"}'
+        values: '0+10x40'
+      - series: 'openpbl_static_resource_duration_seconds_bucket{method="HEAD",route="/_next/static/openpbl-runtime/monaco/:version/:fingerprint/:path",outcome="completed",le="1"}'
+        values: '0+10x40'
+      - series: 'openpbl_static_resource_duration_seconds_bucket{method="HEAD",route="/_next/static/openpbl-runtime/monaco/:version/:fingerprint/:path",outcome="completed",le="+Inf"}'
+        values: '0+10x40'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: OpenPblStaticResourceP95High
+        exp_alerts: []
+  - name: transport aborts never become completed latency samples
+    interval: 15s
+    input_series:
+      - series: 'openpbl_static_resource_duration_seconds_bucket{method="GET",route="/_next/static/openpbl-runtime/monaco/:version/:fingerprint/:path",outcome="aborted",le="1"}'
+        values: '0+0x40'
+      - series: 'openpbl_static_resource_duration_seconds_bucket{method="GET",route="/_next/static/openpbl-runtime/monaco/:version/:fingerprint/:path",outcome="aborted",le="10"}'
+        values: '0+10x40'
+      - series: 'openpbl_static_resource_duration_seconds_bucket{method="GET",route="/_next/static/openpbl-runtime/monaco/:version/:fingerprint/:path",outcome="aborted",le="+Inf"}'
+        values: '0+10x40'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: OpenPblStaticResourceP95High
+        exp_alerts: []
+  - name: absent samples remain unknown
+    interval: 15s
+    input_series: []
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: OpenPblStaticResourceP95High
+        exp_alerts: []
+  - name: zero traffic does not manufacture a zero latency sample
+    interval: 15s
+    input_series:
+      - series: 'openpbl_static_resource_duration_seconds_bucket{method="GET",route="/_next/static/openpbl-runtime/monaco/:version/:fingerprint/:path",outcome="completed",le="1"}'
+        values: '0+0x40'
+      - series: 'openpbl_static_resource_duration_seconds_bucket{method="GET",route="/_next/static/openpbl-runtime/monaco/:version/:fingerprint/:path",outcome="completed",le="+Inf"}'
+        values: '0+0x40'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: OpenPblStaticResourceP95High
+        exp_alerts: []

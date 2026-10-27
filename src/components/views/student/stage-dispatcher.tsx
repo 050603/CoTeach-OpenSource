@@ -1,0 +1,52 @@
+import type { Course, StageViewKey } from "@/lib/session/types";
+import { AiLearningView } from "./ai-learning";
+import { ExperimentPosttestStudentView } from "./experiment-posttest";
+import { SimplifiedStudentStageView } from "@/components/classroom/simple-stage-resources";
+import { NewShowcaseStudentView } from "./showcase-reporting";
+import { StudentPblEvaluation } from "@/components/evaluation/student-evaluation";
+
+export function StudentStageView({
+  view,
+  course,
+}: {
+  view: StageViewKey;
+  course: Course;
+  embedded?: boolean;
+}) {
+  const currentStage = course.stages[course.currentStageIndex];
+  const normalizedView = course.evaluationContractVersion === 2 && currentStage?.key === "reflection"
+    ? "pbl-evaluation"
+    : view === "simple-resource"
+    && currentStage?.key === "showcase"
+    ? "showcase-reporting"
+    : view === "simple-resource"
+      && currentStage?.key === "reflection"
+      ? "experiment-posttest"
+    : view === "reflection-survey" || view === "reflection"
+      ? "experiment-posttest"
+    : view;
+  switch (normalizedView) {
+    case "ai-learning":
+      return <AiLearningView course={course} />;
+    case "simple-resource":
+      return (
+        <SimplifiedStudentStageView
+          course={course}
+          stageKey={course.stages[course.currentStageIndex]?.key ?? "launch"}
+        />
+      );
+    case "showcase-reporting":
+      return <NewShowcaseStudentView course={course} />;
+    case "experiment-posttest":
+      return <ExperimentPosttestStudentView course={course} />;
+    case "pbl-evaluation":
+      return course.evaluationContractVersion === 2 ? <StudentPblEvaluation course={course} /> : <ExperimentPosttestStudentView course={course} />;
+    default:
+      return (
+        <SimplifiedStudentStageView
+          course={course}
+          stageKey={currentStage?.key ?? "launch"}
+        />
+      );
+  }
+}

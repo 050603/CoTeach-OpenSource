@@ -1,0 +1,44 @@
+import { createHash } from "node:crypto";
+import type { Course } from "@/lib/session/types";
+import type { PersistedClassroomData } from "@/lib/openmaic/server/classroom-storage";
+import { activeConfirmedPreparation, activeCourseResourcePackage } from '@/lib/course-design/preparation-source';
+
+function canonical(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonical);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(Object.entries(value).sort(([left], [right]) => left.localeCompare(right)).map(([key, entry]) => [key, canonical(entry)]));
+}
+
+/** Review stamps cover teaching facts and the exact draft; diagnostics cannot invalidate themselves. */
+export function computeCourseQualitySignature(course: Course, classroom: PersistedClassroomData): string {
+  const content = course.content;
+  // Classroom conduct settings do not change the reviewed teaching material.
+  const { documentPasteMonitoringEnabled: _monitoring, ...teachingConfig } = course.pblConfig ?? {};
+  void _monitoring;
+  return createHash("sha256").update(JSON.stringify(canonical({
+    schemaVersion: 2,
+    course: { id: course.id, name: course.name, grade: course.grade, subject: course.subject,
+      drivingQuestion: course.drivingQuestion, learningObjectives: course.learningObjectives,
+      expectedOutcome: course.expectedOutcome, hours: course.hours, pblConfig: course.pblConfig ? teachingConfig : undefined,
+      resources: course.resources?.map(({ downloadedBy: _downloadedBy, ...resource }) => { void _downloadedBy; return resource; }),
+      resourcePackage: activeCourseResourcePackage(course), stagePlan: content.stagePlan,
+      ...(content.preparationSource === 'collaborative-preparation' ? {
+        preparationSource: content.preparationSource, confirmedPreparation: activeConfirmedPreparation(course),
+      } : {}),
+      textbookSelections: content.textbookSelections,
+      courseEvidence: content.courseEvidence ? {
+        schemaVersion: content.courseEvidence.schemaVersion,
+        version: content.courseEvidence.version,
+        fingerprint: content.courseEvidence.fingerprint,
+        retrievalMode: content.courseEvidence.retrievalMode,
+        selections: content.courseEvidence.selections,
+        mappings: content.courseEvidence.mappings,
+      } : undefined,
+      knowledgeScopePlan: content.knowledgeScopePlan,
+      knowledgePoints: content.knowledgePoints, knowledgeGroups: content.knowledgeGroups, knowledgeGraph: content.knowledgeGraph,
+      moduleTimingPlan: content.moduleTimingPlan, evaluationPlan: content.evaluationPlan,
+      teachingBlueprint: content.teachingBlueprint, teachingAdoptions: content.teachingAdoptions,
+      outlines: content._openmaicSceneOutlines },
+    classroom: { id: classroom.id, revision: classroom.revision ?? 1, stage: classroom.stage, scenes: classroom.scenes },
+  }))).digest("hex");
+}

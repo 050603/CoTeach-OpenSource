@@ -1,0 +1,18 @@
+CoTeach
+Copyright 2026 李科骏
+Author affiliation: 北京师范大学 (Beijing Normal University)
+
+Original CoTeach code and documentation are licensed under the Apache License,
+Version 2.0. The copyright holder named above is an individual; the affiliation
+identifies the author's institution.
+
+CoTeach incorporates code adapted from OpenMAIC:
+Copyright (c) 2026 THU-MAIC, licensed under the MIT License.
+The original notice is retained in licenses/OpenMAIC-MIT.txt and in the
+corresponding packages/@openmaic/*/LICENSE files.
+
+Other third-party code, fonts and assets retain their respective copyrights
+and license terms. See THIRD_PARTY_NOTICES.md, licenses/README.md and the
+component license files, including packages/mathml2omml/LICENSE.
+
+This NOTICE records attribution and does not modify any applicable license.

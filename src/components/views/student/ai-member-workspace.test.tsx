@@ -1,0 +1,190 @@
+import { act, fireEvent, render, screen } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
+
+import { AiMemberWorkspace, type AiMemberWorkspaceMessage } from "./ai-member-workspace";
+
+vi.mock("./project-support-cards", () => ({
+  ProjectCitedMarkdown: ({ content }: { content: string }) => <p>{content}</p>,
+  ProjectMemoryPanel: () => <div>项目记忆面板</div>,
+  ProjectReplyContent: ({ content }: { content: string }) => <p>{content}</p>,
+  ProjectSourceNumber: ({ number }: { number: number }) => <span>{number}</span>,
+  ProjectSupportCard: () => null,
+  projectSourceAnchorId: () => "source",
+}));
+
+function workspaceProps(overrides: Record<string, unknown> = {}) {
+  return {
+    busy: false,
+    draft: "这个方案如何比较？",
+    error: null,
+    historyLoaded: true,
+    messages: [] as AiMemberWorkspaceMessage[],
+    pendingChange: null,
+    pendingDelivery: null,
+    projectTitle: "校园项目",
+    memories: [],
+    onAcceptChange: vi.fn(),
+    onAdoptDelivery: vi.fn(),
+    onChangeDraft: vi.fn(),
+    onClose: vi.fn(),
+    onViewDocument: vi.fn(),
+    onDismissError: vi.fn(),
+    onDeleteMessage: vi.fn(),
+    onRetryMessage: vi.fn(),
+    onEditMessage: vi.fn(),
+    onCancelMessage: vi.fn(),
+    onNewConversation: vi.fn(),
+    onRejectDelivery: vi.fn(),
+    onRejectChange: vi.fn(),
+    onReviseDelivery: vi.fn(),
+    onSubmit: vi.fn(),
+    onUpdateMemory: vi.fn(),
+    onDeleteMemory: vi.fn(),
+    onClearMemories: vi.fn(),
+    ...overrides,
+  };
+}
+
+describe("document AI member workspace", () => {
+  it("offers document preview, application and rejection in the chat", () => {
+    const props = workspaceProps({
+      onViewDocument: vi.fn(),
+      pendingDelivery: { title: "整理段落", summary: "保留原意", content: "整理后的记录",
+        documentActions: [{ operation: "replace", targetText: "原段落", content: "新段落", description: "整理现有记录" }],
+        sources: [], researchMode: "none", previewReady: true },
+    });
+    render(<AiMemberWorkspace {...props} />);
+    expect(screen.getByText("修改尚未应用，请查看正文标记后决定。")).toBeInTheDocument();
+    expect(screen.getByText("拟删除")).toBeInTheDocument();
+    expect(screen.getByText("拟新增")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "查看正文中的修改" }));
+    fireEvent.click(screen.getByRole("button", { name: "确认并应用到文档" }));
+    fireEvent.click(screen.getByRole("button", { name: "暂不采用" }));
+    expect(props.onViewDocument).toHaveBeenCalledOnce();
+    expect(props.onAdoptDelivery).toHaveBeenCalledOnce();
+    expect(props.onRejectDelivery).toHaveBeenCalledOnce();
+  });
+  it("keeps discussion available while a delivery awaits review", () => {
+    const props = workspaceProps({
+      pendingDelivery: {
+        title: "资料整理",
+        summary: "已有资料",
+        content: "资料内容",
+        documentActions: [{ operation: "none", targetText: "", content: "", description: "只供参考" }],
+        sources: [],
+        researchMode: "none",
+      },
+    });
+    render(<AiMemberWorkspace {...props} />);
+
+    expect(screen.getByPlaceholderText(/把你的判断/)).not.toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "发送给 AI 组员" }));
+    expect(props.onSubmit).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("button", { name: "完成审阅" })).toBeInTheDocument();
+  });
+
+  it("keeps a failed message and offers same-request retry or editing", () => {
+    const props = workspaceProps({
+      messages: [{
+        id: "message-1", role: "user", content: "请解释这个概念", createdAt: "2026-09-25T10:00:00.000Z",
+        requestId: "request-1", requestStatus: "failed", requestError: "这次回答没能完成，你的消息已保留。", retryable: true,
+      }],
+    });
+    render(<AiMemberWorkspace {...props} />);
+
+    expect(screen.getByText("请解释这个概念")).toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent("你的消息已保留");
+    fireEvent.click(screen.getByRole("button", { name: "重新尝试" }));
+    fireEvent.click(screen.getByRole("button", { name: "编辑后发送" }));
+    expect(props.onRetryMessage).toHaveBeenCalledWith("request-1");
+    expect(props.onEditMessage).toHaveBeenCalledWith("message-1");
+  });
+
+  it("shows the request as an AI bubble after the student message and keeps cancellation", () => {
+    const request = { id: "message-1", role: "user" as const, content: "帮我整理资料", createdAt: "2026-09-25T10:00:00.000Z", requestId: "request-1", requestStatus: "sending" as const };
+    const props = workspaceProps({ messages: [request] });
+    const { rerender } = render(<AiMemberWorkspace {...props} />);
+    expect(screen.getByText("帮我整理资料")).toBeInTheDocument();
+    expect(screen.queryByText("正在发送…")).not.toBeInTheDocument();
+    expect(screen.getByRole("status", { name: "AI 组员正在处理" })).toHaveTextContent("正在发送请求并等待回答");
+    fireEvent.click(screen.getByRole("button", { name: "取消这次请求" }));
+    expect(props.onCancelMessage).toHaveBeenCalledWith("request-1");
+    rerender(<AiMemberWorkspace {...props} messages={[{ ...request, requestStatus: "recovering" }]} />);
+    expect(screen.getByRole("status", { name: "AI 组员正在处理" })).toHaveTextContent("正在查询已保存的回答");
+    rerender(<AiMemberWorkspace {...props} messages={[{ ...request, requestStatus: "cancelled" }]} />);
+    expect(screen.queryByRole("status", { name: "AI 组员正在处理" })).not.toBeInTheDocument();
+    expect(screen.getByText("已取消")).toBeInTheDocument();
+  });
+
+  it("keeps elapsed waiting time through recovery and lets students return to editing", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-10-25T08:00:00Z"));
+    try {
+      const request: AiMemberWorkspaceMessage = {
+        id: "pending", role: "user", content: "统一标题编号", createdAt: "2026-10-25T08:00:00Z",
+        requestId: "pending-request", requestStatus: "processing", requestPhase: "running",
+      };
+      const props = workspaceProps({ busy: true, messages: [request] });
+      const { rerender, unmount } = render(<AiMemberWorkspace {...props} />);
+      expect(screen.getByText("已等待 0 秒，你可以继续编辑文档。")).toHaveAttribute("aria-live", "off");
+      act(() => vi.advanceTimersByTime(65_000));
+      expect(screen.getByText("已等待 1 分 5 秒，你可以继续编辑文档。")).toBeInTheDocument();
+      rerender(<AiMemberWorkspace {...props} messages={[{ ...request, requestStatus: "recovering" }]} />);
+      act(() => vi.advanceTimersByTime(1_000));
+      expect(screen.getByText("已等待 1 分 6 秒，你可以继续编辑文档。")).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "收起 AI 组员" }));
+      expect(props.onClose).toHaveBeenCalledOnce();
+      rerender(<AiMemberWorkspace {...props} busy={false} messages={[{ ...request, requestStatus: undefined }]} />);
+      expect(screen.queryByText(/已等待/)).not.toBeInTheDocument();
+      unmount();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not scroll away from history when a new message arrives", () => {
+    const first = { id: "one", role: "assistant" as const, content: "第一条", createdAt: "2026-09-25T10:00:00.000Z" };
+    const props = workspaceProps({ messages: [first] });
+    const { rerender } = render(<AiMemberWorkspace {...props} />);
+    const log = screen.getByRole("log", { name: "协作消息" });
+    Object.defineProperty(log, "scrollHeight", { configurable: true, value: 1000 });
+    Object.defineProperty(log, "clientHeight", { configurable: true, value: 200 });
+    log.scrollTop = 100;
+    fireEvent.scroll(log);
+    rerender(<AiMemberWorkspace {...props} messages={[first, { id: "two", role: "assistant", content: "新消息", createdAt: "2026-09-25T10:01:00.000Z" }]} />);
+
+    expect(log.scrollTop).toBe(100);
+    fireEvent.click(screen.getByRole("button", { name: "查看新消息" }));
+    expect(log.scrollTop).toBe(1000);
+  });
+
+  it("uses natural language without permanent action prompts", () => {
+    const props = workspaceProps({ draft: "" });
+    render(<AiMemberWorkspace {...props} />);
+    expect(screen.queryByLabelText("协作入口")).not.toBeInTheDocument();
+    for (const name of ["讨论思路", "安排辅助工作", "整理当前进展", "检查文稿", "语言表达", "项目逻辑"]) {
+      expect(screen.queryByRole("button", { name })).not.toBeInTheDocument();
+    }
+    expect(screen.queryByText("项目记忆面板")).not.toBeInTheDocument();
+    fireEvent.change(screen.getByPlaceholderText(/把你的判断/), { target: { value: "把已有记录排成表格" } });
+    expect(props.onChangeDraft).toHaveBeenCalledWith("把已有记录排成表格");
+  });
+
+  it("offers query and cancellation, without resubmission, while the result is unconfirmed", () => {
+    const props = workspaceProps({ messages: [{ id: "m", role: "user", content: "整理已有记录", createdAt: "2026-10-19T08:00:00Z",
+      requestId: "r", requestStatus: "unconfirmed", requestError: "暂未确认处理结果，你的消息已保留。", retryable: false }] });
+    render(<AiMemberWorkspace {...props} />);
+    expect(screen.queryByRole("button", { name: "重新尝试" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "编辑后发送" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("status", { name: "AI 组员正在处理" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "查询结果" }));
+    fireEvent.click(screen.getByRole("button", { name: "取消这次请求" }));
+    expect(props.onRetryMessage).toHaveBeenCalledWith("r");
+    expect(props.onCancelMessage).toHaveBeenCalledWith("r");
+  });
+
+  it("shows project memory when a student memory exists", () => {
+    render(<AiMemberWorkspace {...workspaceProps({ memories: [{ id: "memory-1", content: "先对比两个方案。" }] })} />);
+    expect(screen.getByText("项目记忆面板")).toBeInTheDocument();
+  });
+});

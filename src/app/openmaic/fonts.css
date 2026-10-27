@@ -1,0 +1,38 @@
+/* Original OpenMAIC font binaries are served by this application so the
+ * production font-src 'self' policy applies. Attribution and unaltered
+ * licenses accompany the files under /fonts/openmaic/. */
+@font-face {
+  font-display: swap;
+  font-family: 'SourceHanSans';
+  src: url('/fonts/openmaic/SourceHanSans.woff2') format('woff2');
+}
+
+@font-face {
+  font-display: swap;
+  font-family: 'SourceHanSerif';
+  src: url('/fonts/openmaic/SourceHanSerif.woff2') format('woff2');
+}
+
+@font-face {
+  font-display: swap;
+  font-family: 'LXGWWenKai';
+  src: url('/fonts/openmaic/LXGWWenKai.woff2') format('woff2');
+}
+
+@font-face {
+  font-display: swap;
+  font-family: 'ZhuQueFangSong';
+  src: url('/fonts/openmaic/ZhuQueFangSong.woff2') format('woff2');
+}
+
+@font-face {
+  font-display: swap;
+  font-family: 'WenDingPLKaiTi';
+  src: url('/fonts/openmaic/WenDingPLKaiTi.woff2') format('woff2');
+}
+
+@font-face {
+  font-display: swap;
+  font-family: 'ZcoolHappy';
+  src: url('/fonts/openmaic/ZcoolHappy.woff2') format('woff2');
+}

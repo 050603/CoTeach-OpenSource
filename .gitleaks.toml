@@ -1,0 +1,36 @@
+title = "CoTeach secret scanning"
+
+[extend]
+useDefault = true
+
+# Narrow exceptions for manually reviewed synthetic values. Never allow a
+# whole test directory or all UUID-shaped values: real secrets may occur there.
+[[rules]]
+id = "generic-api-key"
+
+[[rules.allowlists]]
+description = "Nonfunctional README placeholder"
+condition = "AND"
+paths = ['''(^|/)README\.md$''']
+regexTarget = "secret"
+regexes = ['''^replace-with-at-least-32-characters$''']
+
+[[rules.allowlists]]
+description = "Keyboard shortcut, not a credential"
+condition = "AND"
+paths = ['''(^|/)src/components/editor/plugins/exit-break-kit\.tsx$''']
+regexTarget = "secret"
+regexes = ['''^mod\+shift\+enter$''']
+
+[[rules.allowlists]]
+description = "Synthetic request idempotency UUIDs in specific regression tests"
+condition = "AND"
+paths = [
+  '''(^|/)src/app/api/platform/classroom-instances/\[instanceId\]/evaluation/route\.test\.ts$''',
+  '''(^|/)src/app/api/platform/participations/\[participationId\]/outcomes/route\.test\.ts$''',
+  '''(^|/)src/app/api/courses/\[courseId\]/showcase/artifacts/pdf/route\.test\.ts$''',
+  '''(^|/)src/lib/evaluation/pbl-service\.test\.ts$''',
+  '''(^|/)src/lib/platform/classroom-outcomes\.test\.ts$''',
+]
+regexTarget = "secret"
+regexes = ['''^(1b283575-dc73-4f24-98d5-be25ee4bcf3f|ac640a7e-3113-4360-a71f-1ecfc8895a19|ab6f6561-c2fc-4639-a617-84958deaf4c1)$''']

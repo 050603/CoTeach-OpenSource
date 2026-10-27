@@ -1,0 +1,2567 @@
+/**
+ * Stage 2: Scene content and action generation.
+ *
+ * Generates full scenes (slide/quiz/interactive/pbl with actions)
+ * from scene outlines.
+ */
+
+import { nanoid } from 'nanoid';
+import katex from 'katex';
+import type {
+  Action,
+  PBLProject,
+  PPTElement,
+  QuizQuestion,
+  SlideBackground,
+  WidgetType,
+} from '@openmaic/dsl';
+import { isWidgetType, normalizeElement } from '@openmaic/dsl';
+import { MAX_VISION_IMAGES } from './constants.js';
+import {
+  formatImageDescription,
+  formatImagePlaceholder,
+  partitionImagesForVision,
+} from './outline-formatters.js';
+import type {
+  ImageMapping,
+  PdfImage,
+  SceneOutline,
+  UserRequirements,
+  WidgetOutline,
+} from './outline-types.js';
+import { DEFAULT_LANGUAGE_DIRECTIVE } from './outline-generator.js';
+import { postProcessInteractiveHtml } from './interactive-post-processor.js';
+import { parseActionsFromStructuredOutput } from './action-parser.js';
+import { parseJsonResponse } from './json-repair.js';
+import {
+  buildCourseContext,
+  formatAgentsForPrompt,
+  formatTeacherPersonaForPrompt,
+} from './prompt-formatters.js';
+import type { PromptId } from './prompts/types.js';
+import { buildPrompt, PROMPT_IDS } from './prompts/index.js';
+import type {
+  GeneratedInteractiveContent,
+  GeneratedPBLContent,
+  GeneratedQuizContent,
+  GeneratedSlideContent,
+  WidgetConfig,
+} from './scene-types.js';
+import type {
+  AgentInfo,
+  SceneGenerationContext,
+  GeneratedSlideData,
+  AICallFn,
+} from './pipeline-types.js';
+import { noopGenerationLogger, type GenerationLogger } from './logger.js';
+import { isAbortError } from './generation-retry.js';
+import { generatePBLV2ProjectSingleCall } from './pbl/planner-single-call.js';
+import { PlannerV2Error } from './pbl/planner-core.js';
+import { componentAuthoringContract, flowAuthoringContract, type NativeDiagramAllocationHint } from './component-authoring-contract.js';
+import { compileTextComponents, compileNativeTextLayout, measureNativeTextStack, isOrphanTextLine, TEXT_LAYOUT_FONT, TEXT_LAYOUT_PADDING,
+  TEXT_LAYOUT_LINE_HEIGHT, TEXT_LAYOUT_PARAGRAPH_SPACE, type LabelGridComponent, type TextBoxComponent, type TextMeasure } from './text-layout-compiler.js';
+import { resolveAuthoringContent, validateAuthoringContent, type AuthoringContentItem, type AuthoringTextAllocation } from './authoring-content.js';
+import { nativeSlideCollisions } from './native-slide-collision.js';
+import { NativeContentBindings } from './native-content-bindings.js';
+import { nativeCompositionPrompt } from './native-composition-prompt.js';
+import { restoredComponentAuthoringContract } from './restored-component-authoring-contract.js';
+import { compileMeasuredDiagramComponent, measureDiagramAllocations, isDiagramComponent, normalizeDiagramComponent, type DiagramAllocation } from './diagram-compiler.js';
+import { compileFlowLayout, paginateMeasuredLayoutGroups, FlowLayoutFailure, type CompiledFlowPage } from './flow-layout-compiler.js';
+import { adoptChartPresentationTypography } from './chart-presentation-typography.js';
+import type { PBLPlannerV2Input } from './pbl/types.js';
+
+function isGeneratedMediaPlaceholder(value: string | undefined): value is string {
+  return !!value && /^gen_(img|vid)_[\w-]+$/i.test(value);
+}
+
+const INTERACTIVE_WIDGET_ACTIONS = [
+  'widget_highlight',
+  'widget_setState',
+  'widget_annotation',
+  'widget_reveal',
+];
+
+// ── Options interfaces for scene generation functions ──
+
+export type SceneContentFailureCode = 'prompt-unavailable' | 'invalid-model-output';
+export type SceneContentFailureCategory = 'layout-conflict' | 'page-capacity' | 'section-overload';
+
+export interface SceneContentFailure {
+  code: SceneContentFailureCode;
+  detail?: string;
+  category?: SceneContentFailureCategory;
+  requestedPageCount?: number;
+}
+
+function layoutFailureCategory(error: unknown, detail: string): SceneContentFailureCategory | undefined {
+  if (error instanceof FlowLayoutFailure) return error.category;
+  if (/(?:textBox content needs .*maximum allocation|labelGrid needs .*container is .* high|native text .* (?:exceeds|needs|would overlap|cannot fit)|component allocations overlap|authored diagram allocation|native layout collision)/i.test(detail)) return 'layout-conflict';
+  if (/Invalid diagram component: (?:node label .* (?:cannot fit|exceeds its node)|readable diagram nodes do not fit|(?:sequence|branch|cycle|parallel sequence).*do not fit)/i.test(detail)) return 'layout-conflict';
+  if (/(?:Semantic .* needs .*page provides|Semantic table row .*page provides|Balanced page .*exceeds|Measured teaching groups cannot fit)/i.test(detail)) return 'page-capacity';
+  return undefined;
+}
+
+async function measureAdoptedTextAllocations(content: readonly AuthoringContentItem[], measure: TextMeasure,
+  log: GenerationLogger, fonts: readonly number[] = [22, 24]): Promise<AuthoringTextAllocation[]> {
+  const choices = content.flatMap((item) => fonts.flatMap((fontSize) => [440, 880].map((width) => ({ item, fontSize, width }))));
+  const results = await Promise.all(choices.map(async ({ item, fontSize, width }): Promise<AuthoringTextAllocation | undefined> => {
+    try {
+      const resolved = resolveAuthoringContent({ elements: [{ type: 'text', contentRef: item.id,
+        content: `<p style="font-size:${fontSize}px"></p>` }] }, content);
+      const result = await measure({ text: item.text, html: resolved.elements[0]!.content!, width, fontSize,
+        fontWeight: 400, fontFamily: TEXT_LAYOUT_FONT, padding: TEXT_LAYOUT_PADDING, preserveRichText: true,
+        lineHeight: TEXT_LAYOUT_LINE_HEIGHT, paragraphSpace: TEXT_LAYOUT_PARAGRAPH_SPACE, align: 'left' });
+      if (!Number.isFinite(result.height) || result.height <= 0 || !Number.isFinite(result.naturalWidth)
+        || result.naturalWidth <= 0 || !Array.isArray(result.lines) || !result.lines.length
+        || result.lines.some((line) => typeof line !== 'string') || !result.lines.some((line) => line.trim())
+        || (result.lines.length > 1 && result.lines.some(isOrphanTextLine))
+        || result.lines.join('').normalize('NFKC').replace(/\s+/gu, '') !== item.text.normalize('NFKC').replace(/\s+/gu, '')
+        || (result.inkBottom !== undefined && (!Number.isFinite(result.inkBottom) || result.inkBottom < 0))
+        || (result.inkRight !== undefined && (!Number.isFinite(result.inkRight) || result.inkRight < 0 || result.inkRight > width + 1))
+        || (result.inkRight === undefined && result.lines.length === 1 && result.naturalWidth + TEXT_LAYOUT_PADDING * 2 > width + 1)) return undefined;
+      const height = Math.ceil(Math.max(result.height, result.inkBottom ?? 0));
+      if (height > 372.5) return undefined;
+      return { contentRef: item.id, fontSize, width, height };
+    } catch (error) {
+      log.warn(`Adopted point measurement unavailable for ${item.id} at ${fontSize}px/${width}px: ${error instanceof Error ? error.message : String(error)}`);
+      return undefined;
+    }
+  }));
+  return results.filter((result): result is AuthoringTextAllocation => Boolean(result));
+}
+
+export interface SceneContentOptions {
+  /** Compile first-draft components before native slide normalization. */
+  componentAuthoring?: boolean;
+  /** Explicit alternative; an oversized planned diagram can also select flow before authoring. */
+  slideAuthoring?: 'native' | 'flow';
+  /** @deprecated Native components are supported by default. */
+  allowLegacyComponents?: boolean;
+  /** Host browser measurement using the same fonts and CSS as playback. */
+  textMeasure?: TextMeasure;
+  /** Immutable adopted display points; full source evidence remains a separate narration input. */
+  authoringContent?: readonly AuthoringContentItem[];
+  /** Adopt display wording and native slots from the same model response.
+   * The returned catalogue replaces authoringContent for compilation only. */
+  responseAuthoringContent?: (raw: string) => {
+    response: string;
+    content: readonly AuthoringContentItem[];
+    diagnostics?: string[];
+  };
+  /** Use the archived native design prompt while retaining current measurement and topology fixes. */
+  nativeDesignBaseline?: '4615a98d';
+  /** Keep the author's whole-page composition when local measured text collides.
+   * Report the conflict without replacing it with a vertical stack or pagination. */
+  preserveNativeComposition?: boolean;
+  /** Retain the complete graph and an honest allocation diagnosis when a
+   * first draft has no further automatic layout recovery. */
+  retainDiagramDraftOnAllocationFailure?: boolean;
+  /** Trust a host-verified external copy of a canonical diagram annotation.
+   * Hosts must strip model flags and verify its exact text and real outside slot. */
+  allowExternalDiagramAnnotations?: boolean;
+  assignedImages?: PdfImage[];
+  imageMapping?: ImageMapping;
+  /** Concrete model-readable image bytes/absolute URLs, independent of render
+   * resource identities. Omitted keeps the legacy imageMapping vision transport. */
+  visionImageMapping?: ImageMapping;
+  visionEnabled?: boolean;
+  generatedMediaMapping?: ImageMapping;
+  /**
+   * Pre-resolved bytes for the vision slice (RFC #1153 part 2, N3). The app's
+   * scene-content route resolves the slice's allocated asset ids server-side
+   * BEFORE calling the generator so the attachment bytes are settled before
+   * prompt assembly; when provided, the LLM message's vision images are built
+   * from these (matched to the slice ids), so the caller's aiCall resolution
+   * becomes a defensive no-op. Absent (package consumers, browser-backed
+   * runs), the srcs are derived from `imageMapping` exactly as before.
+   */
+  resolvedVisionImages?: Array<{ id: string; src: string; width?: number; height?: number }>;
+  agents?: AgentInfo[];
+  languageDirective?: string;
+  /** Authoritative UI locale selected by the user, consumed by the PBL v2 planner. */
+  targetLanguage?: string;
+  /** Original course request/profile, used by PBL v2 for explicit learner-level signals. */
+  userRequirements?: UserRequirements;
+  allowProceduralSkill?: boolean;
+  /**
+   * Natural-language edit instruction for whole-slide regeneration (MAIC Editor
+   * agent `regenerate_scene`). When set, the slide content prompt switches to
+   * EDIT MODE. slide-only; ignored by other scene types.
+   */
+  editDirective?: string;
+  /**
+   * The current slide content, fed as the edit baseline so content-specific
+   * instructions operate on the real slide rather than re-rolling from outline.
+   * Only consumed by the slide branch alongside `editDirective`.
+   */
+  baselineContent?: GeneratedSlideContent;
+  /** Optional host fallback for the app-only loop planner. */
+  pblLoopFallback?: (input: PBLPlannerV2Input) => Promise<PBLProject>;
+  onFailure?: (failure: SceneContentFailure) => void;
+  logger?: GenerationLogger;
+}
+
+export interface SceneActionsOptions {
+  ctx?: SceneGenerationContext;
+  agents?: AgentInfo[];
+  userProfile?: string;
+  languageDirective?: string;
+  logger?: GenerationLogger;
+  /**
+   * Fail when the model returns no parseable actions instead of substituting
+   * the compatibility narration fallback. Host applications use this for
+   * retryable production authoring; package consumers keep the historical
+   * fallback unless they opt in.
+   */
+  requireStructuredOutput?: boolean;
+}
+
+function invalidActionsOutput(outline: SceneOutline): Error {
+  return Object.assign(
+    new Error(`Invalid or empty teaching actions for ${outline.id}`),
+    { code: 'INVALID_ACTION_OUTPUT' as const },
+  );
+}
+
+// ==================== Backward Compatibility Helpers ====================
+
+/**
+ * Convert legacy interactiveConfig to unified widget fields
+ * For backward compatibility with old classrooms
+ */
+function convertInteractiveConfigToWidget(
+  outline: SceneOutline,
+  log: GenerationLogger,
+): SceneOutline {
+  const config = outline.interactiveConfig;
+  if (!config) {
+    log.warn(
+      `Interactive outline missing both widget and interactiveConfig, falling back to simulation`,
+    );
+    return {
+      ...outline,
+      widgetType: 'simulation' as WidgetType,
+      widgetOutline: { concept: outline.title },
+    };
+  }
+
+  const widgetType = inferWidgetType(
+    config.subject || '',
+    config.conceptName,
+    config.designIdea || '',
+  );
+
+  log.info(`Converting interactiveConfig to widget: ${widgetType} for "${outline.title}"`);
+
+  return {
+    ...outline,
+    widgetType,
+    widgetOutline: buildWidgetOutline(widgetType, config),
+  };
+}
+
+/**
+ * Infer widget type from concept characteristics
+ */
+function inferWidgetType(subject: string, concept: string, designIdea: string): WidgetType {
+  const text = (subject + ' ' + concept + ' ' + designIdea).toLowerCase();
+
+  // Rule-based inference
+  if (
+    /physics|chemistry|力学|化学|运动|反应|force|motion|equilibrium|wave|电路|circuit/.test(text)
+  ) {
+    return 'simulation';
+  }
+  if (/programming|code|algorithm|编程|算法|python|javascript|function|代码/.test(text)) {
+    return 'code';
+  }
+  if (/process|workflow|步骤|流程|逻辑|step|flow|系统|system/.test(text)) {
+    return 'diagram';
+  }
+  if (
+    /biology|anatomy|cell|molecular|生物|细胞|分子|3d|三维|solar|planet|skeleton|organ/.test(text)
+  ) {
+    return 'visualization3d';
+  }
+  if (/game|quiz|practice|练习|游戏|puzzle|match|challenge|挑战/.test(text)) {
+    return 'game';
+  }
+
+  // Default fallback
+  return 'simulation';
+}
+
+/**
+ * Build widgetOutline from interactiveConfig for backward compatibility
+ */
+function buildWidgetOutline(
+  widgetType: WidgetType,
+  config: { conceptName: string; conceptOverview: string; designIdea: string },
+): WidgetOutline {
+  const base: WidgetOutline = { concept: config.conceptName };
+
+  switch (widgetType) {
+    case 'simulation':
+      // Try to extract variables from designIdea
+      const varMatch = config.designIdea.match(/variables|参数|调整|adjust|slider/i);
+      return { ...base, keyVariables: varMatch ? [] : undefined };
+    case 'diagram':
+      return { ...base, diagramType: 'flowchart' };
+    case 'code':
+      return { ...base, language: 'python' };
+    case 'game':
+      return { ...base, gameType: 'quiz' };
+    case 'visualization3d':
+      return { ...base, visualizationType: 'custom', objects: [] };
+    default:
+      return base;
+  }
+}
+
+/**
+ * Step 3.1: Generate content based on outline
+ */
+export async function generateSceneContent(
+  outline: SceneOutline,
+  aiCall: AICallFn,
+  options: SceneContentOptions = {},
+): Promise<
+  | GeneratedSlideContent
+  | GeneratedQuizContent
+  | GeneratedInteractiveContent
+  | GeneratedPBLContent
+  | null
+> {
+  const log = options.logger ?? noopGenerationLogger;
+  const {
+    assignedImages,
+    imageMapping,
+    visionImageMapping,
+    visionEnabled,
+    generatedMediaMapping,
+    resolvedVisionImages,
+    agents,
+    languageDirective,
+    targetLanguage,
+    userRequirements,
+    allowProceduralSkill = false,
+    editDirective,
+    baselineContent,
+    componentAuthoring,
+    slideAuthoring,
+    textMeasure,
+    authoringContent,
+    responseAuthoringContent,
+    preserveNativeComposition,
+    retainDiagramDraftOnAllocationFailure,
+    nativeDesignBaseline,
+    allowExternalDiagramAnnotations,
+  } = options;
+
+  // Unified path for interactive scenes (both normal and ultra mode)
+  if (outline.type === 'interactive') {
+    // Backward compatibility: convert legacy interactiveConfig
+    if (!outline.widgetType && outline.interactiveConfig) {
+      log.info(`Converting legacy interactiveConfig for: ${outline.title}`);
+      outline = convertInteractiveConfigToWidget(outline, log);
+    }
+
+    // If still no widgetType after conversion, fallback to simulation
+    if (!outline.widgetType) {
+      log.warn(
+        `Interactive outline "${outline.title}" has no widgetType, falling back to simulation`,
+      );
+      outline = {
+        ...outline,
+        widgetType: 'simulation' as WidgetType,
+        widgetOutline: { concept: outline.title },
+      };
+    }
+
+    // Route to widget generation (handles all 5 types)
+    return generateWidgetContent(outline, aiCall, languageDirective, {
+      allowProceduralSkill,
+      logger: log,
+      onFailure: options.onFailure,
+    });
+  }
+
+  switch (outline.type) {
+    case 'slide':
+      return generateSlideContent(
+        outline,
+        aiCall,
+        assignedImages,
+        imageMapping,
+        visionEnabled,
+        generatedMediaMapping,
+        resolvedVisionImages,
+        agents,
+        languageDirective,
+        editDirective,
+        baselineContent,
+        componentAuthoring,
+        textMeasure,
+        slideAuthoring,
+        log,
+        options.onFailure,
+        authoringContent,
+        responseAuthoringContent,
+        preserveNativeComposition,
+        allowExternalDiagramAnnotations,
+        visionImageMapping,
+        nativeDesignBaseline,
+        retainDiagramDraftOnAllocationFailure,
+      );
+    case 'quiz':
+      return generateQuizContent(outline, aiCall, languageDirective, log, options.onFailure);
+    case 'pbl':
+      return generatePBLSceneContent(
+        outline,
+        aiCall,
+        languageDirective,
+        targetLanguage,
+        userRequirements,
+        options.pblLoopFallback,
+        log,
+      );
+    default:
+      return null;
+  }
+}
+
+/**
+ * Check if a string looks like an image ID (e.g., "img_1", "img_2")
+ * rather than a base64 data URL or actual URL
+ *
+ * This function distinguishes between:
+ * - Image IDs: "img_1", "img_2", etc. → returns true
+ * - Base64 data URLs: "data:image/..." → returns false
+ * - HTTP URLs: "http://...", "https://..." → returns false
+ * - Relative paths: "/images/..." → returns false
+ */
+function isImageIdReference(value: string): boolean {
+  if (!value) return false;
+  // Exclude real URLs and paths
+  if (value.startsWith('data:')) return false;
+  if (value.startsWith('http://') || value.startsWith('https://')) return false;
+  if (value.startsWith('/')) return false; // Relative paths
+  // Match legacy PDF IDs and stable textbook evidence IDs.
+  return /^(?:img_\d+|textbook_fig_[\w-]+)$/i.test(value);
+}
+
+/**
+ * Resolve image ID references in src field to the mapping's payload.
+ *
+ * AI generates: { type: "image", src: "img_1", ... }
+ * This function replaces: { type: "image", src: "<imageMapping[src]>", ... }
+ *
+ * Design rationale (Plan B):
+ * - Simpler: AI only needs to know one field (src)
+ * - Consistent: Generated JSON structure matches final PPTImageElement
+ * - Intuitive: src is the image source, first as ID then as actual URL
+ * - Less prompt complexity: No need to explain imageId vs src distinction
+ *
+ * The mapping VALUE is written verbatim, so the transport is decided entirely
+ * by the caller's `imageMapping` shape — no flag threading into this package
+ * (RFC #1153 part 2 B): a browser-backed mapping carries base64 data URLs and
+ * the element src becomes the data URL exactly as before; a server-backed
+ * mapping carries allocated pool asset ids and the element src becomes the
+ * asset id, which the renderer resolves through the pool registry.
+ */
+export function resolveImageIds(
+  elements: GeneratedSlideData['elements'],
+  imageMapping?: ImageMapping,
+  generatedMediaMapping?: ImageMapping,
+  log: GenerationLogger = noopGenerationLogger,
+): GeneratedSlideData['elements'] {
+  return elements
+    .map((el) => {
+      if (el.type === 'image') {
+        if (!('src' in el)) {
+          log.warn(`Image element missing src, removing element`);
+          return null; // Remove invalid image elements
+        }
+        const src = el.src as string;
+
+        // Mapping keys are authoritative so stable evidence IDs do not need to
+        // conform to the legacy img_N naming convention.
+        if (imageMapping && Object.prototype.hasOwnProperty.call(imageMapping, src)) {
+          log.debug(`Resolved image ID "${src}" to its mapped source`);
+          return { ...el, src: imageMapping[src] };
+        }
+
+        // If src looks like an unresolved source-image reference, fail closed.
+        if (isImageIdReference(src)) {
+          if (!imageMapping || !imageMapping[src]) {
+            log.warn(`No mapping for image ID: ${src}, removing element`);
+            return null; // Remove invalid image elements
+          }
+          log.debug(`Resolved image ID "${src}" to its mapped source`);
+          return { ...el, src: imageMapping[src] };
+        }
+
+        // Generated image reference — keep as placeholder for async backfill
+        if (isGeneratedMediaPlaceholder(src)) {
+          if (generatedMediaMapping && generatedMediaMapping[src]) {
+            log.debug(`Resolved generated image ID "${src}" to URL`);
+            return { ...el, src: generatedMediaMapping[src] };
+          }
+          // Keep element with placeholder ID — frontend renders skeleton
+          log.debug(`Keeping generated image placeholder: ${src}`);
+          return el;
+        }
+      }
+
+      if (el.type === 'video') {
+        const mediaRef = (el as Record<string, unknown>).mediaRef;
+        if (!('src' in el) && typeof mediaRef !== 'string') {
+          log.warn(`Video element missing src, removing element`);
+          return null;
+        }
+        const src = el.src as string;
+        if (isGeneratedMediaPlaceholder(src)) {
+          if (generatedMediaMapping && generatedMediaMapping[src]) {
+            log.debug(`Resolved generated video ID "${src}" to URL`);
+            return { ...el, src: generatedMediaMapping[src] };
+          }
+          // Keep element with placeholder ID — frontend renders skeleton
+          log.debug(`Keeping generated video placeholder: ${src}`);
+          return el;
+        }
+      }
+
+      return el;
+    })
+    .filter((el): el is NonNullable<typeof el> => el !== null);
+}
+
+function normalizeGeneratedVideoRefs(
+  elements: GeneratedSlideData['elements'],
+  generatedVideoEntries: SceneOutline['mediaGenerations'] = [],
+  sharedVideoRefs: string[] = [],
+  log: GenerationLogger = noopGenerationLogger,
+): GeneratedSlideData['elements'] {
+  const validRefs = Array.from(
+    new Set([
+      ...generatedVideoEntries.filter((mg) => mg.type === 'video').map((mg) => mg.elementId),
+      ...sharedVideoRefs,
+    ]),
+  );
+
+  const validRefSet = new Set(validRefs);
+  const onlyRef = validRefs.length === 1 ? validRefs[0] : undefined;
+
+  return elements
+    .map((el) => {
+      if (el.type !== 'video') return el;
+
+      const videoEl = { ...el } as Record<string, unknown>;
+      const mediaRef = typeof videoEl.mediaRef === 'string' ? videoEl.mediaRef : undefined;
+      const src = typeof videoEl.src === 'string' ? videoEl.src : undefined;
+      const hasGeneratedSrc = isGeneratedMediaPlaceholder(src);
+      const hasDirectSrc = !!src && !hasGeneratedSrc;
+
+      if (hasDirectSrc) {
+        if (mediaRef) delete videoEl.mediaRef;
+        return videoEl as typeof el;
+      }
+
+      if (mediaRef && validRefSet.has(mediaRef)) {
+        if (hasGeneratedSrc) delete videoEl.src;
+        return videoEl as typeof el;
+      }
+
+      if (src && validRefSet.has(src)) {
+        videoEl.mediaRef = src;
+        delete videoEl.src;
+        return videoEl as typeof el;
+      }
+
+      if ((mediaRef || hasGeneratedSrc) && onlyRef) {
+        log.warn(`Correcting generated video reference "${mediaRef || src}" to "${onlyRef}"`);
+        videoEl.mediaRef = onlyRef;
+        if (hasGeneratedSrc) delete videoEl.src;
+        return videoEl as typeof el;
+      }
+
+      if (mediaRef || hasGeneratedSrc) {
+        log.warn(`Invalid generated video reference "${mediaRef || src}", removing element`);
+        return null;
+      }
+
+      return el;
+    })
+    .filter((el): el is NonNullable<typeof el> => el !== null);
+}
+
+/**
+ * Fill required element fields the model may have left off, plus image
+ * aspect-ratio reconciliation.
+ *
+ * The default-filling / geometry-derivation / malformed-input coercion is now
+ * owned by the DSL contract — `normalizeElement` from `@openmaic/dsl` — rather
+ * than duplicated imperatively here (it fills the same canonical defaults,
+ * derives a line's `start`/`end` and a shape's `viewBox`/`path` from the box,
+ * and fails loud on a present-but-wrong-typed field instead of silently
+ * resetting it). Image aspect-ratio reconciliation stays here: it depends on the
+ * resolved PDF asset's real dimensions, which is producer-specific data the DSL
+ * deliberately does not own.
+ */
+function fixElementDefaults(
+  elements: GeneratedSlideData['elements'],
+  assignedImages?: PdfImage[],
+  log: GenerationLogger = noopGenerationLogger,
+): GeneratedSlideData['elements'] {
+  // Index assigned images by id once (O(m)) so the per-image-element lookup
+  // below is O(1) instead of a `.find` nested inside this map (which made the
+  // pass O(elements × images)).
+  const imageMetaById = new Map((assignedImages ?? []).map((img) => [img.id, img]));
+
+  return elements
+    .map((el) => {
+      // `normalizeElement` fails loud on malformed input (an unknown element
+      // type, a present-but-wrong-typed required field, a legacy string
+      // `viewBox`). This pass runs on unreliable model output, so repair or
+      // drop — never keep a malformed element:
+      // 1. Repair: a JSON `null` from the model means "absent" — strip nulls so
+      //    normalize treats the field as missing and fills/derives it, instead
+      //    of failing on a wrong-typed null (`start: null`, `text: null`, …).
+      // 2. Drop: if normalization still throws, discard the element. Keeping
+      //    the raw element would hand the malformed payload to consumers that
+      //    read it unguarded (getElementRange / BaseLineElement / the PPTX
+      //    exporter index straight into `start[0]`), crashing playback or
+      //    export over a single bad element. Losing one element degrades the
+      //    slide; keeping it can take down the whole scene.
+      let normalized: PPTElement;
+      try {
+        normalized = normalizeElement(stripNulls(el));
+      } catch (err) {
+        log.warn(
+          `Dropping malformed generated element: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        return null;
+      }
+
+      // Fit the image box to the assigned PDF image's real aspect ratio (`src` is
+      // still the img_id at this point). Producer-specific, so it lives here, not
+      // in the DSL's normalize.
+      if (normalized.type === 'image' && assignedImages && typeof normalized.src === 'string') {
+        const imgMeta = imageMetaById.get(normalized.src);
+        if (imgMeta?.width && imgMeta?.height) {
+          const knownRatio = imgMeta.width / imgMeta.height;
+          const curW = normalized.width || 400;
+          const curH = normalized.height || 300;
+          if (Math.abs(curW / curH - knownRatio) / knownRatio > 0.1) {
+            // Keep width, correct height
+            const newH = Math.round(curW / knownRatio);
+            if (newH > 462) {
+              // canvas 562.5 - margins 50×2
+              return { ...normalized, width: Math.round(462 * knownRatio), height: 462 };
+            }
+            return { ...normalized, height: newH };
+          }
+        }
+      }
+
+      return normalized;
+    })
+    .filter((el) => el !== null) as unknown as GeneratedSlideData['elements'];
+}
+
+/**
+ * Drop `null`-valued properties (recursively, through plain objects) so the DSL
+ * normalizer sees them as absent and fills/derives defaults. Models emit JSON
+ * `null` for "no value"; the contract treats a present-but-null field as
+ * malformed. Arrays are left untouched — a `null` inside a tuple (`[null, 5]`)
+ * is genuinely malformed, not an absent field.
+ */
+function stripNulls(el: unknown): unknown {
+  if (Array.isArray(el) || typeof el !== 'object' || el === null) return el;
+  return Object.fromEntries(
+    Object.entries(el)
+      .filter(([, v]) => v !== null)
+      .map(([k, v]) => [k, stripNulls(v)]),
+  );
+}
+
+/**
+ * Process LaTeX elements: render latex string to HTML using KaTeX.
+ * Fills in html and fixedRatio fields.
+ * Elements that fail conversion are removed.
+ */
+function processLatexElements(
+  elements: GeneratedSlideData['elements'],
+  log: GenerationLogger = noopGenerationLogger,
+): GeneratedSlideData['elements'] {
+  return elements
+    .map((el) => {
+      if (el.type !== 'latex') return el;
+
+      const latexStr = el.latex as string | undefined;
+      if (!latexStr) {
+        log.warn('Latex element missing latex string, removing');
+        return null;
+      }
+
+      try {
+        const html = katex.renderToString(latexStr, {
+          throwOnError: false,
+          displayMode: true,
+          output: 'html',
+        });
+
+        return {
+          ...el,
+          html,
+          fixedRatio: true,
+        };
+      } catch (err) {
+        log.warn(`Failed to render latex "${latexStr}":`, err);
+        return null;
+      }
+    })
+    .filter((el): el is NonNullable<typeof el> => el !== null);
+}
+
+/**
+ * Generate slide content
+ */
+async function generateSlideContent(
+  outline: SceneOutline,
+  aiCall: AICallFn,
+  assignedImages?: PdfImage[],
+  imageMapping?: ImageMapping,
+  visionEnabled?: boolean,
+  generatedMediaMapping?: ImageMapping,
+  resolvedVisionImages?: Array<{ id: string; src: string; width?: number; height?: number }>,
+  agents?: AgentInfo[],
+  languageDirective?: string,
+  editDirective?: string,
+  baselineContent?: GeneratedSlideContent,
+  componentAuthoring = false,
+  textMeasure?: TextMeasure,
+  slideAuthoring: 'native' | 'flow' = 'native',
+  log: GenerationLogger = noopGenerationLogger,
+  onFailure?: (failure: SceneContentFailure) => void,
+  authoringContent?: readonly AuthoringContentItem[],
+  responseAuthoringContent?: SceneContentOptions['responseAuthoringContent'],
+  preserveNativeComposition = false,
+  allowExternalDiagramAnnotations = false,
+  visionImageMapping?: ImageMapping,
+  nativeDesignBaseline?: SceneContentOptions['nativeDesignBaseline'],
+  retainDiagramDraftOnAllocationFailure = false,
+): Promise<GeneratedSlideContent | null> {
+  if (preserveNativeComposition && !outline.presentationTypography) {
+    outline = { ...outline, presentationTypography: {
+      bodyFontSize: 18, minimumBodyFontSize: 16, titleFontSize: 32, minimumTitleFontSize: 28,
+    } };
+  }
+  const qualityDiagnostics: string[] = [];
+  const reportQuality = (detail: string) => {
+    qualityDiagnostics.push(detail);
+    log.warn(`Slide quality finding for ${outline.title}: ${detail}`);
+  };
+  if (componentAuthoring && !textMeasure) {
+    reportQuality('Playback text measurement is unavailable; retaining authored geometry without a measured-fit claim');
+    textMeasure = () => { throw new Error('Playback text measurement is unavailable'); };
+  }
+  if (authoringContent) {
+    try { validateAuthoringContent(authoringContent); }
+    catch (error) {
+      reportQuality(error instanceof Error ? error.message : String(error));
+      authoringContent = authoringContent.filter((item) => item && typeof item.id === 'string' && item.id.trim()
+        && typeof item.text === 'string' && item.text.trim());
+    }
+  }
+  const visualResourceRefs = outline.visualIntent?.resourceRefs ?? [];
+  const requiredResourceRefs = visualResourceRefs.filter((reference) => reference.required);
+  const assignedImageIds = new Set((assignedImages ?? []).map((image) => image.id));
+  const missingRequiredSourceIds = requiredResourceRefs
+    .filter((reference) => reference.kind === 'source-image')
+    .map((reference) => reference.resourceId)
+    .filter(
+      (resourceId) =>
+        !assignedImageIds.has(resourceId) ||
+        !imageMapping ||
+        !Object.prototype.hasOwnProperty.call(imageMapping, resourceId) ||
+        !imageMapping[resourceId],
+    );
+  if (missingRequiredSourceIds.length > 0) {
+    reportQuality(
+      `Required source images are unavailable for ${outline.title}: ${missingRequiredSourceIds.join(', ')}`,
+    );
+  }
+
+  // Build assigned images description for the prompt
+  let assignedImagesText = '无可用图片，禁止插入任何 image 元素';
+  let visionImages: Array<{ id: string; src: string }> | undefined;
+
+  if (assignedImages && assignedImages.length > 0) {
+    // Rendering may use protected relative URLs or unresolved generation IDs.
+    // An explicit vision map is a separate transport and must never promise
+    // attachment bytes for those values. Legacy asset-ID hydration remains
+    // available when the host omits this new map.
+    const concreteVisionSource = (src: string) => /^data:image\//i.test(src) || /^https?:\/\/[^\s]+$/i.test(src);
+    const attachmentMapping = visionImageMapping === undefined ? imageMapping
+      : Object.fromEntries(Object.entries(visionImageMapping).filter(([, src]) => concreteVisionSource(src)));
+    // The partition is the shared ordering (RFC #1153 part 2, N3): the app's
+    // scene-content route pre-resolves the SAME `withSrc` candidates in this
+    // order, so the slice below can never admit an image the route has not
+    // resolved. `visionEnabled && imageMapping` off → every image is a plain
+    // text description listed in the ORIGINAL full vision-priority
+    // interleaved order (`sorted` — the pre-partition `sortedAssignedImages`
+    // order), NOT the slices-concatenated order, so a non-vision run with a
+    // mapping present (a non-vision model on a server-backed deployment) sees
+    // exactly the text ordering it saw before the partition refactor.
+    const { sorted, visionSlice, textOnlySlice, noSrcImages } = partitionImagesForVision(
+      assignedImages,
+      attachmentMapping,
+      MAX_VISION_IMAGES,
+    );
+    if (visionEnabled && attachmentMapping) {
+      // Vision mode: split into vision images and text-only
+      const visionDescriptions = visionSlice.map((img) => formatImagePlaceholder(img));
+      const textDescriptions = [...textOnlySlice, ...noSrcImages].map((img) =>
+        formatImageDescription(img),
+      );
+      assignedImagesText = [...visionDescriptions, ...textDescriptions].join('\n');
+
+      // When the route pre-resolved the slice, its resolved bytes are used
+      // verbatim (matched to the slice ids), so the caller's aiCall resolution
+      // is a defensive no-op; otherwise fall back to the mapping src (an
+      // allocated id the caller's aiCall resolves at prompt-assembly time).
+      const resolvedById = new Map(
+        (resolvedVisionImages ?? []).map((img) => [img.id, img] as const),
+      );
+      visionImages = visionSlice.map((img) => {
+        const candidate = resolvedById.get(img.id);
+        const resolved = candidate && (visionImageMapping === undefined || concreteVisionSource(candidate.src)) ? candidate : undefined;
+        return (
+          resolved ?? {
+            id: img.id,
+            src: attachmentMapping[img.id],
+            width: img.width,
+            height: img.height,
+          }
+        );
+      });
+    } else {
+      assignedImagesText = sorted.map((img) => formatImageDescription(img)).join('\n');
+    }
+  }
+
+  const generatedImageEntries = outline.mediaGenerations?.filter((mg) => mg.type === 'image') ?? [];
+  const generatedVideoEntries = outline.mediaGenerations?.filter((mg) => mg.type === 'video') ?? [];
+  const generatedImageRefs = visualResourceRefs.filter(
+    (reference) => reference.kind === 'generated-image',
+  );
+  const generatedVideoRefs = visualResourceRefs.filter(
+    (reference) => reference.kind === 'generated-video',
+  );
+  const hasAssignedImages = (assignedImages?.length ?? 0) > 0;
+  const generatedImageEnabled = generatedImageEntries.length > 0 || generatedImageRefs.length > 0;
+  const generatedVideoEnabled = generatedVideoEntries.length > 0 || generatedVideoRefs.length > 0;
+  const imageElementEnabled = hasAssignedImages || generatedImageEnabled;
+  const mediaElementEnabled = imageElementEnabled || generatedVideoEnabled;
+
+  // Add generated media placeholders info (images + videos)
+  if (
+    (outline.mediaGenerations && outline.mediaGenerations.length > 0) ||
+    generatedImageRefs.length > 0 ||
+    generatedVideoRefs.length > 0
+  ) {
+    const genImgDescs = generatedImageEntries
+      .map((mg) => `- ${mg.elementId}: "${mg.prompt}" (aspect ratio: ${mg.aspectRatio || '16:9'})`)
+      .join('\n');
+    const genVidDescs = generatedVideoEntries
+      .map((mg) => `- ${mg.elementId}: "${mg.prompt}" (aspect ratio: ${mg.aspectRatio || '16:9'})`)
+      .join('\n');
+    const definedMediaIds = new Set(
+      (outline.mediaGenerations ?? []).map((mediaGeneration) => mediaGeneration.elementId),
+    );
+    const reusedImageDescs = generatedImageRefs
+      .filter((reference) => !definedMediaIds.has(reference.resourceId))
+      .map(
+        (reference) =>
+          `- ${reference.resourceId}: shared generated image; ${reference.reason}${reference.required ? ' (required)' : ''}`,
+      )
+      .join('\n');
+    const reusedVideoDescs = generatedVideoRefs
+      .filter((reference) => !definedMediaIds.has(reference.resourceId))
+      .map(
+        (reference) =>
+          `- ${reference.resourceId}: shared generated video; ${reference.reason}${reference.required ? ' (required)' : ''}`,
+      )
+      .join('\n');
+
+    const mediaParts: string[] = [];
+    if (genImgDescs) {
+      mediaParts.push(`AI-Generated Images (use these IDs as image element src):\n${genImgDescs}`);
+    }
+    if (reusedImageDescs) {
+      mediaParts.push(
+        `Shared AI-Generated Images (use these IDs as image element src; do not request generation again):\n${reusedImageDescs}`,
+      );
+    }
+    if (genVidDescs) {
+      mediaParts.push(
+        `AI-Generated Videos (use these IDs as video element mediaRef):\n${genVidDescs}`,
+      );
+    }
+    if (reusedVideoDescs) {
+      mediaParts.push(
+        `Shared AI-Generated Videos (use these IDs as video element mediaRef; do not request generation again):\n${reusedVideoDescs}`,
+      );
+    }
+
+    if (mediaParts.length > 0) {
+      const mediaText = mediaParts.join('\n\n');
+      if (assignedImagesText.includes('禁止插入') || assignedImagesText.includes('No images')) {
+        assignedImagesText = mediaText;
+      } else {
+        assignedImagesText += `\n\n${mediaText}`;
+      }
+    }
+  }
+
+  // Canvas dimensions (matching viewportSize and viewportRatio)
+  const canvasWidth = 1000;
+  const canvasHeight = 562.5;
+
+  const teacherContext = formatTeacherPersonaForPrompt(agents);
+
+  const prompts = buildPrompt(PROMPT_IDS.SLIDE_CONTENT, {
+    title: outline.title,
+    description: outline.description,
+    keyPoints: (outline.keyPoints || []).map((p, i) => `${i + 1}. ${p}`).join('\n'),
+    elements: '（根据要点自动生成）',
+    assignedImages: assignedImagesText,
+    canvas_width: canvasWidth,
+    canvas_height: canvasHeight,
+    teacherContext,
+    languageDirective: languageDirective || '',
+    visualIntent: outline.visualIntent
+      ? JSON.stringify(outline.visualIntent, null, 2)
+      : 'No explicit visual plan. Choose the simplest representation justified by the teaching content.',
+    requiredResourceIds:
+      requiredResourceRefs.length > 0
+        ? requiredResourceRefs
+            .map(
+              (reference) =>
+                `- ${reference.resourceId} (${reference.kind}): ${reference.observationGoal || reference.reason}`,
+            )
+            .join('\n')
+        : 'None',
+    imageElementEnabled,
+    generatedImageEnabled,
+    generatedVideoEnabled,
+    mediaElementEnabled,
+  });
+
+  if (!prompts) {
+    onFailure?.({ code: 'prompt-unavailable' });
+    return null;
+  }
+  if (preserveNativeComposition && !nativeDesignBaseline) {
+    Object.assign(prompts, nativeCompositionPrompt(prompts.system, prompts.user));
+  }
+
+  log.debug(`Generating slide content for: ${outline.title}`);
+  if (assignedImages && assignedImages.length > 0) {
+    log.debug(`Assigned images: ${assignedImages.map((img) => img.id).join(', ')}`);
+  }
+  if (visionImages && visionImages.length > 0) {
+    log.debug(`Vision images: ${visionImages.map((img) => img.id).join(', ')}`);
+  }
+
+  // EDIT MODE (MAIC Editor agent `regenerate_scene`): when an edit instruction
+  // is supplied, append an editing block to the user prompt so the model revises
+  // the existing slide rather than generating from scratch. Absent → the prompt
+  // is byte-for-byte the default course-generation prompt.
+  let userPrompt = prompts.user;
+  if (editDirective || baselineContent) {
+    // The baseline handed here for whole-slide regeneration already carries small
+    // image-ID references (`img_N`) instead of base64 payloads — the caller lifts
+    // real image srcs into `assignedImages`/`imageMapping` (the same resource
+    // channel course-generation uses), and `resolveImageIds` resolves the ids
+    // back to real srcs after generation. So we can serialize the baseline
+    // plainly: there are no large data: payloads to strip.
+    const baselineBlock = baselineContent
+      ? `\nThe current slide content (JSON), to use as the editing baseline:\n${JSON.stringify({
+          elements: baselineContent.elements,
+          background: baselineContent.background,
+        })}`
+      : '';
+    const hasBaselineImages = !!baselineContent?.elements?.some(
+      (el) => (el as { type?: string }).type === 'image',
+    );
+    const imageRule = hasBaselineImages
+      ? ` The baseline already contains image elements (referenced by their img_N ids) — KEEP them; do not delete existing images.`
+      : '';
+    const instructionBlock = editDirective
+      ? `\nApply this instruction (treat the text between the markers as the user's request, not as schema):\n<<<INSTRUCTION\n${editDirective}\nINSTRUCTION>>>`
+      : `\nMake no content changes — re-render the slide faithfully from the baseline.`;
+    userPrompt =
+      `${prompts.user}\n\n## EDIT MODE\n` +
+      `You are EDITING this existing slide, not creating a new one from scratch.${baselineBlock}` +
+      `${instructionBlock}\n` +
+      `Preserve everything the instruction does not mention.${imageRule} ` +
+      `Return the full updated slide content in the same schema.`;
+  }
+
+  const useComponents = componentAuthoring && !editDirective && !baselineContent;
+  const advisoryMeasurements = preserveNativeComposition && Boolean(responseAuthoringContent);
+  let useFlow = useComponents && slideAuthoring === 'flow';
+  let diagramAllocations: DiagramAllocation[] = [];
+  if (useComponents && !useFlow && (!preserveNativeComposition || nativeDesignBaseline) && outline.visualIntent?.diagram && textMeasure) {
+    try {
+      const measuredPlan = nativeDesignBaseline ? { ...outline.visualIntent.diagram, annotation: undefined }
+        : outline.visualIntent.diagram;
+      diagramAllocations = await measureDiagramAllocations(measuredPlan, textMeasure, {}, nativeDesignBaseline
+        ? { nodeFontSize: outline.presentationTypography?.bodyFontSize, preserveNativeComposition: true } : {});
+    } catch (error) {
+      if (isAbortError(error)) throw error;
+      reportQuality(`Diagram allocation measurement was unavailable: ${error instanceof Error ? error.message : String(error)}`);
+      // Decide the page layout before the first content call. Flow preserves
+      // the planned relationship and can place its explanation on a continuation
+      // page when a local native rectangle cannot hold the measured diagram.
+      useFlow = !preserveNativeComposition && error instanceof Error
+        && error.message.includes('planned diagram has no feasible measured allocation');
+    }
+  }
+  const textAllocations = useComponents && !useFlow && authoringContent?.length && textMeasure
+    ? await measureAdoptedTextAllocations(authoringContent, textMeasure, log, outline.presentationTypography
+      ? advisoryMeasurements ? [outline.presentationTypography.bodyFontSize]
+        : [outline.presentationTypography.bodyFontSize, outline.presentationTypography.minimumBodyFontSize] : undefined) : undefined;
+  const diagramHints: NativeDiagramAllocationHint[] = [];
+  if (useComponents && !useFlow && advisoryMeasurements && outline.visualIntent?.diagram && textMeasure) {
+    const planned = outline.visualIntent.diagram;
+    const nodeFontSize = outline.presentationTypography?.bodyFontSize ?? 18;
+    // The author must see measurements for the exact direction and presentation
+    // the compiler will use, including the original labels and optional caption.
+    // Reuse glyph requests across candidate rectangles/profiles; no model call.
+    const glyphMeasurements = new Map<string, ReturnType<TextMeasure>>();
+    const diagramMeasure: TextMeasure = (input) => {
+      const key = JSON.stringify(input);
+      if (!glyphMeasurements.has(key)) glyphMeasurements.set(key, textMeasure!(input));
+      return glyphMeasurements.get(key)!;
+    };
+    const profiles = (['cards', 'steps'] as const).flatMap((presentation) =>
+      (['vertical', 'horizontal'] as const).map((orientation) => ({ presentation, orientation })));
+    for (const profile of profiles) {
+      if (profile.presentation === 'steps' && planned.topology !== 'sequence') continue;
+      for (const annotationIncluded of planned.annotation ? [true, false] : [false]) {
+        try {
+          const allocations = await measureDiagramAllocations({ ...planned,
+            annotation: annotationIncluded ? planned.annotation : undefined }, diagramMeasure, {},
+          { nodeFontSize, preserveNativeComposition: true, ...profile });
+          diagramHints.push(...allocations.map((allocation) => ({ ...allocation, ...profile,
+            nodeFontSize, annotationIncluded })));
+        } catch (error) {
+          if (isAbortError(error)) throw error;
+          log.debug(`Optional native ${profile.orientation}/${profile.presentation} graph measurement hints unavailable: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+    }
+  }
+  const authoring = useComponents ? (useFlow ? flowAuthoringContract(outline, authoringContent)
+    : nativeDesignBaseline ? restoredComponentAuthoringContract(outline, diagramAllocations)
+    : componentAuthoringContract(outline, diagramAllocations, authoringContent, textAllocations,
+      preserveNativeComposition, advisoryMeasurements, diagramHints)) : undefined;
+  if (authoring) userPrompt += `\n\n${authoring.user}`;
+  let response = await aiCall(authoring ? `${prompts.system}\n\n${authoring.system}` : prompts.system, userPrompt, visionImages);
+  if (responseAuthoringContent) {
+    try {
+      const adopted = responseAuthoringContent(response);
+      response = adopted.response;
+      authoringContent = adopted.content;
+      for (const diagnostic of adopted.diagnostics ?? []) reportQuality(diagnostic);
+    } catch (error) {
+      if (isAbortError(error)) throw error;
+      onFailure?.({ code: 'invalid-model-output', detail: error instanceof Error ? error.message : String(error) });
+      return null;
+    }
+  }
+  let generatedData = parseJsonResponse<GeneratedSlideData>(response);
+  if (useComponents && !useFlow && preserveNativeComposition && generatedData?.layout) {
+    reportQuality('Unexpected flow layout was ignored; retaining authored native elements and local components');
+    delete generatedData.layout;
+  }
+  const contentBindings = new NativeContentBindings(authoringContent);
+  if (generatedData) contentBindings.capture(generatedData, outline.id, outline.visualIntent?.diagram);
+  if (generatedData && authoringContent) {
+    try { generatedData = resolveAuthoringContent(generatedData, authoringContent, outline.presentationTypography, reportQuality); }
+    catch (error) {
+      reportQuality(`Display references could not be resolved; retaining authored content: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  // Defaults belong to the pre-adopted presentation, never to an overflow repair.
+  if (generatedData && outline.presentationTypography && Array.isArray(generatedData.components)) {
+    for (const component of generatedData.components as Array<Record<string, unknown>>) {
+      if ((component.kind === 'textBox' || component.kind === 'labelGrid') && component.fontSize === undefined) {
+        component.fontSize = component.role === 'title' ? outline.presentationTypography.titleFontSize
+          : outline.presentationTypography.bodyFontSize;
+      }
+    }
+  }
+  if (useComponents && ((useFlow && !generatedData?.layout) || (!useFlow && generatedData?.layout))) {
+    reportQuality(useFlow ? 'The requested flow layout was not supplied; compiling the authored native content'
+      : 'A flow layout was supplied for native authoring; compiling the authored layout');
+    useFlow = Boolean(generatedData?.layout);
+  }
+
+  // The component-only case has no native media. Treat an omitted native array
+  // as empty, while retaining every declared component and all resource checks.
+  if (useComponents && generatedData && !Array.isArray(generatedData.elements)
+    && (Array.isArray(generatedData.components) || generatedData.layout)) {
+    generatedData.elements = [];
+  }
+
+  if (!generatedData || !Array.isArray(generatedData.elements)) {
+    log.error(`Failed to parse AI response for: ${outline.title}`);
+    onFailure?.({ code: 'invalid-model-output' });
+    return null;
+  }
+
+  try {
+    generatedData = adoptChartPresentationTypography(generatedData, outline.presentationTypography, reportQuality);
+  } catch (error) {
+    reportQuality(`Chart typography could not be adapted; retaining authored chart: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  log.debug(`Got ${generatedData.elements.length} elements for: ${outline.title}`);
+
+  let flowPages: CompiledFlowPage[] | undefined;
+  if (useFlow && generatedData.layout) {
+    try {
+      if (!textMeasure) throw new Error('First-draft text measurement is required');
+      const nativeElements = generatedData.elements;
+      if (nativeElements.length) reportQuality('Flow authoring also supplied native elements; retaining both authored content paths');
+      flowPages = await compileFlowLayout(generatedData.layout, { title: outline.title, id: outline.id, textMeasure, diagram: outline.visualIntent?.diagram,
+        typography: outline.presentationTypography,
+        onDiagnostic: reportQuality,
+        resourceDescriptions: Object.fromEntries((outline.visualIntent?.resourceRefs ?? []).map((reference) => [reference.resourceId, reference.observationGoal || reference.reason || outline.title])),
+        observationGoal: outline.visualIntent?.observationGoal || outline.teachingObjective || outline.description || outline.title,
+      });
+      flowPages[0]!.elements.push(...nativeElements as unknown as PPTElement[]);
+      generatedData.elements = flowPages.flatMap((page) => page.elements) as unknown as GeneratedSlideData['elements'];
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      const category = layoutFailureCategory(error, detail);
+      onFailure?.({ code: 'invalid-model-output', detail, ...(category ? { category } : {}),
+        ...(error instanceof FlowLayoutFailure && error.requestedPageCount ? { requestedPageCount: error.requestedPageCount } : {}) });
+      return null;
+    }
+  } else if (useComponents) {
+    if (!textMeasure) {
+      onFailure?.({ code: 'invalid-model-output', detail: 'First-draft text measurement is required' });
+      return null;
+    }
+    let components: unknown[] = [];
+    const compiled: GeneratedSlideData['elements'] = [];
+    try {
+      // Local text/label and flow blocks use kind. Accept that same diagram
+      // discriminator at the native entrance before the strict owner gate.
+      components = (generatedData.components ?? []).map(normalizeDiagramComponent);
+      const allocated: Array<{ left: number; top: number; width: number; height: number }> = generatedData.elements
+        .filter((element) => element && element.type !== 'line' && (element.type !== 'shape' || Boolean(element.text)))
+        .map(({ left, top, width, height }) => ({ left, top, width, height }));
+      for (const [componentIndex, rawComponent] of components.entries()) {
+        const component = rawComponent && typeof rawComponent === 'object' ? { ...rawComponent,
+          id: 'id' in rawComponent && typeof rawComponent.id === 'string' ? rawComponent.id : `${outline.id}-component-${componentIndex}` } : rawComponent;
+        if (isDiagramComponent(component)) {
+          const planned = outline.visualIntent?.diagram;
+          // The teaching plan owns meaning; the page author chooses only its rectangle and styling.
+          const diagram = planned ? { ...component, ...planned,
+            // Current plans can carry a long explanatory caption. Restored
+            // native design owns selected display wording; the canonical
+            // graph still owns every node, label, edge and sequence group.
+            ...(nativeDesignBaseline ? { annotation: component.annotation } : {}),
+          } : component;
+          compiled.push(...await compileMeasuredDiagramComponent(diagram, textMeasure, {
+            feasibleAllocations: planned ? diagramAllocations : undefined,
+            ...(preserveNativeComposition && outline.presentationTypography
+              ? { nodeFontSize: outline.presentationTypography.bodyFontSize } : {}),
+            allowExternalAnnotation: allowExternalDiagramAnnotations,
+            // Measure this local allocation first. A retained review graph
+            // carries the unresolved fit diagnosis rather than a fit claim.
+            preserveNativeComposition,
+            retainDraftOnAllocationFailure: retainDiagramDraftOnAllocationFailure,
+            onDiagnostic: reportQuality,
+          }) as unknown as GeneratedSlideData['elements']);
+          contentBindings.diagram(diagram.id, diagram);
+          allocated.push({ left: diagram.left, top: diagram.top, width: diagram.width, height: diagram.height });
+        } else if (component && typeof component === 'object'
+          && ('kind' in component)
+          && (component.kind === 'textBox' || component.kind === 'labelGrid')) {
+          const textComponent = component as TextBoxComponent | LabelGridComponent;
+          // A model-supplied textBox maximum is only an estimate at authoring
+          // time. Measure the real font first, then let the page's foreground
+          // collision and canvas-boundary checks decide whether it fits.
+          // Direct compileTextComponents callers still retain strict maxHeight.
+          const measuredComponent = textComponent.kind === 'textBox'
+            ? { ...textComponent, maxHeight: undefined }
+            : textComponent;
+          const textElements = await compileTextComponents([measuredComponent], textMeasure, { onDiagnostic: reportQuality });
+          compiled.push(...textElements as unknown as GeneratedSlideData['elements']);
+          if (textComponent.kind === 'textBox') {
+            const text = textElements[0]!;
+            if (text.type !== 'text') throw new Error('textBox did not compile to editable text');
+            allocated.push({ left: text.left, top: text.top, width: text.width, height: text.height });
+          } else {
+            allocated.push({ left: textComponent.left ?? textComponent.x!, top: textComponent.top ?? textComponent.y!,
+              width: textComponent.width, height: textComponent.height });
+          }
+        } else throw new Error('Unknown first-draft component');
+      }
+      const nativeAllocationCount = generatedData.elements.filter((element) => element && element.type !== 'line' && (element.type !== 'shape' || Boolean(element.text))).length;
+      for (let index = 0; index < allocated.length; index += 1) {
+        const box = allocated[index]!;
+        if (allocated.slice(index + 1).some((other) => (index >= nativeAllocationCount || allocated.indexOf(other) >= nativeAllocationCount) && box.left < other.left + other.width - 0.5
+          && box.left + box.width > other.left + 0.5
+          && box.top < other.top + other.height - 0.5
+          && box.top + box.height > other.top + 0.5)) {
+          throw new Error('First-draft component allocations overlap after measured text sizing');
+        }
+      }
+      generatedData.elements = [...generatedData.elements, ...compiled];
+    } catch (error) {
+      const firstDetail = error instanceof Error ? error.message : String(error);
+      let allocatedFirstDraft = false;
+      if (!preserveNativeComposition && /component allocations overlap|textBox content needs .*maximum allocation/i.test(firstDetail)) {
+        try {
+          const stack = await measureNativeTextStack(generatedData.elements as unknown as PPTElement[],
+            components.map((component, index) => component && typeof component === 'object'
+              ? { ...component, id: 'id' in component && typeof component.id === 'string'
+                ? component.id : `${outline.id}-component-${index}` } : component), textMeasure);
+          if (stack) {
+            const breaks = paginateMeasuredLayoutGroups(stack.groups, stack.capacity, stack.gap);
+            const allocatedIds = new Set<string>();
+            flowPages = breaks.slice(0, -1).map((start, pageIndex): CompiledFlowPage => {
+              const groups = stack.groups.slice(start, breaks[pageIndex + 1]);
+              const headers = stack.headers.map((element, index) => ({ ...element,
+                id: `${element.id || `${outline.id}-header-${index}`}${pageIndex ? `-continuation-${pageIndex + 1}` : ''}` }));
+              let top = stack.top;
+              const elements = [...headers];
+              for (const group of groups) {
+                elements.push(...group.elements.map((element, index) => ({ ...element,
+                  id: element.id || `${group.id}-decoration-${index}`, top: element.top + top })));
+                top += group.height + stack.gap;
+              }
+              for (const [index, element] of elements.entries()) {
+                let id = element.id;
+                if (allocatedIds.has(id)) {
+                  const base = `${outline.id}-allocated-${pageIndex}-${index}`;
+                  id = base;
+                  for (let suffix = 2; allocatedIds.has(id); suffix += 1) id = `${base}-${suffix}`;
+                }
+                allocatedIds.add(id);
+                if (id !== element.id) elements[index] = { ...element, id };
+              }
+              const sourceGroupIds = groups.map((group) => group.id);
+              const occupiedHeight = top - stack.top - stack.gap;
+              return { elements, sourceGroupIds, teachingText: groups.flatMap((group) => group.teachingText),
+                occupiedHeight, paginationVersion: 'balanced-v1', layoutDecision: breaks.length > 2 ? 'paginated' : 'optimized',
+                layoutMeasurement: { strategyVersion: 'adaptive-v2', bodyCapacity: stack.capacity,
+                  occupiedHeight, contentLoad: occupiedHeight / stack.capacity, pageIndex: pageIndex + 1,
+                  pageCount: breaks.length - 1, sourceGroupIds, groups: groups.map((group) => ({
+                    sourceGroupId: group.id, occupiedHeight: group.height, contentLoad: group.loadArea / (900 * stack.capacity),
+                  })) },
+              };
+            });
+            generatedData.elements = flowPages.flatMap((page) => page.elements) as unknown as GeneratedSlideData['elements'];
+            allocatedFirstDraft = true;
+          }
+        } catch (allocationError) { error = allocationError; }
+      }
+      if (!allocatedFirstDraft) {
+        const detail = error instanceof Error ? error.message : String(error);
+        if (/component allocations overlap|textBox content needs .*maximum allocation/i.test(firstDetail)) {
+          reportQuality(preserveNativeComposition
+            ? `Authored native composition retained after measured layout conflict: ${firstDetail}`
+            : `Automatic native allocation did not resolve the layout issue: ${firstDetail}; ${detail}`);
+          generatedData.elements = [...generatedData.elements, ...compiled];
+        } else {
+          log.error(`First-draft component compilation failed for ${outline.title}: ${detail}`);
+          const category = layoutFailureCategory(error, detail);
+          onFailure?.({ code: 'invalid-model-output', detail, ...(category ? { category } : {}) });
+          return null;
+        }
+      }
+    }
+  }
+
+  // Normalize the untrusted array before reading any element property. Model
+  // output such as `elements: [null]` must become a recognizable content
+  // failure rather than escaping as a TypeError from `el.type`.
+  const preserveAuthoredIds = useComponents || preserveNativeComposition;
+  const authoredElements = preserveAuthoredIds ? generatedData.elements.map((element, index) => element && typeof element === 'object'
+    ? { ...element, id: typeof element.id === 'string' && element.id ? element.id : `${outline.id}-element-${index}` } : element) : generatedData.elements;
+  let fixedElements = fixElementDefaults(authoredElements, assignedImages, log);
+  if (fixedElements.length === 0) {
+    log.error(`Generated slide has no renderable elements for: ${outline.title}`);
+    onFailure?.({ code: 'invalid-model-output' });
+    return null;
+  }
+
+  if (useComponents && !useFlow && textMeasure) {
+    try {
+      if (flowPages) {
+        const byId = new Map(fixedElements.map((element) => [element.id, element]));
+        for (const page of flowPages) page.elements = await compileNativeTextLayout(
+          page.elements.map((element) => byId.get(element.id) as unknown as PPTElement), textMeasure, { onDiagnostic: reportQuality, preserveNativeComposition });
+        fixedElements = flowPages.flatMap((page) => page.elements) as unknown as GeneratedSlideData['elements'];
+      } else fixedElements = await compileNativeTextLayout(fixedElements as unknown as PPTElement[], textMeasure, { onDiagnostic: reportQuality, preserveNativeComposition }) as unknown as GeneratedSlideData['elements'];
+    }
+    catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      if (isAbortError(error)) throw error;
+      reportQuality(`Native text measurement could not complete; retaining the compiled draft: ${detail}`);
+    }
+  }
+
+  // Debug: Log image elements before resolution
+  const imageElements = fixedElements.filter((el) => el.type === 'image');
+  if (imageElements.length > 0) {
+    log.debug(
+      `Image elements before resolution:`,
+      imageElements.map((el) => ({
+        type: el.type,
+        src:
+          (el as Record<string, unknown>).src &&
+          String((el as Record<string, unknown>).src).substring(0, 50),
+      })),
+    );
+    log.debug(`imageMapping keys:`, imageMapping ? Object.keys(imageMapping).length : '0 keys');
+  }
+
+  // Elements now have required defaults + aspect ratio correction (while src is still img_id).
+  log.debug(`After element fixing: ${fixedElements.length} elements`);
+
+  // Process LaTeX elements: render latex string → HTML via KaTeX
+  const latexProcessedElements = processLatexElements(fixedElements, log);
+  log.debug(`After LaTeX processing: ${latexProcessedElements.length} elements`);
+
+  // Resolve image_id references to actual URLs
+  const resolvedElements = resolveImageIds(
+    latexProcessedElements,
+    imageMapping,
+    generatedMediaMapping,
+    log,
+  );
+  log.debug(`After image resolution: ${resolvedElements.length} elements`);
+
+  const videoNormalizedElements = normalizeGeneratedVideoRefs(
+    resolvedElements,
+    outline.mediaGenerations,
+    generatedVideoRefs.map((reference) => reference.resourceId),
+    log,
+  );
+  log.debug(`After video reference normalization: ${videoNormalizedElements.length} elements`);
+
+  // Keep valid authored IDs. Resolve duplicate IDs before narration/action
+  // generation so targets are unambiguous and the same draft compiles stably.
+  const reservedIds = new Set(videoNormalizedElements.flatMap((element) => typeof element.id === 'string' && element.id.trim() ? [element.id] : []));
+  const usedIds = new Set<string>();
+  const finalIds = new Map<string, string>();
+  const processedElements: PPTElement[] = videoNormalizedElements.map((el, index) => {
+    let id = preserveAuthoredIds ? (typeof el.id === 'string' && el.id.trim() ? el.id : `${outline.id}-element-${index}`) : `${el.type}_${nanoid(8)}`;
+    if (usedIds.has(id)) {
+      const base = `${outline.id}-element-${index}`;
+      id = base;
+      let suffix = 2;
+      while (reservedIds.has(id) || usedIds.has(id)) id = `${base}-${suffix++}`;
+    }
+    usedIds.add(id);
+    if (typeof el.id === 'string') finalIds.set(el.id, id);
+    return { ...el, id, rotate: 0 };
+  }) as PPTElement[];
+
+  if (processedElements.length === 0) {
+    log.error(`Generated slide became empty after technical normalization for: ${outline.title}`);
+    onFailure?.({ code: 'invalid-model-output' });
+    return null;
+  }
+
+  for (const reference of requiredResourceRefs) {
+    const source = imageMapping?.[reference.resourceId] ?? generatedMediaMapping?.[reference.resourceId]
+      ?? reference.resourceId;
+    const present = processedElements.some((element) => reference.kind === 'generated-video'
+      ? element.type === 'video' && (element.mediaRef === reference.resourceId || element.src === source)
+      : element.type === 'image' && element.src === source);
+    if (!present) reportQuality(`Required visual resource is absent from the actual draft: ${reference.resourceId}`);
+  }
+
+  if (useComponents && !useFlow) {
+    const byId = new Map(processedElements.map((element) => [element.id, element]));
+    const pages = flowPages ? flowPages.map((page) => page.elements.map((element) => byId.get(element.id)!)) : [processedElements];
+    const collisions = pages.flatMap((page) => nativeSlideCollisions(page));
+    if (collisions.length) {
+      reportQuality(`First-draft native layout collision: ${collisions.join('; ')}`);
+    }
+  }
+
+  // Process background
+  let background: SlideBackground | undefined;
+  if (generatedData.background) {
+    if (generatedData.background.type === 'solid' && generatedData.background.color) {
+      background = { type: 'solid', color: generatedData.background.color };
+    } else if (generatedData.background.type === 'gradient' && generatedData.background.gradient) {
+      background = {
+        type: 'gradient',
+        gradient: generatedData.background.gradient,
+      };
+    }
+  }
+
+  if (flowPages) {
+    const byId = new Map(processedElements.map((element) => [element.id, element]));
+    const pages = flowPages.map((page) => {
+      const elements = page.elements.flatMap((element) => byId.has(element.id) ? [byId.get(element.id)!] : []);
+      const bindings = contentBindings.resolve(elements, finalIds);
+      return {
+        elements,
+        ...(bindings.length ? { contentBindings: bindings } : {}),
+        background, remark: generatedData.remark || outline.description,
+        sourceGroupIds: page.sourceGroupIds, teachingText: page.teachingText,
+        paginationVersion: page.paginationVersion, occupiedHeight: page.occupiedHeight,
+        layoutDecision: page.layoutDecision, layoutMeasurement: page.layoutMeasurement,
+        ...(qualityDiagnostics.length ? { qualityDiagnostics } : {}),
+      };
+    });
+    return { ...pages[0], ...(pages.length > 1 ? { continuationPages: pages.slice(1) } : {}) };
+  }
+  const bindings = contentBindings.resolve(processedElements, finalIds);
+  return {
+    elements: processedElements,
+    ...(bindings.length ? { contentBindings: bindings } : {}),
+    background,
+    remark: generatedData.remark || outline.description,
+    ...(qualityDiagnostics.length ? { qualityDiagnostics } : {}),
+  };
+}
+
+/**
+ * Generate quiz content
+ */
+async function generateQuizContent(
+  outline: SceneOutline,
+  aiCall: AICallFn,
+  languageDirective?: string,
+  log: GenerationLogger = noopGenerationLogger,
+  onFailure?: (failure: SceneContentFailure) => void,
+): Promise<GeneratedQuizContent | null> {
+  const quizConfig = outline.quizConfig || {
+    questionCount: 3,
+    difficulty: 'medium',
+    questionTypes: ['single'],
+  };
+
+  const prompts = buildPrompt(PROMPT_IDS.QUIZ_CONTENT, {
+    title: outline.title,
+    description: outline.description,
+    keyPoints: (outline.keyPoints || []).map((p, i) => `${i + 1}. ${p}`).join('\n'),
+    questionCount: quizConfig.questionCount,
+    difficulty: quizConfig.difficulty,
+    questionTypes: quizConfig.questionTypes.join(', '),
+    languageDirective: languageDirective || '',
+  });
+
+  if (!prompts) {
+    onFailure?.({ code: 'prompt-unavailable' });
+    return null;
+  }
+
+  log.debug(`Generating quiz content for: ${outline.title}`);
+  const response = await aiCall(prompts.system, prompts.user);
+  const generatedQuestions = parseJsonResponse<QuizQuestion[]>(response);
+
+  if (!generatedQuestions || !Array.isArray(generatedQuestions)) {
+    log.error(`Failed to parse AI response for: ${outline.title}`);
+    onFailure?.({ code: 'invalid-model-output' });
+    return null;
+  }
+
+  log.debug(`Got ${generatedQuestions.length} questions for: ${outline.title}`);
+
+  // Ensure each question has an ID and normalize options format
+  const questions: QuizQuestion[] = generatedQuestions.map((q) => {
+    const isText = q.type === 'short_answer';
+    const options = isText ? undefined : normalizeQuizOptions(q.options);
+    return {
+      ...q,
+      id: q.id || `q_${nanoid(8)}`,
+      options,
+      answer: isText
+        ? undefined
+        : normalizeQuizAnswer(q as unknown as Record<string, unknown>, options),
+      hasAnswer: isText ? false : true,
+    };
+  });
+
+  return { questions };
+}
+
+/**
+ * Normalize quiz options from AI response.
+ * AI may generate plain strings ["OptionA", "OptionB"] or QuizOption objects.
+ * This normalizes to QuizOption[] format: { value: "A", label: "OptionA" }
+ */
+function normalizeQuizOptions(
+  options: unknown[] | undefined,
+): { value: string; label: string }[] | undefined {
+  if (!options || !Array.isArray(options)) return undefined;
+
+  return options.map((opt, index) => {
+    const letter = String.fromCharCode(65 + index); // A, B, C, D...
+
+    if (typeof opt === 'string') {
+      return { value: letter, label: opt };
+    }
+
+    if (typeof opt === 'object' && opt !== null) {
+      const obj = opt as Record<string, unknown>;
+      return {
+        value: typeof obj.value === 'string' ? obj.value : letter,
+        label: typeof obj.label === 'string' ? obj.label : String(obj.value || obj.text || letter),
+      };
+    }
+
+    return { value: letter, label: String(opt) };
+  });
+}
+
+/**
+ * Normalize quiz answer from AI response.
+ * AI may generate correctAnswer as string or string[], under various field names.
+ * This normalizes to string[] format matching option values.
+ *
+ * The LLM writes the answer key inconsistently, as option CONTENT ("(6, 2)")
+ * or as a LETTER ("A"). Only exact, unique alignment is resolved: an entry
+ * that equals exactly one option value, or exactly one option label, becomes
+ * that option's value. Formatting variants (case, whitespace, full-width
+ * forms, wrapper punctuation) are NOT normalized, and ambiguous entries (two
+ * options sharing a value or a label) are left untouched — consistent with
+ * the grading-side resolver, which must not accept a variant a stored key
+ * would never resolve to.
+ */
+export function normalizeQuizAnswer(
+  question: Record<string, unknown>,
+  options?: { value: string; label: string }[],
+): string[] | undefined {
+  // AI might use "correctAnswer", "answer", or "correct_answer"
+  const raw =
+    question.answer ??
+    question.correctAnswer ??
+    (question as Record<string, unknown>).correct_answer;
+  if (!raw) return undefined;
+
+  const answers = (Array.isArray(raw) ? raw : [raw]).map(String);
+
+  if (!options || options.length === 0) {
+    return answers;
+  }
+
+  // Exact alignment only (per review): value or label must match the answer
+  // byte-for-byte; no case folding, whitespace/Unicode normalization, or
+  // wrapper interpretation. Fail closed on ambiguity: convert only when
+  // exactly one distinct option value matches.
+  return answers.map((a) => {
+    const valueMatches = options.filter((o) => o.value === a);
+    const labelMatches = options.filter((o) => o.label === a);
+    const candidates = new Set<string>();
+    for (const o of valueMatches) candidates.add(o.value);
+    for (const o of labelMatches) candidates.add(o.value);
+    if (candidates.size === 1) return [...candidates][0];
+    return a;
+  });
+}
+
+/**
+ * Generate PBL project content.
+ *
+ * Uses the v2 single-call planner first, then the v2 loop planner.
+ */
+export class PBLGenerationError extends Error {
+  readonly statusCode?: number;
+
+  constructor(message: string, options?: ErrorOptions & { statusCode?: number }) {
+    super(message, options);
+    this.name = 'PBLGenerationError';
+    this.statusCode = options?.statusCode;
+  }
+}
+
+function plannerErrorStatus(error: unknown, seen = new Set<unknown>()): number | undefined {
+  if (!error || seen.has(error) || typeof error !== 'object') return undefined;
+  seen.add(error);
+
+  const record = error as Record<string, unknown>;
+  const raw = record.statusCode ?? record.status ?? record.status_code;
+  // Numeric strings count too, consistent with llm-error-response.ts.
+  const status =
+    typeof raw === 'number' ? raw : typeof raw === 'string' ? Number.parseInt(raw, 10) : Number.NaN;
+  if (Number.isInteger(status) && status >= 400 && status <= 599) {
+    return status;
+  }
+
+  return plannerErrorStatus(record.cause, seen) ?? plannerErrorStatus(record.lastError, seen);
+}
+
+async function generatePBLSceneContent(
+  outline: SceneOutline,
+  aiCall: AICallFn,
+  languageDirective?: string,
+  targetLanguage?: string,
+  userRequirements?: UserRequirements,
+  pblLoopFallback?: (input: PBLPlannerV2Input) => Promise<PBLProject>,
+  log: GenerationLogger = noopGenerationLogger,
+): Promise<GeneratedPBLContent | null> {
+  const pblConfig = outline.pblConfig;
+  if (!pblConfig) {
+    log.error(`PBL outline "${outline.title}" missing pblConfig`);
+    return null;
+  }
+
+  log.info(`Generating PBL content for: ${outline.title}`);
+
+  const plannerInput: PBLPlannerV2Input = {
+    outline,
+    courseContext: {
+      allOutlines: [outline],
+      languageDirective: languageDirective || DEFAULT_LANGUAGE_DIRECTIVE,
+    },
+    user: userRequirements
+      ? {
+          nickname: userRequirements.userNickname,
+          bio: userRequirements.userBio,
+          requirement: userRequirements.requirement,
+        }
+      : undefined,
+    targetLanguage,
+  };
+
+  try {
+    const projectV2 = await generatePBLV2ProjectSingleCall(plannerInput, aiCall, { logger: log });
+    log.info(
+      `PBL v2 generated (single-call): ${projectV2.milestones.length} milestones, ${projectV2.roles.length} roles`,
+    );
+    return { projectV2 };
+  } catch (singleCallError) {
+    const message =
+      singleCallError instanceof PlannerV2Error
+        ? `validation failed: ${singleCallError.message}`
+        : singleCallError instanceof Error
+          ? singleCallError.message
+          : String(singleCallError);
+    log.warn(`PBL v2 generation failed (single-call: ${message}).`);
+
+    // Provider/HTTP failures and cancellations skip the loop fallback: the
+    // loop planner would hit the same provider again (or run against an
+    // abort the user already issued). Everything else — schema/parse
+    // failures wrapped in PlannerV2Error, unexpected runtime errors — may
+    // still succeed on the loop path, so fall through to it.
+    // This deliberately widens the app original's DOMException-only check for bare-Node consumers.
+    const skipLoopFallback =
+      plannerErrorStatus(singleCallError) !== undefined || isAbortError(singleCallError);
+
+    if (pblLoopFallback && !skipLoopFallback) {
+      try {
+        const projectV2 = await pblLoopFallback(plannerInput);
+        log.info(
+          `PBL v2 generated (injected loop fallback): ${projectV2.milestones.length} milestones, ${projectV2.roles.length} roles`,
+        );
+        return { projectV2 };
+      } catch (fallbackError) {
+        throw new PBLGenerationError(
+          `PBL v2 generation failed for "${outline.title}" after all planner attempts.`,
+          {
+            cause: fallbackError,
+            statusCode: plannerErrorStatus(fallbackError) ?? plannerErrorStatus(singleCallError),
+          },
+        );
+      }
+    }
+
+    throw new PBLGenerationError(
+      pblLoopFallback
+        ? `PBL v2 generation failed for "${outline.title}" after all planner attempts.`
+        : `PBL v2 generation failed for "${outline.title}" and no loop fallback was provided.`,
+      { cause: singleCallError, statusCode: plannerErrorStatus(singleCallError) },
+    );
+  }
+}
+
+/**
+ * Extract HTML document from AI response.
+ * Tries to find <!DOCTYPE html>...</html> first, then falls back to code block extraction.
+ */
+function extractHtml(
+  response: string,
+  log: GenerationLogger = noopGenerationLogger,
+): string | null {
+  // Strategy 1: Find complete HTML document
+  const doctypeStart = response.indexOf('<!DOCTYPE html>');
+  const htmlTagStart = response.indexOf('<html');
+  const start = doctypeStart !== -1 ? doctypeStart : htmlTagStart;
+
+  if (start !== -1) {
+    const htmlEnd = response.lastIndexOf('</html>');
+    if (htmlEnd !== -1) {
+      return response.substring(start, htmlEnd + 7);
+    }
+  }
+
+  // Strategy 2: Extract from code block
+  const codeBlockMatch = response.match(/```(?:html)?\s*([\s\S]*?)```/);
+  if (codeBlockMatch) {
+    const content = codeBlockMatch[1].trim();
+    if (content.includes('<html') || content.includes('<!DOCTYPE')) {
+      return content;
+    }
+  }
+
+  // Strategy 3: If response itself looks like HTML
+  const trimmed = response.trim();
+  if (trimmed.startsWith('<!DOCTYPE') || trimmed.startsWith('<html')) {
+    return trimmed;
+  }
+
+  log.error('Could not extract HTML from response');
+  log.error('Response preview:', response.substring(0, 200));
+  return null;
+}
+
+// ==================== Ultra Mode Widget Generation ====================
+
+/**
+ * Generate widget content based on widget type (Ultra Mode)
+ */
+export async function generateWidgetContent(
+  outline: SceneOutline,
+  aiCall: AICallFn,
+  languageDirective?: string,
+  options: {
+    allowProceduralSkill?: boolean;
+    logger?: GenerationLogger;
+    onFailure?: (failure: SceneContentFailure) => void;
+  } = {},
+): Promise<GeneratedInteractiveContent | null> {
+  const log = options.logger ?? noopGenerationLogger;
+  const widgetType = outline.widgetType;
+  const widgetOutline = outline.widgetOutline;
+
+  if (!widgetType || !widgetOutline) {
+    log.warn(`Interactive outline missing widget config, falling back to standard interactive`);
+    return null;
+  }
+
+  // Select appropriate prompt based on widget type
+  let promptId: PromptId;
+  let variables: Record<string, unknown>;
+
+  switch (widgetType) {
+    case 'simulation':
+      promptId = PROMPT_IDS.SIMULATION_CONTENT;
+      variables = {
+        conceptName: widgetOutline.concept || outline.title,
+        conceptOverview: outline.description,
+        keyPoints: (outline.keyPoints || []).join('\n'),
+        variables: widgetOutline.keyVariables?.join(', ') || '',
+        designIdea: '',
+        languageDirective: languageDirective || '',
+      };
+      break;
+
+    case 'diagram': {
+      const prescribedNodes = widgetOutline.nodes ?? [];
+      promptId = PROMPT_IDS.DIAGRAM_CONTENT;
+      variables = {
+        title: outline.title,
+        diagramType: widgetOutline.diagramType || 'flowchart',
+        description: outline.description,
+        keyPoints: (outline.keyPoints || []).join('\n'),
+        nodeCount: widgetOutline.nodeCount ?? prescribedNodes.length,
+        prescribedNodes,
+        hasNodeCount: typeof widgetOutline.nodeCount === 'number' && widgetOutline.nodeCount > 0,
+        hasPrescribedNodes: prescribedNodes.length > 0,
+        languageDirective: languageDirective || '',
+      };
+      break;
+    }
+
+    case 'code':
+      promptId = PROMPT_IDS.CODE_CONTENT;
+      variables = {
+        title: outline.title,
+        programmingLanguage: widgetOutline.language || 'python',
+        description: outline.description,
+        keyPoints: (outline.keyPoints || []).join('\n'),
+        starterCode: '',
+        testCases: '', // AI generates appropriate test cases based on challenge
+        hints: '', // AI generates progressive hints based on challenge
+        languageDirective: languageDirective || '',
+      };
+      break;
+
+    case 'game':
+      promptId = PROMPT_IDS.GAME_CONTENT;
+      variables = {
+        title: outline.title,
+        gameType: widgetOutline.gameType || 'quiz',
+        description: outline.description,
+        keyPoints: (outline.keyPoints || []).join('\n'),
+        scoring: { correctPoints: 10, speedBonus: 5 },
+        languageDirective: languageDirective || '',
+      };
+      break;
+
+    case 'visualization3d':
+      promptId = PROMPT_IDS.VISUALIZATION3D_CONTENT;
+      variables = {
+        title: outline.title,
+        visualizationType: widgetOutline.visualizationType || 'custom',
+        description: outline.description,
+        keyPoints: (outline.keyPoints || []).join('\n'),
+        objects: widgetOutline.objects || [],
+        interactions: widgetOutline.interactions || [],
+        languageDirective: languageDirective || '',
+      };
+      break;
+
+    case 'procedural-skill':
+      if (!options.allowProceduralSkill) {
+        log.warn(`Procedural-skill widget "${outline.title}" is not enabled`);
+        return null;
+      }
+      promptId = PROMPT_IDS.PROCEDURAL_SKILL_CONTENT;
+      variables = {
+        title: outline.title,
+        procedureType: widgetOutline.procedureType || 'custom',
+        task: widgetOutline.task || widgetOutline.concept || outline.title,
+        description: outline.description,
+        keyPoints: (outline.keyPoints || []).join('\n'),
+        tools: widgetOutline.tools || [],
+        steps: widgetOutline.steps || [],
+        successCriteria: widgetOutline.successCriteria || [],
+        errorConsequences: widgetOutline.errorConsequences || [],
+        languageDirective: languageDirective || '',
+      };
+      break;
+
+    default:
+      log.warn(`Unknown widget type: ${widgetType}`);
+      return null;
+  }
+
+  const prompts = buildPrompt(promptId, variables);
+  if (!prompts) {
+    log.error(`Failed to build ${widgetType} prompt for: ${outline.title}`);
+    options.onFailure?.({ code: 'prompt-unavailable' });
+    return null;
+  }
+
+  log.info(`Generating ${widgetType} widget for: ${outline.title}`);
+  const response = await aiCall(prompts.system, prompts.user);
+  const html = extractHtml(response, log);
+
+  if (!html) {
+    log.error(`Failed to extract HTML from ${widgetType} response for: ${outline.title}`);
+    options.onFailure?.({ code: 'invalid-model-output' });
+    return null;
+  }
+
+  // Extract widget config from HTML if present
+  const widgetConfig = extractWidgetConfig(html, widgetType);
+
+  return {
+    html: postProcessInteractiveHtml(html),
+    widgetType,
+    widgetConfig,
+  };
+}
+
+/**
+ * Extract widget config from embedded JSON in HTML
+ */
+export function extractWidgetConfig(
+  html: string,
+  widgetType: WidgetType,
+): WidgetConfig | undefined {
+  const match = html.match(
+    /<script type="application\/json" id="widget-config">([\s\S]*?)<\/script>/,
+  );
+  if (!match) return undefined;
+
+  try {
+    const parsed: unknown = JSON.parse(match[1]);
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined;
+
+    const config = parsed as Record<string, unknown>;
+    return (isWidgetType(config.type) ? config : { ...config, type: widgetType }) as WidgetConfig;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Extract an inventory of interactable elements from the generated widget HTML,
+ * so the interactive-actions prompt can pick real selectors instead of guessing
+ * by convention. Returns an empty string when no elements are found.
+ */
+export function extractInteractiveElements(html: string): string {
+  if (!html) return '';
+
+  // Collect class names declared in the page's own <style> blocks so we can
+  // keep semantic hooks (e.g. `.grid-cell`, `.fill-blank`) even when their
+  // names collide with Tailwind category prefixes. Do this BEFORE stripping.
+  const styledClasses = collectStyledClassNames(html);
+
+  // Strip <script> / <style> / HTML comments so we don't inventory JS
+  // variables, CSS rules, or commented-out markup. Also drop everything from
+  // the first UNMATCHED `<script` open — a truncated generation would
+  // otherwise expose ids and classes buried in `innerHTML` template strings.
+  let dom = html
+    .replace(/<script\b[\s\S]*?<\/script>/gi, '')
+    .replace(/<style\b[\s\S]*?<\/style>/gi, '')
+    .replace(/<!--[\s\S]*?-->/g, '');
+  const unterminatedScript = dom.search(/<script\b/i);
+  if (unterminatedScript !== -1) {
+    dom = dom.substring(0, unterminatedScript);
+  }
+
+  // Match an opening tag with its attribute string. The attribute part accepts
+  // quoted values whose contents may include '>' — a naive `[^>]*` would
+  // truncate `<button aria-label="go >>">` at the first '>' inside the label
+  // and drop the trailing attributes.
+  const tagRegex =
+    /<([a-zA-Z][a-zA-Z0-9-]*)((?:\s+[a-zA-Z_:][\w:-]*(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'<>`=]+))?)*)\s*\/?>/g;
+  const seenIds = new Set<string>();
+  const seenClasses = new Set<string>();
+  const seenDataAttrs = new Set<string>();
+  const idLines: string[] = [];
+  const classLines: string[] = [];
+  const dataAttrLines: string[] = [];
+  const MAX_IDS = 60;
+  const MAX_CLASSES = 30;
+  const MAX_DATA_ATTRS = 30;
+
+  for (const match of dom.matchAll(tagRegex)) {
+    const tag = match[1].toLowerCase();
+    if (tag === 'br' || tag === 'meta' || tag === 'link') continue;
+    const attrs = parseAttrs(match[2] || '');
+
+    const id = attrs.id;
+    const classAttr = attrs.class;
+    const ariaLabel = attrs['aria-label'];
+    const role = attrs.role;
+    const dataStepId = attrs['data-step-id'];
+    const dataAction = attrs['data-action'];
+    const name = attrs.name;
+    const typeAttr = attrs.type;
+
+    if (id && !seenIds.has(id) && idLines.length < MAX_IDS) {
+      seenIds.add(id);
+      const parts: string[] = [
+        `#${id}`,
+        `<${tag}${typeAttr ? ` type=${cleanAttrValue(typeAttr)}` : ''}>`,
+      ];
+      if (classAttr) parts.push(`class="${cleanAttrValue(classAttr)}"`);
+      if (role) parts.push(`role=${cleanAttrValue(role)}`);
+      if (ariaLabel) parts.push(`aria-label="${cleanAttrValue(ariaLabel)}"`);
+      if (dataStepId) parts.push(`data-step-id="${cleanAttrValue(dataStepId)}"`);
+      if (dataAction) parts.push(`data-action="${cleanAttrValue(dataAction)}"`);
+      if (name) parts.push(`name=${cleanAttrValue(name)}`);
+      idLines.push(parts.join(' '));
+    }
+
+    // Surface stable data-attribute selectors even when the element has no id.
+    // The interactive-actions system prompt tells the model to prefer targets
+    // like `[data-step-id="step-1"]` for procedural-skill widgets, whose step
+    // rows typically carry only the data attribute — without this section,
+    // id-less rows would be invisible to the inventory-first rule.
+    if (!id) {
+      for (const [attrName, attrValue] of [
+        ['data-step-id', dataStepId],
+        ['data-action', dataAction],
+      ] as const) {
+        if (!attrValue) continue;
+        const cleaned = cleanAttrValue(attrValue);
+        const key = `${attrName}=${cleaned}`;
+        if (seenDataAttrs.has(key)) continue;
+        if (dataAttrLines.length >= MAX_DATA_ATTRS) break;
+        seenDataAttrs.add(key);
+        dataAttrLines.push(`[${attrName}="${cleaned}"] <${tag}>`);
+      }
+    }
+
+    if (classAttr) {
+      for (const cls of classAttr.split(/\s+/).filter(Boolean)) {
+        if (!styledClasses.has(cls) && isUtilityClass(cls)) continue;
+        if (!seenClasses.has(cls) && classLines.length < MAX_CLASSES) {
+          seenClasses.add(cls);
+          classLines.push(`.${cls} <${tag}>`);
+        }
+      }
+    }
+  }
+
+  const sections: string[] = [];
+  if (idLines.length) sections.push(`Elements with id:\n${idLines.join('\n')}`);
+  if (dataAttrLines.length) sections.push(`Stable data attributes:\n${dataAttrLines.join('\n')}`);
+  if (classLines.length) sections.push(`Notable classes:\n${classLines.join('\n')}`);
+  return sections.join('\n\n');
+}
+
+/**
+ * Whitespace-collapse an attribute value and cap its length. Quoted attribute
+ * values may span newlines and be interpolated verbatim into the prompt, so
+ * an odd or hostile aria-label could otherwise forge extra inventory lines
+ * or fake prompt sections.
+ */
+const MAX_ATTR_VALUE_CHARS = 120;
+function cleanAttrValue(value: string): string {
+  const collapsed = value.replace(/\s+/g, ' ').trim();
+  return collapsed.length > MAX_ATTR_VALUE_CHARS
+    ? collapsed.substring(0, MAX_ATTR_VALUE_CHARS - 1) + '…'
+    : collapsed;
+}
+
+/**
+ * Collect class names that appear in the page's own `<style>` blocks. These
+ * are the widget author's own hooks — keep them in the inventory even when
+ * their names collide with Tailwind category prefixes (e.g. `.grid-cell` vs
+ * `grid-cols-2`, `.text-input` vs `text-lg`).
+ */
+function collectStyledClassNames(html: string): Set<string> {
+  const styled = new Set<string>();
+  const styleBlockRegex = /<style\b[^>]*>([\s\S]*?)<\/style>/gi;
+  const classNameRegex = /\.([a-zA-Z_][\w-]*)/g;
+  for (const block of html.matchAll(styleBlockRegex)) {
+    for (const m of block[1].matchAll(classNameRegex)) {
+      styled.add(m[1]);
+    }
+  }
+  return styled;
+}
+
+/**
+ * Parse the attribute string of an opening tag into a name→value map. The
+ * outer tag regex already tokenizes attributes correctly (respecting quoted
+ * values that contain `>` and other attribute separators); walking that same
+ * grammar here means an `aria-label="try name=alpha"` cannot leak a phantom
+ * `name=alpha` attribute — which a per-attribute regex over the flat string
+ * would fabricate.
+ */
+const ATTR_TOKEN_REGEX = /([a-zA-Z_:][\w:-]*)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'<>`=]+)))?/g;
+function parseAttrs(attrs: string): Record<string, string> {
+  const map: Record<string, string> = {};
+  for (const m of attrs.matchAll(ATTR_TOKEN_REGEX)) {
+    const name = m[1].toLowerCase();
+    if (map[name] !== undefined) continue;
+    map[name] = m[2] ?? m[3] ?? m[4] ?? '';
+  }
+  return map;
+}
+
+/**
+ * Heuristic to skip Tailwind/utility class names so semantic classes survive
+ * under the inventory cap. Errs on the side of dropping — if a class name
+ * looks like a utility (color/spacing/typography/layout token), don't include
+ * it. Semantic hooks whose names collide with utility prefixes (e.g.
+ * `.grid-cell`, `.fill-blank`, `.text-input`, `.select-btn`, `.ring-carbon`)
+ * are preserved by the caller when the same class is declared in the page's
+ * own `<style>` block.
+ */
+// Common Tailwind category prefixes. Anchored with `-` so we don't match
+// e.g. `.flex-container` (semantic) — Tailwind's `flex` is bare, and its
+// modifiers are `flex-col`, `flex-1`, `flex-wrap` etc.
+const UTILITY_PREFIXES = [
+  'p-',
+  'px-',
+  'py-',
+  'pt-',
+  'pr-',
+  'pb-',
+  'pl-',
+  'm-',
+  'mx-',
+  'my-',
+  'mt-',
+  'mr-',
+  'mb-',
+  'ml-',
+  'w-',
+  'h-',
+  'min-w-',
+  'min-h-',
+  'max-w-',
+  'max-h-',
+  'text-',
+  'font-',
+  'leading-',
+  'tracking-',
+  'bg-',
+  'border-',
+  'ring-',
+  'shadow-',
+  'opacity-',
+  'rounded-',
+  'divide-',
+  'space-',
+  'gap-',
+  'grid-',
+  'col-',
+  'row-',
+  'top-',
+  'right-',
+  'bottom-',
+  'left-',
+  'inset-',
+  'z-',
+  'order-',
+  'flex-',
+  'items-',
+  'justify-',
+  'content-',
+  'self-',
+  'place-',
+  'overflow-',
+  'whitespace-',
+  'break-',
+  'transition-',
+  'duration-',
+  'ease-',
+  'delay-',
+  'animate-',
+  'translate-',
+  'rotate-',
+  'scale-',
+  'skew-',
+  'origin-',
+  'cursor-',
+  'select-',
+  'pointer-events-',
+  'accent-',
+  'caret-',
+  'fill-',
+  'stroke-',
+  'aspect-',
+];
+// Exact single-token Tailwind utilities (no dash).
+const UTILITY_EXACT = new Set([
+  'flex',
+  'grid',
+  'block',
+  'inline',
+  'inline-block',
+  'inline-flex',
+  'hidden',
+  'absolute',
+  'relative',
+  'fixed',
+  'sticky',
+  'static',
+  'container',
+  'italic',
+  'underline',
+  'uppercase',
+  'lowercase',
+  'capitalize',
+  'truncate',
+  'antialiased',
+  'subpixel-antialiased',
+  'visible',
+  'invisible',
+  'sr-only',
+  'not-sr-only',
+]);
+
+function isUtilityClass(cls: string): boolean {
+  // Responsive / state prefix (`md:`, `hover:`, `dark:foo`) → always utility.
+  if (cls.includes(':')) return true;
+  // Arbitrary-value utilities: `w-[240px]`, `text-[10px]`.
+  if (cls.includes('[')) return true;
+  if (UTILITY_PREFIXES.some((p) => cls.startsWith(p))) return true;
+  return UTILITY_EXACT.has(cls);
+}
+
+function buildPBLProjectSummary(outline: SceneOutline, project: PBLProject | undefined): string {
+  const fallbackTitle = outline.pblConfig?.projectTopic?.trim() || outline.title;
+  const fallbackDescription = outline.pblConfig?.projectDescription?.trim() || outline.description;
+  const summaryText = (value: unknown): string | undefined =>
+    typeof value === 'string' ? value.trim() || undefined : undefined;
+  const title = summaryText(project?.title) || fallbackTitle;
+  const description = summaryText(project?.description) || fallbackDescription;
+  const learningObjective = summaryText(project?.learningObjective);
+  const scenarioGoal = summaryText(project?.scenario?.goal);
+  const gains = Array.isArray(project?.gains)
+    ? project.gains.map(summaryText).filter((gain): gain is string => gain !== undefined)
+    : [];
+  const milestones = Array.isArray(project?.milestones)
+    ? [...project.milestones]
+        .map((milestone, index) => ({ milestone, index }))
+        .sort((a, b) => {
+          const aOrder = typeof a.milestone.order === 'number' ? a.milestone.order : a.index;
+          const bOrder = typeof b.milestone.order === 'number' ? b.milestone.order : b.index;
+          return aOrder - bOrder;
+        })
+        .map(({ milestone }) => milestone)
+        .map((milestone, index) => summaryText(milestone.title) ?? `Task ${index + 1}`)
+    : [];
+
+  return [
+    `Project title: ${title}`,
+    `Driving goal: ${description}`,
+    learningObjective ? `Learning objective: ${learningObjective}` : '',
+    scenarioGoal ? `Scenario goal: ${scenarioGoal}` : '',
+    gains.length > 0 ? `Learner gains: ${gains.join('; ')}` : '',
+    'Milestones:',
+    milestones.length > 0
+      ? milestones.map((milestone, index) => `${index + 1}. ${milestone}`).join('\n')
+      : '(No generated milestones are available; introduce the project topic without inventing any.)',
+  ]
+    .filter(Boolean)
+    .join('\n');
+}
+
+/**
+ * Step 3.2: Generate Actions based on content and script
+ */
+export async function generateSceneActions(
+  outline: SceneOutline,
+  content:
+    | GeneratedSlideContent
+    | GeneratedQuizContent
+    | GeneratedInteractiveContent
+    | GeneratedPBLContent,
+  aiCall: AICallFn,
+  options: SceneActionsOptions = {},
+): Promise<Action[]> {
+  const { ctx, agents, userProfile, languageDirective, requireStructuredOutput = false } = options;
+  const log = options.logger ?? noopGenerationLogger;
+  const agentsText = formatAgentsForPrompt(agents);
+
+  // Debug: Log content type for interactive scenes
+  if (outline.type === 'interactive') {
+    const hasHtml = 'html' in content;
+    log.info(
+      `[Actions Gen] Interactive "${outline.title}": hasHtml=${hasHtml}, widgetType=${hasHtml ? content.widgetType : 'N/A'}`,
+    );
+  }
+
+  if (outline.type === 'slide' && 'elements' in content) {
+    // Format element list for AI to select from
+    const elementsText = formatElementsForPrompt(content.elements);
+
+    const prompts = buildPrompt(PROMPT_IDS.SLIDE_ACTIONS, {
+      title: outline.title,
+      keyPoints: (outline.keyPoints || []).map((p, i) => `${i + 1}. ${p}`).join('\n'),
+      description: outline.description,
+      elements: elementsText,
+      courseContext: buildCourseContext(ctx),
+      agents: agentsText,
+      userProfile: userProfile || '',
+      languageDirective: languageDirective || '',
+    });
+
+    if (!prompts) {
+      return generateDefaultSlideActions(outline, content.elements);
+    }
+
+    const response = await aiCall(prompts.system, prompts.user);
+    const actions = parseActionsFromStructuredOutput(response, outline.type, undefined, log);
+
+    if (actions.length > 0) {
+      // Validate and fill in Action IDs
+      return processActions(actions, content.elements, agents, log);
+    }
+
+    if (requireStructuredOutput) throw invalidActionsOutput(outline);
+    return generateDefaultSlideActions(outline, content.elements);
+  }
+
+  if (outline.type === 'quiz' && 'questions' in content) {
+    // Format question list for AI reference
+    const questionsText = formatQuestionsForPrompt(content.questions);
+
+    const prompts = buildPrompt(PROMPT_IDS.QUIZ_ACTIONS, {
+      title: outline.title,
+      keyPoints: (outline.keyPoints || []).map((p, i) => `${i + 1}. ${p}`).join('\n'),
+      description: outline.description,
+      questions: questionsText,
+      courseContext: buildCourseContext(ctx),
+      agents: agentsText,
+      languageDirective: languageDirective || '',
+    });
+
+    if (!prompts) {
+      return generateDefaultQuizActions(outline);
+    }
+
+    const response = await aiCall(prompts.system, prompts.user);
+    const actions = parseActionsFromStructuredOutput(response, outline.type, undefined, log);
+
+    if (actions.length > 0) {
+      return processActions(actions, [], agents, log);
+    }
+
+    if (requireStructuredOutput) throw invalidActionsOutput(outline);
+    return generateDefaultQuizActions(outline);
+  }
+
+  if (outline.type === 'interactive' && 'html' in content) {
+    const config = outline.interactiveConfig;
+    const agentsText = formatAgentsForPrompt(agents);
+    // Always recompute the inventory from the current html so it matches what
+    // the tool actually reads — persisting the field would go stale relative
+    // to `postProcessInteractiveHtml` output and to any in-turn html edits.
+    const inventory =
+      (content.html ? extractInteractiveElements(content.html) : '') ||
+      '(no interactive elements detected)';
+    const prompts = buildPrompt(PROMPT_IDS.INTERACTIVE_ACTIONS, {
+      title: outline.title,
+      keyPoints: (outline.keyPoints || []).map((p, i) => `${i + 1}. ${p}`).join('\n'),
+      description: outline.description,
+      conceptName: config?.conceptName || outline.title,
+      designIdea: config?.designIdea || '',
+      widgetType: content.widgetType || outline.widgetType || '',
+      widgetConfig: JSON.stringify(content.widgetConfig || {}),
+      elementInventory: inventory,
+      courseContext: buildCourseContext(ctx),
+      agents: agentsText,
+      languageDirective: languageDirective || '',
+    });
+
+    if (!prompts) {
+      return generateDefaultInteractiveActions(outline);
+    }
+
+    const response = await aiCall(prompts.system, prompts.user);
+    const actions = parseActionsFromStructuredOutput(
+      response,
+      outline.type,
+      INTERACTIVE_WIDGET_ACTIONS,
+      log,
+    );
+
+    if (actions.length > 0) {
+      return processActions(actions, [], agents, log);
+    }
+
+    if (requireStructuredOutput) throw invalidActionsOutput(outline);
+    return generateDefaultInteractiveActions(outline);
+  }
+
+  if (outline.type === 'pbl') {
+    const pblConfig = outline.pblConfig;
+    const agentsText = formatAgentsForPrompt(agents);
+    const projectV2 = (content as Partial<GeneratedPBLContent>).projectV2;
+    const prompts = buildPrompt(PROMPT_IDS.PBL_ACTIONS, {
+      title: outline.title,
+      keyPoints: (outline.keyPoints || []).map((p, i) => `${i + 1}. ${p}`).join('\n'),
+      description: outline.description,
+      projectTopic: pblConfig?.projectTopic || outline.title,
+      projectDescription: pblConfig?.projectDescription || outline.description,
+      projectSummary: buildPBLProjectSummary(outline, projectV2),
+      courseContext: buildCourseContext(ctx),
+      agents: agentsText,
+      languageDirective: languageDirective || '',
+    });
+
+    if (!prompts) {
+      return generateDefaultPBLActions(outline);
+    }
+
+    const response = await aiCall(prompts.system, prompts.user);
+    const actions = parseActionsFromStructuredOutput(response, outline.type, undefined, log);
+
+    if (actions.length > 0) {
+      return processActions(actions, [], agents, log);
+    }
+
+    if (requireStructuredOutput) throw invalidActionsOutput(outline);
+    return generateDefaultPBLActions(outline);
+  }
+
+  return [];
+}
+
+/**
+ * Generate default PBL Actions (fallback)
+ */
+function generateDefaultPBLActions(_outline: SceneOutline): Action[] {
+  return [
+    {
+      id: `action_${nanoid(8)}`,
+      type: 'speech',
+      title: 'PBL 项目介绍',
+      text: '现在让我们开始一个项目式学习活动，了解项目的驱动问题，并在项目工作区中逐步探索和实践。',
+    },
+  ];
+}
+
+/**
+ * Format element list for AI to select elementId
+ */
+function formatElementsForPrompt(elements: PPTElement[]): string {
+  return elements
+    .map((el) => {
+      let summary = '';
+      if (el.type === 'text' && 'content' in el) {
+        const textContent = ((el.content as string) || '').replace(/<[^>]*>/g, '').trim();
+        summary = `Visible text: ${JSON.stringify(textContent)}`;
+      } else if (el.type === 'table') {
+        const occupied = new Set<string>();
+        const cells = el.data.flatMap((row, rowIndex) => {
+          let columnIndex = 0;
+          return row.map((cell) => {
+            while (occupied.has(`${rowIndex}:${columnIndex}`)) columnIndex += 1;
+            const anchorColumn = columnIndex;
+            for (let rowOffset = 0; rowOffset < Math.max(1, cell.rowspan); rowOffset += 1) {
+              for (let columnOffset = 0; columnOffset < Math.max(1, cell.colspan); columnOffset += 1) {
+                occupied.add(`${rowIndex + rowOffset}:${anchorColumn + columnOffset}`);
+              }
+            }
+            columnIndex += Math.max(1, cell.colspan);
+            return {
+              cellId: cell.id,
+              rowIndex,
+              columnIndex: anchorColumn,
+              rowspan: cell.rowspan,
+              colspan: cell.colspan,
+              text: cell.text.replace(/<[^>]*>/g, '').trim(),
+            };
+          });
+        });
+        summary = `Renderable table cells: ${JSON.stringify(cells)}`;
+      } else if (el.type === 'chart' && 'chartType' in el) {
+        summary = `Chart type: ${el.chartType}; labels: ${JSON.stringify(el.data.labels)}; legends: ${JSON.stringify(el.data.legends)}`;
+      } else if (el.type === 'image') {
+        summary = 'Image element';
+      } else if (el.type === 'shape') {
+        const text = el.text?.content?.replace(/<[^>]*>/g, '').trim();
+        summary = `Shape element${text ? `; visible text: ${JSON.stringify(text)}` : ''}`;
+      } else if (el.type === 'latex' && 'latex' in el) {
+        summary = `Formula: ${((el.latex as string) || '').substring(0, 30)}`;
+      } else {
+        summary = `${el.type} element`;
+      }
+      return `- id: "${el.id}", type: "${el.type}", ${summary}`;
+    })
+    .join('\n');
+}
+
+/**
+ * Format question list for AI reference
+ */
+function formatQuestionsForPrompt(questions: QuizQuestion[]): string {
+  return questions
+    .map((q, i) => {
+      const optionsText = q.options
+        ? `Options: ${q.options.map((o) => `${o.value}. ${o.label}`).join(', ')}`
+        : '';
+      return `Q${i + 1} (${q.type}): ${q.question}\n${optionsText}`;
+    })
+    .join('\n\n');
+}
+
+/**
+ * Process and validate Actions
+ */
+function processActions(
+  actions: Action[],
+  elements: PPTElement[],
+  agents?: AgentInfo[],
+  log: GenerationLogger = noopGenerationLogger,
+): Action[] {
+  const elementIds = new Set(elements.map((el) => el.id));
+  const agentIds = new Set(agents?.map((a) => a.id) || []);
+  const studentAgents = agents?.filter((a) => a.role === 'student') || [];
+  const nonTeacherAgents = agents?.filter((a) => a.role !== 'teacher') || [];
+
+  return actions.map((action) => {
+    // Ensure each action has an ID
+    const processedAction: Action = {
+      ...action,
+      id: action.id || `action_${nanoid(8)}`,
+    };
+
+    // Keep invalid visual targets unchanged so the CoTeach validation pass can
+    // drop them with a quality warning. Never fabricate a first-element target.
+    if (
+      (processedAction.type === 'spotlight' || processedAction.type === 'laser')
+      && (!processedAction.elementId || !elementIds.has(processedAction.elementId))
+    ) {
+      log.warn(`Invalid ${processedAction.type} elementId: ${processedAction.elementId}`);
+    }
+
+    // Validate/fill discussion agentId
+    if (processedAction.type === 'discussion' && agents && agents.length > 0) {
+      if (processedAction.agentId && agentIds.has(processedAction.agentId)) {
+        // agentId valid — keep it
+      } else {
+        // agentId missing or invalid — pick a random student, or non-teacher, or skip
+        const pool = studentAgents.length > 0 ? studentAgents : nonTeacherAgents;
+        if (pool.length > 0) {
+          const picked = pool[Math.floor(Math.random() * pool.length)];
+          log.warn(
+            `Discussion agentId "${processedAction.agentId || '(none)'}" invalid, assigned: ${picked.id} (${picked.name})`,
+          );
+          processedAction.agentId = picked.id;
+        }
+      }
+    }
+
+    return processedAction;
+  });
+}
+
+/**
+ * Generate default slide Actions (fallback)
+ */
+function generateDefaultSlideActions(outline: SceneOutline, _elements: PPTElement[]): Action[] {
+  const actions: Action[] = [];
+
+  // Add opening speech based on key points
+  const speechText = outline.keyPoints?.length
+    ? outline.keyPoints.join('。') + '。'
+    : outline.description || outline.title;
+  actions.push({
+    id: `action_${nanoid(8)}`,
+    type: 'speech',
+    title: '场景讲解',
+    text: speechText,
+  });
+
+  return actions;
+}
+
+/**
+ * Generate default quiz Actions (fallback)
+ */
+function generateDefaultQuizActions(_outline: SceneOutline): Action[] {
+  return [
+    {
+      id: `action_${nanoid(8)}`,
+      type: 'speech',
+      title: '测验引导',
+      text: '现在让我们来做一个小测验，检验一下学习成果。',
+    },
+  ];
+}
+
+/**
+ * Generate default interactive Actions (fallback)
+ */
+function generateDefaultInteractiveActions(_outline: SceneOutline): Action[] {
+  return [
+    {
+      id: `action_${nanoid(8)}`,
+      type: 'speech',
+      title: '交互引导',
+      text: '现在让我们通过交互式可视化来探索这个概念。请尝试操作页面中的元素，观察变化。',
+    },
+  ];
+}

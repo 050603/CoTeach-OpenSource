@@ -1,0 +1,93 @@
+providers:
+  openai:
+    apiKey: ''
+    baseUrl: https://api.openai.com/v1
+    enabled: true
+  anthropic:
+    apiKey: ''
+  deepseek:
+    apiKey: ''
+    baseUrl: https://api.deepseek.com/v1
+    models:
+      - deepseek-chat
+      - deepseek-reasoner
+    enabled: true
+    priority: 0
+    defaultModel: deepseek-chat
+  glm:
+    apiKey: ''
+    baseUrl: https://open.bigmodel.cn/api/paas/v4
+  qwen:
+    apiKey: ''
+    baseUrl: https://dashscope.aliyuncs.com/compatible-mode/v1
+  kimi:
+    apiKey: ''
+    baseUrl: https://api.moonshot.cn/v1
+  doubao:
+    apiKey: ''
+    baseUrl: https://ark.cn-beijing.volces.com/api/v3
+  siliconflow:
+    apiKey: ''
+    baseUrl: https://api.siliconflow.cn/v1
+  openrouter:
+    apiKey: ''
+    baseUrl: https://openrouter.ai/api/v1
+  grok:
+    apiKey: ''
+    baseUrl: https://api.x.ai/v1
+  tencent-hunyuan:
+    apiKey: ''
+    baseUrl: https://api.hunyuan.cloud.tencent.com/v1
+  xiaomi:
+    apiKey: ''
+    baseUrl: https://api.mimo.xiaomi.com/v1
+  ollama:
+    baseUrl: http://localhost:11434/v1
+  lemonade:
+    baseUrl: http://localhost:8000/v1
+tts:
+  browser-native-tts:
+    enabled: true
+  qwen-tts:
+    apiKey: ''
+    baseUrl: https://dashscope.aliyuncs.com/compatible-mode/v1
+    models:
+      - qwen3-tts-flash
+      - qwen3-tts-instruct-flash
+      - qwen-tts
+    enabled: true
+    priority: 0
+    defaultModel: qwen3-tts-flash
+  minimax-tts:
+    apiKey: ''
+    baseUrl: https://api-bj.minimaxi.com/v1/t2a_v2
+    enabled: true
+    priority: 100
+    defaultModel: speech-2.8-hd
+asr: {}
+image:
+  qwen-image:
+    apiKey: ''
+    baseUrl: https://dashscope.aliyuncs.com/compatible-mode/v1
+    models:
+      - qwen-image-2.0-pro
+      - qwen-image-2.0
+      - qwen-image-max
+      - qwen-image-plus
+      - qwen-image
+    enabled: true
+    priority: 0
+    defaultModel: qwen-image-2.0-pro
+  minimax-image:
+    apiKey: ''
+    enabled: false
+video: {}
+web-search:
+  brave:
+    apiKey: ''
+    baseUrl: https://search.brave.com
+    enabled: true
+  minimax:
+    apiKey: ''
+    baseUrl: https://api.minimaxi.com
+    enabled: true

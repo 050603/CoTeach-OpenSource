@@ -1,0 +1,62 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+  schedule:
+    - cron: "17 3 * * 1"
+
+permissions:
+  actions: read
+  contents: read
+  security-events: write
+
+jobs:
+  applicability:
+    name: Check CodeQL availability
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      security-events: read
+    outputs:
+      enabled: ${{ steps.policy.outputs.enabled }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Validate availability policy
+        run: node --test scripts/check-codeql-availability.test.mjs
+      - name: Check Code Scanning entitlement
+        id: policy
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node scripts/check-codeql-availability.mjs
+
+  analyze:
+    name: Analyze and upload CodeQL results
+    needs: applicability
+    if: needs.applicability.outputs.enabled == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: javascript-typescript
+          queries: security-extended
+      - uses: github/codeql-action/analyze@v3
+        with:
+          output: codeql-results
+      - name: Preserve SARIF analysis even if upload fails
+        if: always() && hashFiles('codeql-results/**/*.sarif') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: codeql-sarif-${{ github.sha }}
+          path: codeql-results/*.sarif
+          if-no-files-found: error
+          retention-days: 7

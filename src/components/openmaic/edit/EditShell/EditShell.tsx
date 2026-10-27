@@ -1,0 +1,335 @@
+'use client';
+
+import { motion, useReducedMotion } from 'motion/react';
+import { useLayoutEffect, useRef, useState, type ReactNode } from 'react';
+import { cn } from '@openmaic/lib/utils/cn';
+import type { SceneEditorSurface, SurfaceState } from '@openmaic/lib/edit/scene-editor-surface';
+import { sceneEditorRegistry } from '@openmaic/lib/edit/scene-editor-registry';
+import { NOOP_SURFACE } from '@openmaic/lib/edit/noop-surface';
+import type { Scene } from '@openmaic/lib/types/stage';
+import { CHROME_DURATION, CHROME_EASE, CHROME_STAGGER } from '@openmaic/lib/edit/transitions';
+import { StageGrid } from '@openmaic/components/edit/StageGrid';
+import { CommandBar } from './CommandBar';
+import type { EditorControlsProps } from './EditorControls';
+import { FloatingInsertToolbar } from './FloatingInsertToolbar';
+import { FloatingToolbar } from './FloatingToolbar';
+import { HintRail } from './HintRail';
+
+interface EditShellProps {
+  readonly scene: Scene;
+  /**
+   * Optional left-side navigator slot. In v0 this is the SlideNavRail
+   * passed from Stage when mode === 'edit'. Surface code never imports
+   * the rail (the prop is the only handoff seam), keeping chrome and
+   * surface separable.
+   */
+  readonly leftRail?: ReactNode | ((controls: EditorControlsProps) => ReactNode);
+  /** Embedded teacher preparation places surface controls in the page navigator. */
+  readonly commandPlacement?: 'top' | 'navigation';
+  /**
+   * Right-edge slot of the CommandBar — Stage uses this to hand in the
+   * global controls (settings pill + Pro Switch) when the Stage Header
+   * is hidden, so the entire top chrome reduces to a single bar.
+   */
+  readonly commandTrailing?: ReactNode;
+  /**
+   * Optional right-side panel slot. Used by the MAIC Agent PoC to mount the
+   * AI sidebar. Like `leftRail`, it is a pure chrome handoff — surface code
+   * never imports it. Collapses to zero width when absent.
+   */
+  readonly rightRail?: ReactNode;
+  /** Optional bottom bar (under the canvas) — used for the actions timeline. */
+  readonly bottomRail?: ReactNode;
+  /** CoTeach preparation workspace uses a calmer, task-led canvas frame. */
+  readonly teacherPreparation?: boolean;
+}
+
+const CHROME_TRANSITION = { duration: CHROME_DURATION, ease: CHROME_EASE } as const;
+const COMMANDBAR_DELAY = CHROME_STAGGER;
+const LEFT_RAIL_DELAY = CHROME_STAGGER * 2;
+
+/**
+ * Edit chrome mounts inside Stage's canvas slot. The standalone editor keeps
+ * CommandBar for navigation and global controls. Teacher preparation already
+ * has a course header, so it passes the surface controls to the left navigator
+ * and omits the full-width command row.
+ *
+ *   ┌──────────────────────────────────────────────┐  (Stage Header above)
+ *   ├──────────────────────────────────────────────┤
+ *   │ CommandBar  (undo/redo · title · insert ·    │
+ *   │              surface commands)                │
+ *   ├──────────┬───────────────────────────────────┤
+ *   │ leftRail │ Canvas / unsupported-scene        │
+ *   │ (opt)    │ FloatingToolbar (when selected)   │
+ *   │          │ HintRail (AI, reserved)            │
+ *   └──────────┴───────────────────────────────────┘
+ *
+ * Mount choreography: CommandBar drops in from top, leftRail slides in
+ * from left after a stagger, content opacity-fades in. All three share
+ * the single `CHROME_*` source in `lib/edit/transitions.ts` so timing
+ * stays consistent with the outer Stage-level cross-fade.
+ *
+ * Architecture: this shell resolves `scene.type` to a registered surface
+ * (or falls back to NOOP_SURFACE for unregistered types) and **never
+ * branches into a different component type**. The same `<Frame>` mounts
+ * across every scene-type change — only the `surface.SurfaceComponent`
+ * inside the center slot swaps. That guarantees CommandBar and `leftRail`
+ * never remount during scene navigation, removing the chrome flicker that
+ * the previous two-branch design caused (PR3a rearch).
+ */
+export function EditShell({
+  scene,
+  leftRail,
+  commandTrailing,
+  rightRail,
+  bottomRail,
+  commandPlacement = 'top',
+  teacherPreparation = false,
+}: EditShellProps) {
+  const surface = sceneEditorRegistry.resolve(scene.type) ?? NOOP_SURFACE;
+  // Surface state is published from a child runner (keyed by sceneType so it
+  // remounts when the surface identity changes — that's the boundary at which
+  // rules-of-hooks naturally allows a different hook signature). The chrome
+  // around it stays mounted and consumes state via these props.
+  const [state, setState] = useState<SurfaceState | null>(null);
+  const SurfaceComponent = surface.SurfaceComponent;
+
+  return (
+    <>
+      {/* `key={scene.type}` is the remount boundary. We can't use
+          `surface.sceneType` here because NOOP_SURFACE deliberately reuses
+          'slide' as a placeholder (the SceneType union is closed and NOOP
+          isn't a real type). The scene's own `type` is the actual signal
+          that the hook signature inside `useSurfaceState` is about to
+          change — so we remount the runner exactly when it does, keeping
+          rules-of-hooks happy across the slide ↔ read-only surface swap
+          while the rest of the chrome stays mounted. */}
+      <SurfaceStateRunner key={scene.type} surface={surface} onChange={setState} />
+      <Frame
+        title={scene.title}
+        leftRail={typeof leftRail === 'function'
+          ? leftRail({ title: scene.title, history: state?.history, commands: state?.commands })
+          : leftRail}
+        commandPlacement={commandPlacement}
+        history={state?.history}
+        commands={state?.commands}
+        trailing={commandTrailing}
+        rightRail={rightRail}
+        bottomRail={bottomRail}
+        teacherPreparation={teacherPreparation}
+      >
+        <SurfaceComponent />
+        {state?.insertItems && state.insertItems.length > 0 && (
+          <FloatingInsertToolbar items={state.insertItems} />
+        )}
+        {state?.hasSelection && <FloatingToolbar actions={state.floatingActions} />}
+        <HintRail hints={state?.hints} />
+      </Frame>
+    </>
+  );
+}
+
+/**
+ * Hidden runner that owns the surface state hook. `key={surface.sceneType}`
+ * ensures it remounts when the surface itself changes (slide → noop) — the
+ * only point at which the hook call signature can vary. Within a single mount
+ * the hook signature is fixed (the surface object is constant), so React's
+ * rules-of-hooks are respected.
+ *
+ * Renders no DOM; state flows up to the chrome via `onChange`. A custom
+ * shallow comparison gates the publish — surface hooks (e.g. slideSurface's
+ * `useSlideSurfaceState`) return a fresh object literal every render, so naive
+ * reference equality would loop infinitely (every publish causes the parent to
+ * re-render, which re-runs this hook, which yields a new ref, which publishes
+ * again, etc.). We only publish when one of the fields the chrome actually
+ * reads has materially changed.
+ */
+function SurfaceStateRunner({
+  surface,
+  onChange,
+}: {
+  readonly surface: SceneEditorSurface;
+  readonly onChange: (state: SurfaceState) => void;
+}) {
+  const state = surface.useSurfaceState();
+  const lastRef = useRef<SurfaceState | null>(null);
+  useLayoutEffect(() => {
+    if (surfaceStateEqual(state, lastRef.current)) return;
+    lastRef.current = state;
+    onChange(state);
+  });
+  return null;
+}
+
+/**
+ * Field-by-field equality for the subset of SurfaceState that the chrome
+ * reads. Surface hooks (e.g. `useSlideSurfaceState`) return a fresh object
+ * literal every render, so naive reference equality would publish on
+ * every render and trip an infinite render loop via the runner →
+ * setState → re-render cycle. We compare semantic content instead.
+ *
+ * **When you extend `SurfaceState`** (new field on `EditorCommand`,
+ * `InsertPaletteItem`, `FloatingAction`, `EditorHint`, or a new top-level
+ * field), update this function in lock-step. A field that's read by the
+ * chrome but missing from the comparison silently goes stale.
+ *
+ * - `content` is reference-equal as long as the in-memory slide buffer
+ *   hasn't been committed — the canonical "real change" signal.
+ * - History flags compared individually (functions like undo/redo are
+ *   stable references via `useSlideEditSession.getState()`).
+ * - InsertPaletteItem / EditorCommand / FloatingAction arrays: length +
+ *   per-item `id` + per-item flags that drive visual state.
+ * - EditorHint compared by length + per-item severity/message.
+ *
+ * **Callback identity (`onInvoke`, `popoverContent`) is intentionally
+ * NOT compared.** Per-render closure rebinding is normal and would
+ * trip equality every render. Today this is safe because slide is the
+ * only registered surface and its `floatingActions` is `[]` — the only
+ * `onInvoke` set the chrome reads is on `InsertPaletteItem`, which is
+ * a stable module-level closure from `buildInsertItems`. A future
+ * surface that returns non-empty `floatingActions` with closures
+ * capturing per-render state must fold its own change signal (a
+ * content ref / version counter) into the comparison, otherwise the
+ * stale callback fires at click time.
+ */
+function surfaceStateEqual(a: SurfaceState, b: SurfaceState | null): boolean {
+  if (!b) return false;
+  if (a.content !== b.content) return false;
+  if (a.hasSelection !== b.hasSelection) return false;
+  if ((a.history?.canUndo ?? null) !== (b.history?.canUndo ?? null)) return false;
+  if ((a.history?.canRedo ?? null) !== (b.history?.canRedo ?? null)) return false;
+  if (a.insertItems.length !== b.insertItems.length) return false;
+  for (let i = 0; i < a.insertItems.length; i++) {
+    if (a.insertItems[i].id !== b.insertItems[i].id) return false;
+    if (a.insertItems[i].active !== b.insertItems[i].active) return false;
+    if (a.insertItems[i].disabled !== b.insertItems[i].disabled) return false;
+    // Label/tooltip are user-facing and locale-dependent: without them the
+    // insert toolbar text stays stale after a language switch.
+    if (a.insertItems[i].label !== b.insertItems[i].label) return false;
+    if (a.insertItems[i].tooltip !== b.insertItems[i].tooltip) return false;
+  }
+  if (a.commands.length !== b.commands.length) return false;
+  for (let i = 0; i < a.commands.length; i++) {
+    if (a.commands[i].id !== b.commands[i].id) return false;
+    if (a.commands[i].disabled !== b.commands[i].disabled) return false;
+    if (a.commands[i].label !== b.commands[i].label) return false;
+    if (a.commands[i].tooltip !== b.commands[i].tooltip) return false;
+  }
+  if (a.floatingActions.length !== b.floatingActions.length) return false;
+  for (let i = 0; i < a.floatingActions.length; i++) {
+    if (a.floatingActions[i].id !== b.floatingActions[i].id) return false;
+    if (a.floatingActions[i].disabled !== b.floatingActions[i].disabled) return false;
+    if (a.floatingActions[i].label !== b.floatingActions[i].label) return false;
+  }
+  const aHints = a.hints ?? [];
+  const bHints = b.hints ?? [];
+  if (aHints.length !== bHints.length) return false;
+  for (let i = 0; i < aHints.length; i++) {
+    if (aHints[i].id !== bHints[i].id) return false;
+    if (aHints[i].severity !== bHints[i].severity) return false;
+    if (aHints[i].message !== bHints[i].message) return false;
+  }
+  return true;
+}
+
+interface FrameProps {
+  readonly title: string;
+  readonly commandPlacement: 'top' | 'navigation';
+  readonly leftRail?: ReactNode;
+  readonly history?: React.ComponentProps<typeof CommandBar>['history'];
+  readonly commands?: React.ComponentProps<typeof CommandBar>['commands'];
+  readonly trailing?: ReactNode;
+  readonly rightRail?: ReactNode;
+  readonly bottomRail?: ReactNode;
+  readonly teacherPreparation: boolean;
+  readonly children: ReactNode;
+}
+
+function Frame({
+  title,
+  leftRail,
+  history,
+  commands,
+  trailing,
+  rightRail,
+  bottomRail,
+  children,
+  commandPlacement,
+  teacherPreparation,
+}: FrameProps) {
+  const prefersReducedMotion = useReducedMotion();
+
+  // Chrome layers fade in (opacity only) — deliberately NO transform (x/y)
+  // slide. Two reasons: (1) the CommandBar's trailing slot and the rail host
+  // the Pro Switch / settings pill, which animate across the mode swap via
+  // `layoutId`; a transform on an ancestor distorts motion's layout
+  // measurement and makes the shared element drift. (2) the rail
+  // (`backdrop-blur-xl`) and the pills (`backdrop-blur-md`) would force a
+  // per-frame backdrop-filter recompute while transforming, which drops
+  // frames. A pure opacity fade composites cleanly and keeps the layout
+  // static so layoutId morphs land precisely.
+  const cmdInitial = { opacity: 0 };
+  const cmdAnimate = { opacity: 1 };
+  const railInitial = { opacity: 0 };
+  const railAnimate = { opacity: 1 };
+
+  const stepTransition = prefersReducedMotion
+    ? { duration: 0.12, ease: CHROME_EASE }
+    : CHROME_TRANSITION;
+
+  return (
+    <StageGrid
+      className={teacherPreparation
+        ? 'bg-[#EFF0ED] text-[#1F2933]'
+        : 'bg-gradient-to-b from-zinc-100 to-zinc-200 dark:from-zinc-950 dark:to-zinc-900'}
+      topSlot={commandPlacement === 'top' ? (
+        <motion.div
+          initial={cmdInitial}
+          animate={cmdAnimate}
+          transition={{ ...stepTransition, delay: prefersReducedMotion ? 0 : COMMANDBAR_DELAY }}
+        >
+          <CommandBar title={title} history={history} commands={commands} trailing={trailing} />
+        </motion.div>
+      ) : null}
+      leftSlot={
+        leftRail ? (
+          <motion.div
+            initial={railInitial}
+            animate={railAnimate}
+            transition={{ ...stepTransition, delay: prefersReducedMotion ? 0 : LEFT_RAIL_DELAY }}
+            className="h-full shrink-0"
+          >
+            {leftRail}
+          </motion.div>
+        ) : null
+      }
+      centerSlot={
+        // Padded studio frame around the actual scene renderer. Lifted
+        // up from SlideCanvas so the slide and the non-slide read-only
+        // renderers share the exact same canvas bounding rect (no
+        // layout jump when switching scene type). Children render
+        // inside an inner ring/shadow card that the playback
+        // CanvasArea visually mirrors.
+        <div className={cn('relative h-full w-full p-3 sm:p-4', teacherPreparation && 'flex flex-col gap-2.5 bg-[#EFF0ED]')}>
+          {teacherPreparation && (
+            <div className="flex min-h-7 shrink-0 items-center gap-2 overflow-hidden px-1 text-xs">
+              <span className="font-semibold text-[#344A6A]">课堂画布</span>
+              <span className="text-[#A9B1B3]">/</span>
+              <span className="truncate text-[#5F6B76]">{title}</span>
+            </div>
+          )}
+          <div className={cn(
+            'relative w-full overflow-hidden bg-white dark:bg-zinc-900',
+            teacherPreparation
+              ? 'min-h-0 flex-1 rounded-[10px] border border-[#D8D6D0] shadow-none dark:border-[#D8D6D0]'
+              : 'h-full rounded-xl ring-1 ring-zinc-200/80 shadow-[0_10px_40px_-12px_rgba(15,23,42,0.18)] dark:ring-zinc-800/80 dark:shadow-[0_10px_40px_-12px_rgba(0,0,0,0.6)]',
+          )}>
+            {children}
+          </div>
+        </div>
+      }
+      rightSlot={rightRail ? <div className="h-full shrink-0">{rightRail}</div> : null}
+      bottomSlot={bottomRail ?? null}
+    />
+  );
+}

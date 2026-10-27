@@ -1,0 +1,28 @@
+.editor {
+  overflow: hidden;
+}
+
+.workspace {
+  min-height: 0;
+  flex: 1 1 0%;
+}
+
+/* Native browser zoom can leave less room than the expanded timeline needs.
+   Keep an editable canvas and expose the timeline through this local scroller. */
+@media (max-height: 480px) {
+  .editor {
+    overflow-y: auto;
+    overscroll-behavior-y: contain;
+  }
+
+  .header {
+    position: sticky;
+    top: 0;
+    z-index: 40;
+  }
+
+  .workspace {
+    min-height: 500px;
+    flex: none;
+  }
+}

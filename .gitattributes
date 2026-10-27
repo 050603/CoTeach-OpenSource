@@ -1,0 +1,4 @@
+# Unified patch context lines require a leading space, including blank lines.
+patches/*.patch whitespace=-blank-at-eol
+# Font redistribution licenses are copied verbatim, including upstream whitespace.
+public/fonts/openmaic/font-licenses/*.txt whitespace=-blank-at-eol

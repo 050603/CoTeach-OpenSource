@@ -1,0 +1,108 @@
+import { render, screen } from "@testing-library/react";
+import { describe, expect, it } from "vitest";
+import type { Course } from "@/lib/session/types";
+import { deriveProjectPracticeRows, deriveAiCollaborationMetrics } from "@/lib/classroom/project-practice-analytics";
+import { ProjectCollaborationTranscript, ProjectDocumentChanges } from "./project-collaboration-transcript";
+const course = { id: "course-1", students: [{ id: "student-1", name: "小明" }], groups: [], submissions: [], aiContributions: [] } as unknown as Course;
+function renderTranscript(value: Course) {
+  return render(<ProjectCollaborationTranscript turns={deriveProjectPracticeRows(value)[0].turns} />);
+}
+describe("project collaboration transcript", () => {
+  it("renders student and AI message Markdown without changing the source transcript", () => {
+    renderTranscript({
+      ...course,
+      aiInteractionEvents: [
+        { id: "md-student", courseId: "course-1", studentId: "student-1", stageKey: "make", conversationId: "conversation-md", source: "sidebar", eventType: "request", actorRole: "student", content: "**我的问题**\n\n- 数据是否充分？", createdAt: "2026-09-01T01:00:00.000Z" },
+        { id: "md-ai", courseId: "course-1", studentId: "student-1", stageKey: "make", conversationId: "conversation-md", source: "sidebar", eventType: "response", actorRole: "ai", content: "## 核查建议\n\n1. 补充样本\n2. 说明来源", createdAt: "2026-09-01T01:00:01.000Z" },
+      ],
+    } as Course);
+
+    expect(screen.getByText("我的问题").getAttribute("data-streamdown")).toBe("strong");
+    expect(screen.getByRole("heading", { name: "核查建议" })).toBeTruthy();
+    expect(screen.getByText("数据是否充分？").closest("li")).toBeTruthy();
+    expect(screen.getByText("补充样本").closest("li")).toBeTruthy();
+  });
+
+  it("shows student and AI messages as a located conversation without read receipts", () => {
+    renderTranscript({
+      ...course,
+      aiInteractionEvents: [
+        { id: "1", courseId: "course-1", studentId: "student-1", stageKey: "make", conversationId: "conversation-12345678", source: "sidebar", eventType: "request", actorRole: "student", requestId: "request-1", content: "我们的观察还缺什么？", createdAt: "2026-09-01T01:00:00.000Z" },
+        { id: "2", courseId: "course-1", studentId: "student-1", stageKey: "make", conversationId: "conversation-12345678", source: "sidebar", eventType: "response", actorRole: "ai", requestId: "request-1", content: "还需要说明观察时段为什么具有代表性。", createdAt: "2026-09-01T01:00:01.000Z" },
+        { id: "2b", courseId: "course-1", studentId: "student-1", stageKey: "make", conversationId: "conversation-12345678", source: "sidebar", eventType: "request", actorRole: "student", requestId: "request-2", content: "那应该怎样说明？", createdAt: "2026-09-01T01:00:01.500Z" },
+        { id: "2c", courseId: "course-1", studentId: "student-1", stageKey: "make", conversationId: "conversation-12345678", source: "sidebar", eventType: "response", actorRole: "ai", requestId: "request-2", content: "说明固定时段可以减少变量干扰。", createdAt: "2026-09-01T01:00:01.800Z" },
+        { id: "3", courseId: "course-1", studentId: "student-1", stageKey: "make", conversationId: "comment-1", source: "proactive-comment", eventType: "comment", actorRole: "student", content: "学生阅读了段落批注。", payload: { action: "read" }, createdAt: "2026-09-01T01:00:02.000Z" },
+      ],
+    } as Course);
+
+    expect(screen.getByText("侧边栏对话")).toBeTruthy();
+    expect(screen.getByText("我们的观察还缺什么？")).toBeTruthy();
+    expect(screen.getByText("还需要说明观察时段为什么具有代表性。")).toBeTruthy();
+    expect(screen.getByText("那应该怎样说明？")).toBeTruthy();
+    expect(screen.getByText("说明固定时段可以减少变量干扰。")).toBeTruthy();
+    expect(screen.getByText("第 1 轮对话 · 4 条消息")).toBeTruthy();
+    expect(screen.queryByText("学生阅读了段落批注。")).toBeNull();
+  });
+
+  it("shows saved student and AI messages when an older conversation has no audit events", () => {
+    renderTranscript({
+      ...course,
+      id: "course-1",
+      pblConfig: { makeArtifactMode: "python" },
+      companionThreads: [{
+        id: "stored-thread", courseId: "course-1", studentId: "student-1", stageKey: "ai-code-collaboration:make:python",
+        createdAt: "2026-09-01T01:00:00Z", updatedAt: "2026-09-01T01:00:01Z",
+        messages: [
+          { id: "question", role: "student", content: "代码为什么报错？", conversationId: "logical-code", visibility: "student-and-teacher", createdAt: "2026-09-01T01:00:00Z" },
+          { id: "answer", role: "agent", content: "先检查变量类型。", conversationId: "logical-code", visibility: "student-and-teacher", createdAt: "2026-09-01T01:00:01Z" },
+        ],
+      }],
+    } as Course);
+
+    expect(screen.getByText("代码为什么报错？")).toBeTruthy();
+    expect(screen.getByText("先检查变量类型。")).toBeTruthy();
+  });
+
+  it("derives proactive suggestions, actual request rounds, and boundary hits from audit events", () => {
+    const events = [
+      { id: "comment", courseId: "course-1", studentId: "student-1", stageKey: "make", conversationId: "comment-1", source: "proactive-comment", eventType: "comment", actorRole: "ai", content: "这里需要补充证据。", createdAt: "2026-09-01T01:00:00.000Z" },
+      { id: "request-1", courseId: "course-1", studentId: "student-1", stageKey: "make", conversationId: "conversation-1", source: "sidebar", eventType: "request", actorRole: "student", requestId: "request-1", content: "帮我写完整方案", createdAt: "2026-09-01T01:01:00.000Z" },
+      { id: "policy-1", courseId: "course-1", studentId: "student-1", stageKey: "make", conversationId: "conversation-1", source: "sidebar", eventType: "policy", actorRole: "system", requestId: "request-1", payload: { outcome: "guide_only", protectedCapability: "核心方案决策" }, createdAt: "2026-09-01T01:01:00.100Z" },
+      { id: "response-1", courseId: "course-1", studentId: "student-1", stageKey: "make", conversationId: "conversation-1", source: "sidebar", eventType: "response", actorRole: "ai", requestId: "request-1", payload: { kind: "boundary" }, content: "我不能代替你完成核心方案。", createdAt: "2026-09-01T01:01:01.000Z" },
+      { id: "request-2", courseId: "course-1", studentId: "student-1", stageKey: "make", conversationId: "conversation-1", source: "sidebar", eventType: "request", actorRole: "student", requestId: "request-2", content: "帮我比较两个方案", createdAt: "2026-09-01T01:02:00.000Z" },
+    ] as NonNullable<Course["aiInteractionEvents"]>;
+
+    expect(deriveAiCollaborationMetrics(events)).toMatchObject({
+      proactiveSuggestions: 1,
+      dialogueRounds: 2,
+      boundaryTriggers: 1,
+    });
+
+    renderTranscript({ ...course, aiInteractionEvents: events } as Course);
+    expect(screen.queryByText(/待学生决定/)).toBeNull();
+  });
+
+  it("shows the most recently active conversation first", () => {
+    renderTranscript({
+      ...course,
+      aiInteractionEvents: [
+        { id: "old", courseId: "course-1", studentId: "student-1", stageKey: "make", conversationId: "conversation-old", source: "sidebar", eventType: "request", actorRole: "student", content: "较早的对话", createdAt: "2026-09-01T01:00:00.000Z" },
+        { id: "new", courseId: "course-1", studentId: "student-1", stageKey: "make", conversationId: "conversation-new", source: "sidebar", eventType: "request", actorRole: "student", content: "最近的对话", createdAt: "2026-09-01T02:00:00.000Z" },
+      ],
+    } as Course);
+
+    const latest = screen.getByText("最近的对话");
+    const earlier = screen.getByText("较早的对话");
+    expect(latest.compareDocumentPosition(earlier) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+});
+
+it("renders document delivery changes as readable before and after content", () => {
+  render(<ProjectDocumentChanges actions={[{ operation: "replace", description: "补充比较条件", targetText: "原来的结论", content: "带有证据的新结论" }, { operation: "delete", targetText: "应当删除的内容", content: "" }]} />);
+  expect(screen.getByText("补充比较条件")).toBeInTheDocument();
+  expect(screen.getByText("原来的结论")).toBeInTheDocument();
+  expect(screen.getByText("带有证据的新结论")).toBeInTheDocument();
+  expect(screen.getByRole("heading", { name: "删除原文" })).toBeInTheDocument();
+  expect(screen.queryByText("replace")).toBeNull();
+});

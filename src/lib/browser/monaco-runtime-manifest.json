@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "package": "monaco-editor",
+  "version": "0.56.0",
+  "source": "min/vs",
+  "treeHashAlgorithm": "sha256-path-size-content-v1",
+  "treeSha256": "cd69222f4d006ec80376a2a29f75cf5afcab1866abbc56ca32e00bc46d8a2a50",
+  "fileCount": 151,
+  "totalBytes": 24416296
+}

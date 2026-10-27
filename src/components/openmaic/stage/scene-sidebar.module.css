@@ -1,0 +1,22 @@
+.backdrop { display: none; }
+
+@media (max-width: 1023px) {
+  .backdrop {
+    display: block;
+    position: absolute;
+    inset: 0;
+    z-index: 35;
+    background: rgb(15 23 42 / 24%);
+  }
+  .sidebar {
+    position: absolute;
+    inset: 0 auto 0 0;
+    max-width: calc(100% - 44px);
+    background: var(--background, white);
+    z-index: 40;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sidebar { transition: none !important; }
+}

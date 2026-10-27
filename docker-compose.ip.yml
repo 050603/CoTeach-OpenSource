@@ -1,0 +1,91 @@
+# 内网域名(HTTPS)+ host 网络部署覆盖 —— 与 docker-compose.prod.yml 叠加使用:
+#   docker compose --env-file deploy/.deploy.env \
+#     -f docker-compose.prod.yml -f docker-compose.ip.yml \
+#     up -d
+#
+# 本机网络背景:
+#   - 校园网屏蔽 IPv4 出站,仅 IPv6 出站可用;Docker 默认桥接网络为 IPv4-only,
+#     容器内无法访问 npm/apk/LLM API 等外部服务
+#   - 因此全部服务使用 network_mode: host,直接复用宿主机网络栈(IPv6 出站正常)
+#
+# 端口规划(均已避开现有服务 5432/6379/8080/8081/4000/11434 等):
+#   - nginx:        0.0.0.0:80/443(内网入口,HTTP 自动跳转 HTTPS)
+#   - app(Next.js): 127.0.0.1:3000(仅经 Nginx 访问)
+#   - WebSocket:    3001;tldraw sync: 3002
+#   - postgres:     127.0.0.1:15432
+#   - redis:        127.0.0.1:16379
+#
+# 其他差异:
+#   - PUBLIC_BASE_URL 根据 deploy/.deploy.env 的 PUBLIC_HOST 生成 HTTPS 地址
+#   - Nginx 使用 HTTPS 模板和宿主机 Certbot 证书目录
+#   - postgres 复用生产编排的 PostgreSQL 16 + pgvector 0.8.6 自建镜像；
+#     未启用 pgBackRest WAL 云归档，精简备份仅由管理员手动触发
+services:
+  nginx:
+    network_mode: host
+    environment:
+      OPENPBL_UPSTREAM_HOST: 127.0.0.1
+      # 8080 已被宿主机其他服务占用，仅在回环地址暴露内部检查。
+      NGINX_INTERNAL_LISTEN: 127.0.0.1:18082
+    volumes:
+      - ./.openpbl-data/letsencrypt:/etc/letsencrypt:ro
+    ports: !override []
+    # Inherit the production directory bind and explicit template renderer.
+
+  postgres:
+    network_mode: host
+    command: !override
+      - postgres
+      - -h
+      - 127.0.0.1
+      - -p
+      - "15432"
+      - -c
+      - max_connections=120
+      - -c
+      - shared_buffers=1GB
+      - -c
+      - track_wal_io_timing=on
+      - -c
+      - effective_cache_size=3GB
+      - -c
+      - maintenance_work_mem=256MB
+    healthcheck: !override
+      test: ["CMD-SHELL", "pg_isready -U openpbl -d openpbl -p 15432"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  redis:
+    network_mode: host
+    command: !override
+      - redis-server
+      - --port
+      - "16379"
+      - --bind
+      - 127.0.0.1
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --maxmemory
+      - 512mb
+      - --maxmemory-policy
+      - allkeys-lru
+      - --timeout
+      - "0"
+    healthcheck: !override
+      test: ["CMD", "redis-cli", "-p", "16379", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  migrate:
+    network_mode: host
+
+  manual-essential-backup:
+    network_mode: host
+    environment:
+      POSTGRES_HOST: 127.0.0.1
+      POSTGRES_PORT: "15432"

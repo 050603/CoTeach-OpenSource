@@ -1,0 +1,302 @@
+import { randomInt, randomUUID } from "node:crypto";
+import type { Prisma } from "@prisma/client";
+import { z } from "zod";
+import type { AuthClaims } from "@/lib/auth/session";
+import { prisma } from "@/lib/db/client";
+import { runMutationTransaction } from "@/lib/db/transaction-retry";
+import { publishCourseEvent } from "@/lib/realtime/event-bus";
+import { requireStudentUser, requireTeacherUser } from "./access";
+import { EXPERIMENT_QUESTION_LIMIT, ExperimentConfigSchema, ExperimentPhaseSchema, ExperimentQuestionSchema, composeExperimentForms, evaluationContractVersion, experimentConfigFromActivity, gradeExperimentAnswers, hasCompletedClassroomLearning, isPosttestOpen, normalizeExperimentDraftAnswers, posttestAccess, posttestOpenedAt, publicExperimentQuestions, type ExperimentVariant } from "./experiment";
+import { PlatformError } from "./repository";
+
+const ENROLLED = ["ACTIVE", "active", "COMPLETED", "completed"];
+const assignedFormSchema = z.array(ExperimentQuestionSchema).max(EXPERIMENT_QUESTION_LIMIT);
+
+function isPretestAvailable(instance: {
+  status: string;
+  activity: { archivedAt: Date | null; isOpen: boolean; opensAt: Date | null; chapter: { archivedAt: Date | null; isOpen: boolean; opensAt: Date | null; offering: { status: string } } };
+}) {
+  const now = new Date();
+  return ["scheduled", "teaching"].includes(instance.status.toLowerCase())
+    && !instance.activity.archivedAt && !instance.activity.chapter.archivedAt
+    && instance.activity.isOpen && instance.activity.chapter.isOpen
+    && (!instance.activity.opensAt || instance.activity.opensAt <= now)
+    && (!instance.activity.chapter.opensAt || instance.activity.chapter.opensAt <= now)
+    && instance.activity.chapter.offering.status.toLowerCase() === "open";
+}
+
+function isPosttestAvailable(instance: Parameters<typeof isPretestAvailable>[0] & { runtimeConfig: unknown }) {
+  // A posttest is available after learning ends; finishing the main classroom
+  // does not reopen any classroom writes or bypass the activity's permissions.
+  const lifecycle = instance.status.toLowerCase() === "finished"
+    ? { ...instance, status: "TEACHING" } : instance;
+  return isPretestAvailable(lifecycle) && isPosttestOpen(instance.status, instance.runtimeConfig);
+}
+
+function assertPosttestAccessVersion(instance: { runtimeConfig: unknown }, phase: string, accessVersion?: number) {
+  if (phase === "posttest" && evaluationContractVersion(instance.runtimeConfig) === 2 && accessVersion !== posttestAccess(instance.runtimeConfig).version) {
+    throw new PlatformError("ASSESSMENT_ACCESS_VERSION_CONFLICT", "教师已调整后测开放状态，请重新加载后继续作答", 409);
+  }
+}
+
+function assignedQuestions(assignment: { pretestForm: unknown; posttestForm: unknown }, phase: "pretest" | "posttest") {
+  const parsed = assignedFormSchema.safeParse(phase === "pretest" ? assignment.pretestForm : assignment.posttestForm);
+  if (!parsed.success) throw new PlatformError("INVALID_ASSESSMENT_ASSIGNMENT", "测验题目配置有误，请联系教师", 409);
+  return parsed.data;
+}
+
+function draftView(draft: { answers: unknown; currentPage: number; version: number; updatedAt: Date } | null) {
+  return draft ? { answers: draft.answers, currentPage: draft.currentPage, version: draft.version, updatedAt: draft.updatedAt } : null;
+}
+
+async function notifyExperimentChanged(instanceId: string, studentId: string) {
+  if (!studentId) return;
+  try {
+    await publishCourseEvent(instanceId, { type: "submission-updated", courseId: instanceId, at: new Date().toISOString(), payload: { scope: "student", studentId } });
+  } catch (error) {
+    console.error("[experiment] realtime notification failed", error);
+  }
+}
+
+export async function getStudentExperimentAssessment(claims: AuthClaims, instanceId: string, phase: "pretest" | "posttest") {
+  const student = await requireStudentUser(claims);
+  const instance = await prisma.classroomInstance.findUnique({ where: { id: instanceId }, include: { activity: { include: { chapter: { include: { offering: true } } } } } });
+  if (!instance) throw new PlatformError("NOT_FOUND", "课堂不存在", 404);
+  const enrollment = await prisma.enrollment.findUnique({ where: { userId_offeringId: { userId: student.id, offeringId: instance.activity.chapter.offeringId } } });
+  if (!enrollment || !ENROLLED.includes(enrollment.status)) throw new PlatformError("ENROLLMENT_REQUIRED", "请先加入教学班", 403);
+  const assignment = await prisma.experimentAssessmentAssignment.findUnique({ where: { instanceId_enrollmentId: { instanceId, enrollmentId: enrollment.id } } });
+  const enabled = Boolean(assignment || experimentConfigFromActivity(instance.activity.config));
+  const available = phase === "posttest"
+    ? isPosttestAvailable(instance)
+    : isPretestAvailable(instance);
+  const [draft, submission, pretest, participation] = await Promise.all([
+    assignment ? prisma.experimentAssessmentDraft.findUnique({ where: { assignmentId_phase: { assignmentId: assignment.id, phase } } }) : null,
+    prisma.experimentAssessmentSubmission.findUnique({ where: { instanceId_enrollmentId_phase: { instanceId, enrollmentId: enrollment.id, phase } } }),
+    phase === "posttest" ? prisma.experimentAssessmentSubmission.findUnique({ where: { instanceId_enrollmentId_phase: { instanceId, enrollmentId: enrollment.id, phase: "pretest" } }, select: { id: true } }) : null,
+    phase === "posttest" ? prisma.classroomParticipation.findUnique({ where: { instanceId_enrollmentId: { instanceId, enrollmentId: enrollment.id } }, select: { id: true, completedAt: true, firstEnteredAt: true, lastEnteredAt: true } }) : null,
+  ]);
+  const activeEnrollment = enrollment.status.toLowerCase() === "active";
+  const canAnswer = enabled && available && activeEnrollment && Boolean(assignment) && (phase !== "posttest" || Boolean(pretest && hasCompletedClassroomLearning(participation)));
+  const questions = (canAnswer || submission) && assignment ? publicExperimentQuestions(assignedQuestions(assignment, phase)) : [];
+  const config = experimentConfigFromActivity(instance.activity.config);
+  return {
+    enabled, available: canAnswer, questions, variant: assignment?.variant ?? "none",
+    ...(phase === "posttest" && evaluationContractVersion(instance.runtimeConfig) === 2 ? { accessVersion: posttestAccess(instance.runtimeConfig).version } : {}),
+    introduction: phase === "pretest" ? config?.pretestIntroduction : config?.posttestIntroduction,
+    minutes: phase === "pretest" ? config?.pretestMinutes : config?.posttestMinutes,
+    skipReasonPrompt: config?.skipReasonPrompt,
+    blockedReason: !enabled ? "本课堂未开启后测" : !activeEnrollment ? "学习记录已结束，仅可查看已提交的答案。" : !available ? evaluationContractVersion(instance.runtimeConfig) === 2 ? "后测暂未开放，请先完成课堂学习，并在课堂结束后等待教师开放；已提交答案仍可查看。" : instance.status.toLowerCase() === "finished" || instance.activity.chapter.offering.status.toLowerCase() !== "open" ? "课程已结束，后测已关闭，仅可查看已提交的答案。" : "后测暂未开放，请先完成课堂学习并等待课堂结束" : !assignment ? "请先打开课堂活动，获取本人的测验题目" : phase === "posttest" && (!pretest || !hasCompletedClassroomLearning(participation)) ? "请先完成前测和本场课堂学习" : null,
+    draft: canAnswer ? draftView(draft) : null,
+    submission: submission ? { id: submission.id, answers: submission.answers, submittedAt: submission.submittedAt } : null,
+    studentKey: enrollment.id,
+  };
+}
+
+export async function saveExperimentAssessmentDraft(claims: AuthClaims, instanceId: string, input: { phase: "pretest" | "posttest"; answers: unknown; currentPage: number; version: number; accessVersion?: number }) {
+  if (!Number.isInteger(input.currentPage) || input.currentPage < 0 || input.currentPage > 100 || !Number.isInteger(input.version) || input.version < 0) throw new PlatformError("INVALID_INPUT", "草稿页码或版本无效", 400);
+  const result = await runMutationTransaction(async (tx) => {
+    // Students share the classroom lifecycle guard. Their own assignment row
+    // below serializes draft/submit races without queuing the entire class.
+    await tx.$queryRaw`SELECT "id" FROM "ClassroomInstance" WHERE "id" = ${instanceId} FOR SHARE`;
+    const student = await requireStudentUser(claims, tx);
+    const instance = await tx.classroomInstance.findUnique({ where: { id: instanceId }, include: { activity: { include: { chapter: { include: { offering: true } } } } } });
+    if (!instance) throw new PlatformError("NOT_FOUND", "课堂不存在", 404);
+    const enrollment = await tx.enrollment.findUnique({ where: { userId_offeringId: { userId: student.id, offeringId: instance.activity.chapter.offeringId } } });
+    if (!enrollment || !ENROLLED.includes(enrollment.status)) throw new PlatformError("ENROLLMENT_REQUIRED", "请先加入教学班", 403);
+    if (enrollment.status.toLowerCase() !== "active") throw new PlatformError("ASSESSMENT_UNAVAILABLE", "学习记录已结束，无法继续作答", 409);
+    assertPosttestAccessVersion(instance, input.phase, input.accessVersion);
+    const available = input.phase === "posttest" ? isPosttestAvailable(instance) : isPretestAvailable(instance);
+    if (!available) throw new PlatformError("ASSESSMENT_UNAVAILABLE", "当前无法保存测验草稿", 409);
+    await tx.$queryRaw`SELECT "id" FROM "ExperimentAssessmentAssignment" WHERE "instanceId" = ${instanceId} AND "enrollmentId" = ${enrollment.id} FOR UPDATE`;
+    const assignment = await tx.experimentAssessmentAssignment.findUnique({ where: { instanceId_enrollmentId: { instanceId, enrollmentId: enrollment.id } } });
+    if (!assignment) throw new PlatformError("ASSESSMENT_ASSIGNMENT_REQUIRED", "请重新打开课堂活动，获取本人的测验题目", 409);
+    if (input.phase === "posttest") {
+      const [pretest, participation] = await Promise.all([
+        tx.experimentAssessmentSubmission.findUnique({ where: { instanceId_enrollmentId_phase: { instanceId, enrollmentId: enrollment.id, phase: "pretest" } }, select: { id: true } }),
+        tx.classroomParticipation.findUnique({ where: { instanceId_enrollmentId: { instanceId, enrollmentId: enrollment.id } }, select: { id: true, completedAt: true, firstEnteredAt: true, lastEnteredAt: true } }),
+      ]);
+      if (!pretest || !hasCompletedClassroomLearning(participation)) throw new PlatformError("CLASSROOM_PARTICIPATION_REQUIRED", "请先完成前测和本场课堂学习", 409);
+    }
+    const submission = await tx.experimentAssessmentSubmission.findUnique({ where: { instanceId_enrollmentId_phase: { instanceId, enrollmentId: enrollment.id, phase: input.phase } }, select: { id: true } });
+    if (submission) throw new PlatformError("ASSESSMENT_SUBMITTED", "本场测验已提交，不能修改草稿", 409);
+    const answers = normalizeExperimentDraftAnswers(assignedQuestions(assignment, input.phase), input.answers);
+    if (!answers) throw new PlatformError("INVALID_ANSWERS", "草稿包含无效题目或选项", 400);
+    const key = { assignmentId_phase: { assignmentId: assignment.id, phase: input.phase } };
+    const existing = await tx.experimentAssessmentDraft.findUnique({ where: key });
+    if ((existing?.version ?? 0) !== input.version) throw new PlatformError("DRAFT_VERSION_CONFLICT", "草稿已在其他页面更新，请刷新后查看最新内容", 409);
+    const draft = existing
+      ? await tx.experimentAssessmentDraft.update({ where: key, data: { answers: answers as Prisma.InputJsonValue, currentPage: input.currentPage, version: { increment: 1 } } })
+      : await tx.experimentAssessmentDraft.create({ data: { id: randomUUID(), assignmentId: assignment.id, phase: input.phase, answers: answers as Prisma.InputJsonValue, currentPage: input.currentPage } });
+    await tx.domainEvent.create({ data: { id: randomUUID(), idempotencyKey: randomUUID(), actorId: student.id, offeringId: instance.activity.chapter.offeringId, classroomInstanceId: instanceId, researchKey: enrollment.researchKey, eventType: "experiment-draft-updated", payload: { scope: "student", studentId: student.id, phase: input.phase } } });
+    return { draft: draftView(draft) };
+  });
+  await notifyExperimentChanged(instanceId, claims.sub ?? "");
+  return result;
+}
+
+/** Shared parent guards exclude teacher edits while distinct students proceed. */
+export async function ensureExperimentAssignment(instanceId: string, enrollmentId: string) {
+  return runMutationTransaction(async (tx) => {
+    // Duplicate requests for one student serialize before taking parent guards.
+    await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`experiment-assignment:${instanceId}:${enrollmentId}`}, 0))::text`;
+    const ref = await tx.classroomInstance.findUnique({ where: { id: instanceId }, select: { activityId: true, activity: { select: { chapterId: true } } } });
+    if (!ref) return null;
+    await tx.$queryRaw`SELECT "id" FROM "Chapter" WHERE "id" = ${ref.activity.chapterId} FOR SHARE`;
+    await tx.$queryRaw`SELECT "id" FROM "Activity" WHERE "id" = ${ref.activityId} FOR SHARE`;
+    await tx.$queryRaw`SELECT "id" FROM "ClassroomInstance" WHERE "id" = ${instanceId} FOR SHARE`;
+    const instance = await tx.classroomInstance.findUnique({ where: { id: instanceId }, include: { activity: { include: { chapter: { include: { offering: true } } } } } });
+    const now = new Date();
+    if (!instance || !["scheduled", "teaching"].includes(instance.status.toLowerCase()) || instance.activity.archivedAt || instance.activity.chapter.archivedAt || !instance.activity.isOpen || !instance.activity.chapter.isOpen || instance.activity.opensAt && instance.activity.opensAt > now || instance.activity.chapter.opensAt && instance.activity.chapter.opensAt > now || instance.activity.chapter.offering.status.toLowerCase() !== "open") return null;
+    const enrollment = await tx.enrollment.findUnique({ where: { id: enrollmentId }, select: { offeringId: true, status: true } });
+    if (!enrollment || enrollment.offeringId !== instance.activity.chapter.offeringId || !ENROLLED.includes(enrollment.status)) return null;
+    const experiment = experimentConfigFromActivity(instance.activity.config);
+    if (!experiment) return null;
+    const existing = await tx.experimentAssessmentAssignment.findUnique({ where: { instanceId_enrollmentId: { instanceId, enrollmentId } } });
+    if (existing) return existing;
+    let variant: ExperimentVariant = "none";
+    if (experiment.scenarioPair) {
+      // Only balanced A/B allocation needs a class-wide critical section.
+      // The assignment uniqueness lock and parent guards are otherwise shared.
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`experiment-counterbalance:${instanceId}`}, 0))::text`;
+      const [aCount, bCount] = await Promise.all([
+        tx.experimentAssessmentAssignment.count({ where: { instanceId, variant: "A_PRE_B_POST" } }),
+        tx.experimentAssessmentAssignment.count({ where: { instanceId, variant: "B_PRE_A_POST" } }),
+      ]);
+      variant = aCount < bCount ? "A_PRE_B_POST" : bCount < aCount ? "B_PRE_A_POST" : randomInt(2) === 0 ? "A_PRE_B_POST" : "B_PRE_A_POST";
+    }
+    const forms = composeExperimentForms(experiment, variant, randomInt);
+    return tx.experimentAssessmentAssignment.create({ data: {
+      id: randomUUID(), instanceId, enrollmentId, variant,
+      pretestForm: forms.pretest as Prisma.InputJsonValue,
+      posttestForm: forms.posttest as Prisma.InputJsonValue,
+    } });
+  });
+}
+
+export async function submitExperimentAssessment(
+  claims: AuthClaims,
+  instanceId: string,
+  input: { phase: unknown; answers: unknown; accessVersion?: number },
+) {
+  const phase = ExperimentPhaseSchema.safeParse(input.phase);
+  if (!phase.success) throw new PlatformError("INVALID_INPUT", "请选择前测或后测", 400);
+  const result = await runMutationTransaction(async (tx) => {
+    await tx.$queryRaw`SELECT "id" FROM "ClassroomInstance" WHERE "id" = ${instanceId} FOR SHARE`;
+    const student = await requireStudentUser(claims, tx);
+    const instance = await tx.classroomInstance.findUnique({
+      where: { id: instanceId },
+      include: { activity: { include: { chapter: { include: { offering: true } } } } },
+    });
+    if (!instance) throw new PlatformError("NOT_FOUND", "课堂不存在", 404);
+    const offering = instance.activity.chapter.offering;
+    const enrollment = await tx.enrollment.findUnique({ where: { userId_offeringId: { userId: student.id, offeringId: offering.id } } });
+    if (!enrollment || !ENROLLED.includes(enrollment.status)) throw new PlatformError("ENROLLMENT_REQUIRED", "请先加入教学班", 403);
+    if (enrollment.status.toLowerCase() !== "active") throw new PlatformError("ASSESSMENT_UNAVAILABLE", "学习记录已结束，无法继续作答", 409);
+    assertPosttestAccessVersion(instance, phase.data, input.accessVersion);
+    if (instance.activity.archivedAt || instance.activity.chapter.archivedAt) throw new PlatformError("ACTIVITY_LOCKED", "课堂已归档", 403);
+    const status = instance.status.toLowerCase();
+    if (phase.data === "pretest") {
+      const now = new Date();
+      if (!["scheduled", "teaching"].includes(status) || offering.status.toLowerCase() !== "open" || !instance.activity.isOpen || !instance.activity.chapter.isOpen || instance.activity.opensAt && instance.activity.opensAt > now || instance.activity.chapter.opensAt && instance.activity.chapter.opensAt > now) {
+        throw new PlatformError("PRETEST_UNAVAILABLE", "当前无法提交课前测", 409);
+      }
+    } else if (!isPosttestAvailable(instance)) {
+      throw new PlatformError("POSTTEST_UNAVAILABLE", "后测暂未开放，请先完成课堂学习，并在课堂结束、后测开放后作答", 409);
+    }
+    await tx.$queryRaw`SELECT "id" FROM "ExperimentAssessmentAssignment" WHERE "instanceId" = ${instanceId} AND "enrollmentId" = ${enrollment.id} FOR UPDATE`;
+    const assignment = await tx.experimentAssessmentAssignment.findUnique({ where: { instanceId_enrollmentId: { instanceId, enrollmentId: enrollment.id } } });
+    if (!assignment) throw new PlatformError("ASSESSMENT_ASSIGNMENT_REQUIRED", "请重新打开课堂活动，获取本人的测验题目", 409);
+    const questionnaire = { enabled: true, pretest: assignedQuestions(assignment, "pretest"), posttest: assignedQuestions(assignment, "posttest") };
+    if (phase.data === "posttest") {
+      const [pretest, participation] = await Promise.all([
+        tx.experimentAssessmentSubmission.findUnique({ where: { instanceId_enrollmentId_phase: { instanceId, enrollmentId: enrollment.id, phase: "pretest" } }, select: { id: true } }),
+        tx.classroomParticipation.findUnique({ where: { instanceId_enrollmentId: { instanceId, enrollmentId: enrollment.id } }, select: { id: true, completedAt: true, firstEnteredAt: true, lastEnteredAt: true } }),
+      ]);
+      if (!pretest || !hasCompletedClassroomLearning(participation)) throw new PlatformError("CLASSROOM_PARTICIPATION_REQUIRED", "请先完成前测和本场课堂学习", 409);
+    }
+    const graded = gradeExperimentAnswers(questionnaire[phase.data], input.answers);
+    if (!graded) throw new PlatformError("INVALID_ANSWERS", "请完成所有题目并检查选项后提交", 400);
+    const existing = await tx.experimentAssessmentSubmission.findUnique({ where: { instanceId_enrollmentId_phase: { instanceId, enrollmentId: enrollment.id, phase: phase.data } } });
+    if (existing) {
+      if (JSON.stringify(existing.answers) === JSON.stringify(graded.answers)) return existing;
+      throw new PlatformError("ASSESSMENT_SUBMITTED", "本场测验已提交，不能重复作答", 409);
+    }
+    const submitted = await tx.experimentAssessmentSubmission.create({ data: {
+      id: randomUUID(), instanceId, enrollmentId: enrollment.id, assignmentId: assignment.id, phase: phase.data,
+      researchKey: enrollment.researchKey,
+      questionnaire: questionnaire as Prisma.InputJsonValue,
+      answers: graded.answers as Prisma.InputJsonValue,
+      objectiveScore: graded.objectiveScore,
+      objectiveTotal: graded.objectiveTotal,
+    } });
+    await tx.experimentAssessmentDraft.deleteMany({ where: { assignmentId: assignment.id, phase: phase.data } });
+    await tx.domainEvent.create({ data: { id: randomUUID(), idempotencyKey: randomUUID(), actorId: student.id, offeringId: offering.id, classroomInstanceId: instanceId, researchKey: enrollment.researchKey, eventType: "experiment-assessment-submitted", payload: { scope: "student", studentId: student.id, phase: phase.data } } });
+    return submitted;
+  });
+  await notifyExperimentChanged(instanceId, claims.sub ?? "");
+  return result;
+}
+
+export async function getClassroomExperimentResults(claims: AuthClaims, instanceId: string) {
+  const teacher = await requireTeacherUser(claims);
+  const instance = await prisma.classroomInstance.findUnique({ where: { id: instanceId }, include: { activity: { include: { chapter: true } } } });
+  if (!instance) throw new PlatformError("NOT_FOUND", "课堂不存在", 404);
+  const offeringId = instance.activity.chapter.offeringId;
+  if (!await prisma.courseTeacher.findFirst({ where: { offeringId, userId: teacher.id }, select: { id: true } })) throw new PlatformError("FORBIDDEN", "无权查看该课堂", 403);
+  const [submissions, assignments, enrollments, participations, drafts] = await Promise.all([
+    prisma.experimentAssessmentSubmission.findMany({
+      where: { instanceId, enrollment: { offeringId } }, orderBy: [{ submittedAt: "asc" }, { id: "asc" }],
+      include: { enrollment: { select: { user: { select: { id: true, displayName: true, username: true } } } }, assignment: { select: { variant: true } } },
+    }),
+    prisma.experimentAssessmentAssignment.findMany({ where: { instanceId }, select: { variant: true, enrollmentId: true } }),
+    prisma.enrollment.findMany({ where: { offeringId, status: { in: ENROLLED } }, select: { id: true, user: { select: { id: true, displayName: true } } } }),
+    prisma.classroomParticipation.findMany({
+      where: { instanceId, enrollment: { offeringId }, OR: [{ firstEnteredAt: { not: null } }, { lastEnteredAt: { not: null } }] },
+      select: { enrollmentId: true, enrollment: { select: { status: true, user: { select: { id: true, displayName: true } } } } },
+    }),
+    prisma.experimentAssessmentDraft.findMany({ where: { phase: "posttest", assignment: { instanceId } }, select: { assignment: { select: { enrollmentId: true } } } }),
+  ]);
+  const snapshot = submissions[0] ? ExperimentConfigSchema.safeParse(submissions[0].questionnaire) : null;
+  const experiment = snapshot?.success ? snapshot.data : assignments.length ? { enabled: true } : experimentConfigFromActivity(instance.activity.config);
+  const activeEnrollmentIds = new Set(enrollments.map((row) => row.id));
+  const participantsByEnrollment = new Map(participations.map((row) => [row.enrollmentId, row]));
+  const participantIds = new Set(participantsByEnrollment.keys());
+  const pretestIds = new Set(submissions.filter((row) => row.phase === "pretest" && activeEnrollmentIds.has(row.enrollmentId)).map((row) => row.enrollmentId));
+  const posttestSubmissions = submissions.filter((row) => row.phase === "posttest" && participantIds.has(row.enrollmentId));
+  const posttestByEnrollment = new Map(posttestSubmissions.map((row) => [row.enrollmentId, row]));
+  const submittedIds = new Set(posttestByEnrollment.keys());
+  const draftingIds = new Set(drafts.map((row) => row.assignment.enrollmentId));
+  return {
+    instanceId,
+    activityId: instance.activityId,
+    runNo: instance.runNo,
+    status: instance.status.toLowerCase(),
+    evaluationContractVersion: evaluationContractVersion(instance.runtimeConfig),
+    ...(evaluationContractVersion(instance.runtimeConfig) === 2 ? { posttestAccess: posttestAccess(instance.runtimeConfig) } : {}),
+    enabled: Boolean(experiment),
+    posttestAvailable: isPosttestOpen(instance.status, instance.runtimeConfig),
+    enrollmentCount: enrollments.length,
+    participantCount: participantIds.size,
+    posttestOpenedAt: posttestOpenedAt(instance.runtimeConfig),
+    posttestDraftCount: [...participantIds].filter((id) => draftingIds.has(id) && !submittedIds.has(id)).length,
+    studentRows: [...participantsByEnrollment.values()].map((row) => ({
+      student: row.enrollment.user,
+      enrollmentStatus: row.enrollment.status.toLowerCase(),
+      status: submittedIds.has(row.enrollmentId) ? "submitted" as const : draftingIds.has(row.enrollmentId) ? "in-progress" as const : "not-started" as const,
+      ...(posttestByEnrollment.get(row.enrollmentId)?.submittedAt ? { submittedAt: posttestByEnrollment.get(row.enrollmentId)!.submittedAt } : {}),
+    })),
+    pretestCount: pretestIds.size,
+    posttestCount: submittedIds.size,
+    variantCounts: {
+      aPreBPost: assignments.filter((row) => row.variant === "A_PRE_B_POST").length,
+      bPreAPost: assignments.filter((row) => row.variant === "B_PRE_A_POST").length,
+    },
+    submissions: submissions.map((row) => ({
+      id: row.id, phase: row.phase,
+      variant: row.assignment.variant,
+      student: row.enrollment.user, submittedAt: row.submittedAt,
+      questionnaire: row.questionnaire, answers: row.answers,
+      objectiveScore: row.objectiveScore, objectiveTotal: row.objectiveTotal,
+    })),
+  };
+}

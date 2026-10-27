@@ -1,0 +1,199 @@
+// Node.js runtime 专用的 instrumentation。
+//
+// 此文件仅在 Node.js runtime 中加载（通过 instrumentation.ts 的条件
+// 动态 import），因此可以自由使用 Node.js 内置模块（node:async_hooks、
+// node:crypto）和 Node.js API（process.on、process.exit）。
+//
+// 用途：
+//   - 初始化 prom-client 默认指标采集（堆、事件循环、CPU、GC 等）。
+//   - 启动 WebSocket 服务器用于实时课堂同步。
+//   - 注册 SIGTERM / SIGINT 优雅关闭信号处理器（Stage 7）：
+//     翻转关闭标志 → 运行清理钩子 → 关闭 WebSocket → 断开 Prisma → exit 0。
+
+let registered = false;
+let registration: Promise<void> | null = null;
+
+export function register(): Promise<void> {
+  if (registered) return Promise.resolve();
+  if (!registration) registration = initialize().then(() => { registered = true; }, error => {
+    registration = null;
+    throw error;
+  });
+  return registration;
+}
+
+async function initialize(): Promise<void> {
+  if (process.env.ENABLE_TLDRAW_SYNC === "true") {
+    throw new Error("ENABLE_TLDRAW_SYNC is no longer supported: the unconnected tldraw prototype was removed from this distribution. Remove this setting; existing board snapshots are preserved.");
+  }
+  const { assertProductionEnvironment } = await import("@/lib/config/env");
+  assertProductionEnvironment();
+  const { registerShutdownHook } = await import("@/lib/runtime/lifecycle");
+  const { startNodeHttpIngressClock, stopNodeHttpIngressClock } = await import("@/lib/observability/node-http-ingress");
+  if (startNodeHttpIngressClock()) {
+    registerShutdownHook("node-http-ingress", async () => { stopNodeHttpIngressClock(); });
+  }
+  const { installEnvironmentHttpProxy } = await import(
+    "@/lib/network/environment-http-proxy"
+  );
+  installEnvironmentHttpProxy();
+  const { initializeServerProviderConfig } = await import(
+    "@/lib/openmaic/server/provider-config"
+  );
+  await initializeServerProviderConfig();
+  // A first class-wide submission must not pay the browser-oriented DOCX
+  // module's cold parsing cost on the request/event loop. A failed engine load
+  // fails startup rather than advertising an unusable submission feature.
+  const { initializeProjectDocumentArchive } = await import("@/lib/project-practice/document-archive");
+  await initializeProjectDocumentArchive();
+  const { stopDocumentConversionPool } = await import("@/lib/project-practice/document-conversion-pool");
+  registerShutdownHook("document-converters", stopDocumentConversionPool, { timeout: 10_000 });
+  // Side-effect import: triggers collectDefaultMetrics() exactly once.
+  await import("@/lib/observability/metrics");
+  const { initializeCourseReadWorkers, stopCourseReadWorkers } = await import("@/lib/courses/course-read-worker-pool");
+  await initializeCourseReadWorkers();
+  registerShutdownHook("course-read-workers", stopCourseReadWorkers, { timeout: 10_000 });
+  // Edge timing is optional monitoring, never a readiness dependency. Establish
+  // the current log EOF before serving so the first classroom burst is retained.
+  try {
+    const edge = await import("@/lib/observability/nginx-edge-metrics");
+    registerShutdownHook("nginx-edge-log", edge.closeNginxEdgeMetrics);
+    await edge.initializeNginxEdgeMetrics();
+  } catch { console.warn("Nginx edge telemetry initialization unavailable"); }
+
+  const { isBackgroundCourseGenerationEnabled } = await import("@/lib/course-generation/capability");
+  if (isBackgroundCourseGenerationEnabled()) {
+    const { startCourseGenerationWorker } = await import("@/lib/course-generation/job-runner");
+    const { startCourseDesignWorker } = await import("@/lib/course-design/job-runner");
+    const { startResourcePackageWorker } = await import("@/lib/resource-package/job-runner");
+    const { startCourseQualityReviewWorker } = await import("@/lib/course-quality-review/job-runner");
+    const { startTextbookIngestWorker } = await import("@/lib/textbook/worker");
+    await startCourseGenerationWorker();
+    await startCourseDesignWorker();
+    await startResourcePackageWorker();
+    await startCourseQualityReviewWorker();
+    await startTextbookIngestWorker();
+  }
+
+  if (process.env.ENABLE_WEBSOCKET === "true") {
+    const { initializeEventBus } = await import("@/lib/realtime/event-bus");
+    const { startWebSocketServer } = await import("@/lib/realtime/websocket-server");
+    await initializeEventBus();
+    const wsPort = Number(process.env.WEBSOCKET_PORT ?? "3001");
+    const wsHost = process.env.WEBSOCKET_HOST?.trim() || "127.0.0.1";
+    await startWebSocketServer(wsPort, wsHost);
+  }
+
+  const { startAiAuditOutbox } = await import("@/lib/ai-collaboration/audit-outbox");
+  startAiAuditOutbox();
+
+  const { startKnowledgeExplanationWorker, stopKnowledgeExplanationWorker } = await import("@/lib/courses/knowledge-explanation-warmup");
+  startKnowledgeExplanationWorker();
+  registerShutdownHook("knowledge-explanation-worker", stopKnowledgeExplanationWorker);
+
+  const { startDocumentReviewWorker, stopDocumentReviewWorker } = await import("@/lib/ai-collaboration/document-review-worker");
+  startDocumentReviewWorker();
+  registerShutdownHook("document-review-worker", stopDocumentReviewWorker, { timeout: 7_000 });
+
+  const { startShowcaseRecommendationWorker, stopShowcaseRecommendationWorker } = await import("@/lib/showcase/recommendation-worker");
+  startShowcaseRecommendationWorker();
+  registerShutdownHook("showcase-recommendation-worker", stopShowcaseRecommendationWorker, { timeout: 7_000 });
+
+  const { startProcessEvaluationWorker, stopProcessEvaluationWorker } = await import("@/lib/evaluation/process-worker");
+  startProcessEvaluationWorker();
+  registerShutdownHook("process-evaluation-worker", stopProcessEvaluationWorker, { timeout: 7_000 });
+
+  const { startContentMonitorWorker, stopContentMonitorWorker } = await import("@/lib/project-practice/content-monitor-worker");
+  startContentMonitorWorker();
+  registerShutdownHook("content-monitor-worker", stopContentMonitorWorker, { timeout: 7_000 });
+
+  // Register graceful-shutdown signal handlers (Stage 7).
+  await installShutdownHandlers();
+}
+
+async function installShutdownHandlers(): Promise<void> {
+  const { beginShutdown, SHUTDOWN_TIMEOUT_MS } = await import(
+    "@/lib/runtime/lifecycle"
+  );
+  const { logger } = await import("@/lib/observability/logger");
+
+  let shuttingDown = false;
+
+  const handleSignal = (signal: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+
+    // Hard ceiling: even if beginShutdown() hangs (e.g. a hook ignores its
+    // timeout), force-exit slightly after the budget. `.unref()` so this
+    // timer doesn't keep the event loop alive on its own.
+    const forceExitTimer = setTimeout(() => {
+      logger.error(
+        { signal, budgetMs: SHUTDOWN_TIMEOUT_MS },
+        "graceful shutdown exceeded budget; forcing exit",
+      );
+      process.exit(1);
+    }, SHUTDOWN_TIMEOUT_MS + 2_000);
+    forceExitTimer.unref?.();
+
+    // 1) Flip isShuttingDown() -> health checks return 503, LB drains.
+    // 2) Run registered cleanup hooks (each with its own timeout).
+    beginShutdown(`received ${signal}`)
+      .then(async () => {
+        if (process.env.ENABLE_WEBSOCKET === "true") {
+          const { closeWebSocketServer } = await import(
+            "@/lib/realtime/websocket-server"
+          );
+          const { closeEventBus } = await import("@/lib/realtime/event-bus");
+          await closeWebSocketServer();
+          await closeEventBus();
+        }
+
+        const { stopCourseGenerationWorker } = await import("@/lib/course-generation/job-runner");
+        const { stopCourseDesignWorker } = await import("@/lib/course-design/job-runner");
+        const { stopResourcePackageWorker } = await import("@/lib/resource-package/job-runner");
+        const { stopCourseQualityReviewWorker } = await import("@/lib/course-quality-review/job-runner");
+        const { stopTextbookIngestWorker } = await import("@/lib/textbook/worker");
+        await stopCourseGenerationWorker();
+        await stopCourseDesignWorker();
+        await stopResourcePackageWorker();
+        await stopCourseQualityReviewWorker();
+        await stopTextbookIngestWorker();
+
+        // 4) Close the database connection. Prisma is always instantiated
+        //    (singleton), but if DATABASE_URL is unset (Demo mode) calling
+        //    $disconnect is a safe no-op.
+        try {
+          const { closeRedisClient } = await import("@/lib/redis/client");
+          await closeRedisClient();
+        } catch (err) {
+          logger.warn(
+            { err: err instanceof Error ? err.message : String(err) },
+            "Redis client shutdown failed",
+          );
+        }
+
+        try {
+          const { prisma } = await import("@/lib/db/client");
+          await prisma.$disconnect();
+        } catch (err) {
+          logger.warn(
+            { err: err instanceof Error ? err.message : String(err) },
+            "prisma.$disconnect() failed during shutdown",
+          );
+        }
+
+        // 5) Exit cleanly.
+        process.exit(0);
+      })
+      .catch((err: unknown) => {
+        logger.error(
+          { err: err instanceof Error ? err.message : String(err) },
+          "graceful shutdown threw; forcing exit",
+        );
+        process.exit(1);
+      });
+  };
+
+  process.on("SIGTERM", () => handleSignal("SIGTERM"));
+  process.on("SIGINT", () => handleSignal("SIGINT"));
+}

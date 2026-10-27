@@ -1,0 +1,491 @@
+/**
+ * Action — the universal playback verb contract.
+ *
+ * Actions are the sole mechanism for agents to drive a presentation. Two
+ * categories:
+ * - Fire-and-forget: visual effects on slides (spotlight, laser)
+ * - Synchronous: must wait for completion before the next action (speech,
+ *   whiteboard, video, discussion, widget interactions)
+ *
+ * Both the online (streaming) and offline (playback) paths consume the same
+ * Action types, so they belong in the contract alongside the lesson skeleton
+ * (`Stage` / `Scene`): a consumer of `@openmaic/dsl` can now describe both what a
+ * lesson *looks like* and how it *plays back*.
+ *
+ * No runtime dependencies. Pure types + plain data constants only.
+ */
+
+import type { AssetRef } from './storage.js';
+
+// ==================== Base ====================
+
+export interface ActionBase {
+  id: string;
+  title?: string;
+  description?: string;
+  /** Whiteboard elements sharing this id move as one composition. */
+  groupId?: string;
+}
+
+/** An attachment to an existing whiteboard element, in board coordinates. */
+export interface WhiteboardAnchor {
+  elementId: string;
+  side: 'top' | 'right' | 'bottom' | 'left' | 'center';
+}
+
+// ==================== Fire-and-forget actions ====================
+
+/** Select one complete rendered table row by its zero-based row index. */
+export interface TableRowVisualTargetSelector {
+  /** @minimum 0 */
+  rowIndex: number;
+  quote?: string;
+  occurrence?: number;
+}
+
+/** Select a precise region inside a slide element. `occurrence` is zero-based. */
+export type VisualTargetSelector =
+  | { cellId: string; quote?: string; occurrence?: number }
+  | TableRowVisualTargetSelector
+  | { quote: string; occurrence?: number };
+
+/** A precise target activated at its own narration anchor after the primary target. */
+export interface LaserWaypoint {
+  elementId: string;
+  selector?: VisualTargetSelector;
+  /** Phrase that activates this target inside the laser's bound narration. */
+  speechAnchor?: SpeechAnchor;
+  /** Compiled media time for `speechAnchor`, in milliseconds. */
+  speechOffsetMs?: number;
+}
+
+/** Stable semantic start point inside the cue's bound narration paragraph. */
+export interface SpeechAnchor {
+  quote: string;
+  occurrence?: number;
+}
+
+/** Whiteboard commands may run at an authored point inside narration.
+ * Without `speechId`, they retain the legacy sequential playback behavior. */
+export interface WhiteboardActionBase extends ActionBase {
+  speechId?: string;
+  speechAnchor?: SpeechAnchor;
+  /** Compiled media time inside `speechId`, in milliseconds. Defaults to 0. */
+  speechOffsetMs?: number;
+}
+
+/** One aligned text span. Character offsets are UTF-16 and `endChar` is exclusive. */
+export interface SpeechAlignmentSpan {
+  /** Exact slice of the original narration, including punctuation or whitespace when aligned. */
+  text: string;
+  startChar: number;
+  endChar: number;
+  startMs: number;
+  endMs: number;
+}
+
+export type SpeechAlignmentStatus = 'pending' | 'aligned' | 'failed';
+
+/** Cached forced-alignment result for one narration audio asset and its original text. */
+export interface SpeechAlignment {
+  /** Aligner data-contract/model version used to produce the spans. */
+  version: string;
+  status: SpeechAlignmentStatus;
+  /** Fingerprints invalidate this timeline when narration text or audio changes. */
+  textHash: string;
+  audioHash: string;
+  language?: string;
+  spans: SpeechAlignmentSpan[];
+  /** Stable, teacher-facing reason when alignment could not be produced. */
+  error?: string;
+}
+
+export type VisualCueNecessity = 'essential' | 'helpful';
+
+/** Spotlight — focus on a single element, dim everything else */
+export interface SpotlightAction extends ActionBase {
+  type: 'spotlight';
+  elementId: string;
+  selector?: VisualTargetSelector;
+  /** Narration segment whose lifetime owns this visual cue. */
+  speechId?: string;
+  /** Start time inside `speechId`, in media milliseconds. Defaults to 0. */
+  speechOffsetMs?: number;
+  /** Phrase whose position is converted locally to `speechOffsetMs`. */
+  speechAnchor?: SpeechAnchor;
+  /** Phrase at which this cue stops being active. */
+  endSpeechAnchor?: SpeechAnchor;
+  /** Compiled media time for `endSpeechAnchor`, in milliseconds. */
+  endSpeechOffsetMs?: number;
+  necessity?: VisualCueNecessity;
+  omissionRisk?: string;
+  /** Optional final narration segment through which the spotlight remains active. */
+  endSpeechId?: string;
+  dimOpacity?: number; // default 0.5
+}
+
+/** Maximum number of stops after the laser's initial target. */
+export const MAX_LASER_WAYPOINTS = 12;
+
+/** Laser — point at an element with a laser effect */
+export interface LaserAction extends ActionBase {
+  type: 'laser';
+  elementId: string;
+  selector?: VisualTargetSelector;
+  /** Ordered targets activated by their individual narration anchors. */
+  waypoints?: LaserWaypoint[];
+  /** Narration segment whose lifetime owns this visual cue. */
+  speechId?: string;
+  /** Start time inside `speechId`, in media milliseconds. Defaults to 0. */
+  speechOffsetMs?: number;
+  /** Phrase whose position is converted locally to `speechOffsetMs`. */
+  speechAnchor?: SpeechAnchor;
+  /** Phrase at which this cue stops being active. */
+  endSpeechAnchor?: SpeechAnchor;
+  /** Compiled media time for `endSpeechAnchor`, in milliseconds. */
+  endSpeechOffsetMs?: number;
+  necessity?: VisualCueNecessity;
+  omissionRisk?: string;
+  color?: string; // default '#ff0000'
+  /** Visible duration in milliseconds. Runtime default: 2500. */
+  duration?: number;
+}
+
+// ==================== Synchronous actions ====================
+
+/** Speech — teacher narration (wait for TTS to finish) */
+export interface SpeechAction extends ActionBase {
+  type: 'speech';
+  text: string;
+  /** Authored quiz narration phase, retained for the two learner-controlled waits. */
+  quizNarrationPhase?: 'intro' | 'review-guidance' | 'handoff';
+  /**
+   * An asset reference for narration audio. Documents converted by the app-side
+   * reference converter (#1007 part 2, step c) hold allocated asset ids here.
+   * Unconverted legacy documents may still carry TTS-derived ids until they are
+   * opened and converted; such values are foreign to the asset pool and resolve
+   * through the app's legacy read fallbacks.
+   */
+  audioId?: AssetRef;
+  /** Legacy OpenPBL TTS URL retained until all persisted classrooms use asset refs. */
+  audioUrl?: string;
+  /** Decoded duration of the generated audio asset, in seconds. */
+  audioDurationSec?: number;
+  /** Prevent legacy derived-id fallback after an edit invalidates old narration. */
+  audioInvalidated?: boolean;
+  /** Word/character timing tied to the exact `text` and audio fingerprints. */
+  speechAlignment?: SpeechAlignment;
+  voice?: string;
+  speed?: number; // default 1.0
+}
+
+/** Open whiteboard (wait for animation) */
+export interface WbOpenAction extends WhiteboardActionBase {
+  type: 'wb_open';
+}
+
+/** Draw text on whiteboard (wait for render) */
+export interface WbDrawTextAction extends WhiteboardActionBase {
+  type: 'wb_draw_text';
+  elementId?: string; // Custom element ID for later reference (e.g. wb_delete)
+  content: string; // HTML string or plain text
+  x: number;
+  y: number;
+  width?: number; // default 400
+  height?: number; // default 100
+  fontSize?: number; // default 18
+  color?: string; // default '#333333'
+}
+
+/** Show an existing image on the whiteboard (wait for render). */
+export interface WbDrawImageAction extends WhiteboardActionBase {
+  type: 'wb_draw_image';
+  elementId?: string;
+  /** Image asset reference, data URL, or concrete URL. */
+  src: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+/** Draw shape on whiteboard (wait for render) */
+export interface WbDrawShapeAction extends WhiteboardActionBase {
+  type: 'wb_draw_shape';
+  elementId?: string; // Custom element ID for later reference (e.g. wb_delete)
+  shape: 'rectangle' | 'circle' | 'triangle';
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  fillColor?: string; // default '#5b9bd5'
+}
+
+/** Draw chart on whiteboard (wait for render) */
+export interface WbDrawChartAction extends WhiteboardActionBase {
+  type: 'wb_draw_chart';
+  elementId?: string; // Custom element ID for later reference (e.g. wb_delete)
+  chartType: 'bar' | 'column' | 'line' | 'pie' | 'ring' | 'area' | 'radar' | 'scatter';
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  data: {
+    labels: string[];
+    legends: string[];
+    series: number[][];
+  };
+  themeColors?: string[];
+}
+
+/** Draw LaTeX formula on whiteboard (wait for render) */
+export interface WbDrawLatexAction extends WhiteboardActionBase {
+  type: 'wb_draw_latex';
+  elementId?: string; // Custom element ID for later reference (e.g. wb_delete)
+  latex: string;
+  x: number;
+  y: number;
+  width?: number; // default 400
+  height?: number; // auto-calculated based on formula aspect ratio
+  color?: string; // default '#000000'
+}
+
+/** Draw table on whiteboard (wait for render) */
+export interface WbDrawTableAction extends WhiteboardActionBase {
+  type: 'wb_draw_table';
+  elementId?: string; // Custom element ID for later reference (e.g. wb_delete)
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  data: string[][]; // Simplified 2D string array, first row is header
+  outline?: { width: number; style: string; color: string };
+  theme?: { color: string };
+}
+
+/** Draw line/arrow on whiteboard (wait for render) */
+export interface WbDrawLineAction extends WhiteboardActionBase {
+  type: 'wb_draw_line';
+  elementId?: string; // Custom element ID for later reference (e.g. wb_delete)
+  startX: number; // Start X position (0-1000)
+  startY: number; // Start Y position (0-562)
+  endX: number; // End X position (0-1000)
+  endY: number; // End Y position (0-562)
+  /** Resolve against the target's current bounds; coordinates remain a legacy fallback. */
+  startAnchor?: WhiteboardAnchor;
+  endAnchor?: WhiteboardAnchor;
+  color?: string; // Default '#333333'
+  width?: number; // Line width, default 2
+  style?: 'solid' | 'dashed'; // Default 'solid'
+  points?: ['', 'arrow'] | ['arrow', ''] | ['arrow', 'arrow'] | ['', '']; // Endpoint markers, default ['', '']
+}
+
+/** Clear all whiteboard elements */
+export interface WbClearAction extends WhiteboardActionBase {
+  type: 'wb_clear';
+}
+
+/** Delete a specific whiteboard element by ID */
+export interface WbDeleteAction extends WhiteboardActionBase {
+  type: 'wb_delete';
+  elementId: string;
+}
+
+/** Close whiteboard (wait for animation) */
+export interface WbCloseAction extends WhiteboardActionBase {
+  type: 'wb_close';
+}
+
+/** Draw code block on whiteboard (wait for typing animation) */
+export interface WbDrawCodeAction extends WhiteboardActionBase {
+  type: 'wb_draw_code';
+  elementId?: string;
+  language: string;
+  code: string; // Raw code text, lines separated by \n
+  x: number;
+  y: number;
+  width?: number; // Default 500
+  height?: number; // Default 300
+  fileName?: string;
+}
+
+/** Edit code block on whiteboard (line-level operations) */
+export interface WbEditCodeAction extends WhiteboardActionBase {
+  type: 'wb_edit_code';
+  elementId: string; // Target code block ID
+  operation: 'insert_after' | 'insert_before' | 'delete_lines' | 'replace_lines';
+  lineId?: string; // Reference line ID for insert operations
+  lineIds?: string[]; // Target line IDs for delete/replace operations
+  content?: string; // New content for insert/replace, lines separated by \n
+}
+
+/** Play video — start playback of a video element on the slide */
+export interface PlayVideoAction extends ActionBase {
+  type: 'play_video';
+  elementId: string;
+}
+
+/** Discussion — trigger a roundtable discussion */
+export interface DiscussionAction extends ActionBase {
+  type: 'discussion';
+  topic: string;
+  prompt?: string;
+  agentId?: string;
+}
+
+// ==================== Widget Interaction Actions ====================
+
+/** Widget Highlight — highlight an element in a widget iframe */
+export interface WidgetHighlightAction extends ActionBase {
+  type: 'widget_highlight';
+  target: string; // CSS selector or element ID in the iframe
+  content?: string; // Speech text to accompany the highlight
+}
+
+/** Widget SetState — set widget state (e.g., simulation variables) */
+export interface WidgetSetStateAction extends ActionBase {
+  type: 'widget_setState';
+  state: Record<string, unknown>;
+  content?: string; // Speech text to accompany the state change
+}
+
+/** Widget Annotation — add floating annotation to an element */
+export interface WidgetAnnotationAction extends ActionBase {
+  type: 'widget_annotation';
+  target: string;
+  content?: string;
+}
+
+/** Widget Reveal — reveal hidden content in widget */
+export interface WidgetRevealAction extends ActionBase {
+  type: 'widget_reveal';
+  target: string;
+  content?: string;
+}
+
+// ==================== Union type ====================
+
+export type WhiteboardAction =
+  | WbOpenAction
+  | WbDrawTextAction
+  | WbDrawImageAction
+  | WbDrawShapeAction
+  | WbDrawChartAction
+  | WbDrawLatexAction
+  | WbDrawTableAction
+  | WbDrawLineAction
+  | WbClearAction
+  | WbDeleteAction
+  | WbCloseAction
+  | WbDrawCodeAction
+  | WbEditCodeAction;
+
+export type Action =
+  | SpotlightAction
+  | LaserAction
+  | PlayVideoAction
+  | SpeechAction
+  | WhiteboardAction
+  | DiscussionAction
+  | WidgetHighlightAction
+  | WidgetSetStateAction
+  | WidgetAnnotationAction
+  | WidgetRevealAction;
+
+export type ActionType = Action['type'];
+
+/** Every whiteboard command, including visibility and content mutations. */
+export const WHITEBOARD_ACTION_TYPES = [
+  'wb_open', 'wb_draw_text', 'wb_draw_image', 'wb_draw_shape', 'wb_draw_chart',
+  'wb_draw_latex', 'wb_draw_table', 'wb_draw_line', 'wb_clear', 'wb_delete',
+  'wb_close', 'wb_draw_code', 'wb_edit_code',
+] as const satisfies readonly WhiteboardAction['type'][];
+
+/** Narrow an action to its whiteboard contract. */
+export function isWhiteboardAction(action: Action): action is WhiteboardAction {
+  return (WHITEBOARD_ACTION_TYPES as readonly string[]).includes(action.type);
+}
+
+/** Action types that fire immediately without blocking */
+export const FIRE_AND_FORGET_ACTIONS: ActionType[] = ['spotlight', 'laser'];
+
+/** Action types that only work on slide scenes (require slide canvas elements) */
+export const SLIDE_ONLY_ACTIONS: ActionType[] = ['spotlight', 'laser'];
+
+/** Action types that must complete before the next action runs */
+export const SYNC_ACTIONS: ActionType[] = [
+  'speech',
+  'play_video',
+  'wb_open',
+  'wb_draw_text',
+  'wb_draw_image',
+  'wb_draw_shape',
+  'wb_draw_chart',
+  'wb_draw_latex',
+  'wb_draw_table',
+  'wb_draw_line',
+  'wb_draw_code',
+  'wb_edit_code',
+  'wb_clear',
+  'wb_delete',
+  'wb_close',
+  'discussion',
+  'widget_highlight',
+  'widget_setState',
+  'widget_annotation',
+  'widget_reveal',
+];
+
+/** Frozen set of every valid {@link ActionType}, for cheap membership checks. */
+export const ACTION_TYPES = [
+  'spotlight',
+  'laser',
+  'play_video',
+  'speech',
+  'wb_open',
+  'wb_draw_text',
+  'wb_draw_image',
+  'wb_draw_shape',
+  'wb_draw_chart',
+  'wb_draw_latex',
+  'wb_draw_table',
+  'wb_draw_line',
+  'wb_draw_code',
+  'wb_edit_code',
+  'wb_clear',
+  'wb_delete',
+  'wb_close',
+  'discussion',
+  'widget_highlight',
+  'widget_setState',
+  'widget_annotation',
+  'widget_reveal',
+] as const satisfies readonly ActionType[];
+
+// Compile-time exhaustiveness: every ActionType must appear in ACTION_TYPES.
+// `satisfies` above proves the converse (each entry is a valid ActionType); this
+// fails the build if the Action union gains a member the tuple is missing — so
+// the validators never silently reject a valid, newly-added action type.
+type _ActionTypesExhaustive = [ActionType] extends [(typeof ACTION_TYPES)[number]] ? true : never;
+const _actionTypesExhaustive: _ActionTypesExhaustive = true;
+void _actionTypesExhaustive;
+
+/** Narrow an unknown value to a valid {@link ActionType}. Pure, no runtime deps. */
+export function isActionType(value: unknown): value is ActionType {
+  return typeof value === 'string' && (ACTION_TYPES as readonly string[]).includes(value);
+}
+
+// ==================== Canvas utility types (non-action) ====================
+
+/**
+ * Percentage-based geometry (0-100 coordinate system)
+ * Used by spotlight/laser overlays for responsive positioning.
+ */
+export interface PercentageGeometry {
+  x: number; // 0-100
+  y: number; // 0-100
+  w: number; // 0-100
+  h: number; // 0-100
+  centerX: number; // 0-100
+  centerY: number; // 0-100
+}

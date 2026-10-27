@@ -1,0 +1,727 @@
+import { promises as fs } from "node:fs";
+import { createHash } from "node:crypto";
+import path from "node:path";
+import sharp from "sharp";
+import { fileTypeFromBuffer } from "file-type";
+import { fetch as undiciFetch } from "undici";
+import type { Course } from "@/lib/session/types";
+import { prisma } from "@/lib/db/client";
+import { getCourse } from "@/lib/session/server-store";
+import {
+  CLASSROOMS_DIR,
+  isValidClassroomId,
+  readClassroom,
+  type PersistedClassroomData,
+} from "@/lib/openmaic/server/classroom-storage";
+import { audioDurationSec } from "@/lib/openmaic/audio/audio-duration";
+import { createSsrfSafeDispatcher } from "@/lib/openmaic/server/ssrf-guard";
+import {
+  findMissingTeachingToolResources,
+  findMissingTtsResources,
+} from "@/lib/course-generation/resource-readiness";
+import { findUnresolvedClassroomMedia } from "@/lib/openmaic/server/classroom-media-generation";
+import { isMediaPlaceholder } from "@/lib/openmaic/store/media-generation";
+import { resolveDurableCourseSceneOutlines } from "@/lib/course-generation/course-resource-outlines";
+import { resolveCourseTextbookFigures, hydrateCourseEvidenceFigureReferences } from "@/lib/textbook/course-evidence";
+import { resolveCourseSourceSequenceContracts } from "@/lib/textbook/course-evidence-types";
+import { scopeCourseTextbookFigures, type FigureUsePage } from "@/lib/textbook/figure-use";
+import { hasExplicitNativeSourceSequenceUse, scopeSourceSequenceContracts, usesSourceSequence } from "@/lib/textbook/source-sequence-use";
+import { findBlueprintFigureSequenceIssues, findKnowledgeSourceSequenceIssues,
+  inspectFigureSequence, type FigureSequenceContract } from "@/lib/textbook/course-visual-binding";
+import { sourceSequenceSlideContent } from "./source-content-acceptance";
+import { userFacingName } from "@/lib/user-facing-labels";
+
+export type CourseResourceIssue = {
+  id: string;
+  type: "classroom" | "adaptive-resource" | "teaching-tool" | "tts" | "media" | "speech-sync" | "source-consistency";
+  title: string;
+  detail: string;
+};
+
+export type CourseResourceAuditSnapshot = {
+  /** The exact course revision being published, rather than the latest editable draft. */
+  course: Course;
+  /** The classroom paired with that revision and already used for review-signature validation. */
+  classroom: PersistedClassroomData;
+};
+
+export type CourseResourceAuditOptions = {
+  /** Automatic generation checks saved resources only. Content checks belong
+   * to an explicit teacher review or publication check. */
+  reviewContent?: boolean;
+};
+
+const MANAGED_MEDIA_PREFIX = "/api/openmaic/classroom-media/";
+const UPLOAD_MEDIA_PREFIX = "/api/uploads/";
+// New assets use content-addressed `[a-zA-Z0-9_.-]` names. `:` remains
+// readable only for classrooms generated before that filename contract was
+// enforced, where blueprint action IDs were embedded in the filename.
+const SAFE_PATH_PART = /^[a-zA-Z0-9_.:-]+$/;
+const REMOTE_RESOURCE_TIMEOUT_MS = 8_000;
+const MAX_REMOTE_RESOURCE_BYTES = 25 * 1024 * 1024;
+const MAX_REMOTE_REDIRECTS = 3;
+
+type ResourceBytes = { bytes: Uint8Array; format: string };
+type ResourceIntegrity = { ok: true } | { ok: false; detail: string };
+
+function managedMediaStoragePath(resourceUrl: string): string | null {
+  let pathname: string;
+  try {
+    pathname = new URL(resourceUrl, "http://localhost").pathname;
+  } catch {
+    return null;
+  }
+  if (!pathname.startsWith(MANAGED_MEDIA_PREFIX)) return null;
+  let parts: string[];
+  try {
+    parts = pathname.slice(MANAGED_MEDIA_PREFIX.length).split("/").map(decodeURIComponent);
+  } catch {
+    return null;
+  }
+  if (parts.length < 3 || !isValidClassroomId(parts[0] ?? "")
+    || parts.some((part) => part === "." || part === ".." || !SAFE_PATH_PART.test(part))) {
+    return null;
+  }
+  return path.join(CLASSROOMS_DIR, ...parts);
+}
+
+function resourceFormat(resourceUrl: string, contentType = ""): string {
+  const mediaType = contentType.toLowerCase().split(";", 1)[0]?.trim();
+  if (mediaType?.startsWith("audio/")) return mediaType;
+  let pathname = resourceUrl;
+  try { pathname = new URL(resourceUrl, "http://localhost").pathname; } catch { /* use the raw value */ }
+  return path.extname(pathname).slice(1).toLowerCase();
+}
+
+async function readBoundedBody(
+  body: ReadableStream<Uint8Array> | null,
+  maxBytes: number,
+): Promise<Uint8Array> {
+  if (!body) throw new Error("资源响应为空");
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let received = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      received += value.byteLength;
+      if (received > maxBytes) throw new Error("资源文件超过检查大小限制");
+      chunks.push(value);
+    }
+  } finally {
+    await reader.cancel().catch(() => undefined);
+  }
+  const result = new Uint8Array(received);
+  let offset = 0;
+  for (const chunk of chunks) {
+    result.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return result;
+}
+
+async function readRemoteResource(resourceUrl: string): Promise<ResourceBytes> {
+  let currentUrl = resourceUrl;
+  for (let redirect = 0; redirect <= MAX_REMOTE_REDIRECTS; redirect += 1) {
+    const connection = await createSsrfSafeDispatcher(currentUrl);
+    try {
+      const response = await undiciFetch(currentUrl, {
+        dispatcher: connection.dispatcher,
+        redirect: "manual",
+        headers: {
+          Accept: "audio/*,image/*,video/*,application/octet-stream",
+          "User-Agent": "CoTeach-ResourceAudit/1.0",
+        },
+        signal: AbortSignal.timeout(REMOTE_RESOURCE_TIMEOUT_MS),
+      });
+      if (response.status >= 300 && response.status < 400) {
+        const location = response.headers.get("location");
+        await response.body?.cancel();
+        if (!location || redirect === MAX_REMOTE_REDIRECTS) throw new Error("远程资源重定向无效");
+        currentUrl = new URL(location, currentUrl).href;
+        continue;
+      }
+      if (!response.ok) {
+        await response.body?.cancel();
+        throw new Error(`远程资源返回 ${response.status}`);
+      }
+      const declaredSize = Number(response.headers.get("content-length") ?? "");
+      if (Number.isFinite(declaredSize) && declaredSize > MAX_REMOTE_RESOURCE_BYTES) {
+        await response.body?.cancel();
+        throw new Error("远程资源文件超过检查大小限制");
+      }
+      const bytes = await readBoundedBody(
+        response.body as unknown as ReadableStream<Uint8Array> | null,
+        MAX_REMOTE_RESOURCE_BYTES,
+      );
+      return { bytes, format: resourceFormat(currentUrl, response.headers.get("content-type") ?? "") };
+    } finally {
+      await connection.close();
+    }
+  }
+  throw new Error("远程资源重定向过多");
+}
+
+async function readResource(resourceUrl: string): Promise<ResourceBytes> {
+  const managedPath = managedMediaStoragePath(resourceUrl);
+  if (managedPath) {
+    return { bytes: await fs.readFile(managedPath), format: resourceFormat(resourceUrl) };
+  }
+  if (/^https?:\/\//i.test(resourceUrl)) return readRemoteResource(resourceUrl);
+  if (resourceUrl.startsWith(UPLOAD_MEDIA_PREFIX)) {
+    const parsed = new URL(resourceUrl, "http://localhost");
+    const uploadId = parsed.pathname.slice(UPLOAD_MEDIA_PREFIX.length);
+    if (!/^[a-z\d-]+$/i.test(uploadId)) throw new Error("上传资源地址无效");
+    const asset = await prisma.fileAsset.findFirst({
+      where: { id: uploadId, deletedAt: null },
+      select: { storageKey: true, mimeType: true, size: true },
+    });
+    if (!asset || path.basename(asset.storageKey) !== asset.storageKey) throw new Error("上传资源不存在");
+    const uploadDir = process.env.UPLOAD_DIR?.trim() || path.resolve(".openpbl-data", "uploads");
+    const bytes = await fs.readFile(path.join(uploadDir, asset.storageKey));
+    if (BigInt(bytes.byteLength) !== asset.size) throw new Error("上传资源大小与记录不符");
+    return { bytes, format: asset.mimeType };
+  }
+  const inline = /^data:((?:image|video|audio)\/[\w.+-]+);base64,([a-z\d+/=]+)$/i.exec(resourceUrl);
+  if (inline) {
+    const encoded = inline[2]!;
+    if (encoded.length > Math.ceil(MAX_REMOTE_RESOURCE_BYTES * 4 / 3) + 4) {
+      throw new Error("内嵌资源文件超过检查大小限制");
+    }
+    return { bytes: Buffer.from(encoded, "base64"), format: inline[1]! };
+  }
+  throw new Error("资源地址不属于可核验的课堂存储");
+}
+
+async function checkResourceIntegrity(resourceUrl: string, kind: "audio" | "image" | "video"): Promise<ResourceIntegrity> {
+  try {
+    const { bytes, format } = await readResource(resourceUrl);
+    if (bytes.byteLength === 0) return { ok: false, detail: kind === "audio" ? "语音文件为空" : "媒体文件为空" };
+    if (kind === "audio" && !audioDurationSec(bytes, format)) {
+      return { ok: false, detail: "语音文件损坏或时长无效" };
+    }
+    if (kind === "image") {
+      try {
+        const metadata = await sharp(bytes).metadata();
+        if (!metadata.width || !metadata.height) return { ok: false, detail: "图片文件损坏或尺寸无效" };
+      } catch {
+        return { ok: false, detail: "图片文件损坏或尺寸无效" };
+      }
+    }
+    if (kind === "video") {
+      const detected = await fileTypeFromBuffer(bytes);
+      if (!detected?.mime.startsWith("video/")) return { ok: false, detail: "视频文件损坏或格式无效" };
+    }
+    return { ok: true };
+  } catch {
+    return { ok: false, detail: kind === "audio" ? "语音文件不存在或无法读取" : "媒体文件不存在或无法读取" };
+  }
+}
+
+function classroomMediaReferences(classroom: PersistedClassroomData): Array<{
+  sceneId: string;
+  elementId: string;
+  type: "image" | "video";
+  url: string;
+}> {
+  return classroom.scenes.flatMap((scene) => {
+    if (scene.type !== "slide" || scene.content?.type !== "slide") return [];
+    return (scene.content.canvas.elements ?? []).flatMap((element) => (
+      (element.type === "image" || element.type === "video") && !isMediaPlaceholder(element.src || "")
+        ? [{ sceneId: scene.id, elementId: element.id, type: element.type, url: element.src || "" }]
+        : []
+    ));
+  });
+}
+
+async function auditClassroomFiles(
+  classroom: PersistedClassroomData,
+  cache: Map<string, Promise<ResourceIntegrity>>,
+): Promise<{ tts: CourseResourceIssue[]; media: CourseResourceIssue[] }> {
+  const check = (url: string, kind: "audio" | "image" | "video") => {
+    const key = `${kind}:${url}`;
+    const pending = cache.get(key) ?? checkResourceIntegrity(url, kind);
+    cache.set(key, pending);
+    return pending;
+  };
+  const tts = (await Promise.all(classroom.scenes.flatMap((scene) => (
+    (scene.actions ?? []).flatMap((action) => (
+      action.type === "speech" && action.text.trim() && action.audioUrl
+        ? [check(action.audioUrl, "audio").then((result): CourseResourceIssue | null => result.ok ? null : ({
+            id: `tts:${scene.id}:${action.id}`,
+            type: "tts",
+            title: userFacingName(scene.title, "课程讲解页面"),
+            detail: result.detail,
+          }))]
+        : []
+    ))
+  )))).filter((issue): issue is CourseResourceIssue => Boolean(issue));
+  const media = (await Promise.all(classroomMediaReferences(classroom).map((reference) => (
+    check(reference.url, reference.type).then((result): CourseResourceIssue | null => result.ok ? null : ({
+      id: `media:${reference.type}:${reference.elementId}`,
+      type: "media",
+      title: reference.type === "image" ? "课程图片" : "课程视频",
+      detail: result.detail,
+    }))
+  )))).filter((issue): issue is CourseResourceIssue => Boolean(issue));
+  return { tts, media };
+}
+
+type ResourceAuditOutline = NonNullable<Course["content"]["_openmaicSceneOutlines"]>[number];
+type SequenceContentGroup = NonNullable<Parameters<typeof inspectFigureSequence>[0]["contentGroups"]>[number];
+
+function outlineSequenceContent(outline: ResourceAuditOutline,
+  scenes: readonly PersistedClassroomData["scenes"][number][] = []): SequenceContentGroup[] {
+  if (outline.teachingBrief?.manuscript) {
+    const actual = scenes.filter((scene) => sceneMatchesOutlineIds(scene, new Set([outline.id])));
+    if (actual.length) return actual.map((scene) => sceneSequenceContent(scene, true));
+    const plan = outline.teachingBrief.teachingPlan;
+    return [{ statements: [...(plan?.presentationItems?.map((item) => item.text)
+      ?? plan?.presentationContent ?? outline.keyPoints ?? []),
+      ...(outline.visualIntent?.diagram?.annotation ? [outline.visualIntent.diagram.annotation] : [])],
+    diagramLabels: outline.visualIntent?.diagram?.nodes.map((node) => node.label) }];
+  }
+  return [{
+    statements: [outline.description, outline.teachingObjective, ...(outline.keyPoints ?? []),
+      outline.visualIntent?.observationGoal, outline.visualIntent?.rationale,
+      outline.visualIntent?.diagram?.annotation].filter((value): value is string => Boolean(value)),
+    diagramLabels: outline.visualIntent?.diagram?.nodes.map((node) => node.label),
+  }, {
+    statements: [outline.teachingBrief?.explanation, ...(outline.teachingBrief?.teachingPlan?.visibleContent ?? [])]
+      .filter((value): value is string => Boolean(value)),
+  }];
+}
+
+function sceneSequenceContent(
+  scene: PersistedClassroomData["scenes"][number],
+  includeDiagramLabels = false,
+): SequenceContentGroup {
+  const elements = scene.content?.type === "slide" ? scene.content.canvas.elements : [];
+  const visible = sourceSequenceSlideContent({ elements }, includeDiagramLabels);
+  return {
+    ...visible,
+    statements: [
+      ...visible.statements,
+      ...(scene.actions ?? []).flatMap((action) => action.type === "speech" ? [action.text] : []),
+    ],
+  };
+}
+
+function sceneMatchesOutlineIds(scene: PersistedClassroomData["scenes"][number], ids: ReadonlySet<string>): boolean {
+  const sceneOutlineId = scene.outlineId ?? scene.id;
+  return [...ids].some((id) => sceneOutlineId === id
+    || (sceneOutlineId.startsWith(`${id}--continuation-`)
+      && /^\d+$/.test(sceneOutlineId.slice(`${id}--continuation-`.length))));
+}
+
+function pageUsesSourceImage(page: FigureUsePage, ids: ReadonlySet<string>): boolean {
+  return (page.caseObservation?.kind === "source-image"
+    && page.caseObservation.resourceIds?.some((id) => ids.has(id))) === true
+    || [...(page.resourceNeeds ?? []), ...(page.teachingBrief?.resourceNeeds ?? [])]
+      .some((need) => need.kind === "source-image" && Boolean(need.assetId && ids.has(need.assetId)))
+    || (page.visualIntent?.resourceRefs ?? []).some((reference) =>
+      reference.kind === "source-image" && reference.required && ids.has(reference.resourceId))
+    || (page.suggestedImageIds ?? []).some((id) => ids.has(id));
+}
+
+async function auditRequiredTextbookImages(
+  course: Course,
+  outlines: NonNullable<Course["content"]["_openmaicSceneOutlines"]>,
+  classroom: PersistedClassroomData,
+  options: CourseResourceAuditOptions,
+): Promise<CourseResourceIssue[]> {
+  const allPages = course.content.teachingBlueprint?.sections.flatMap((section) => section.pages) ?? [];
+  const executedPageIds = new Set(outlines.flatMap((outline) =>
+    [outline.id, outline.spatialParentId, ...(outline.sourcePageIds ?? [])]
+      .filter((id): id is string => typeof id === "string" && Boolean(id))));
+  const pages = course.content.classroomGenerationRun?.scope === "test-lesson"
+    ? allPages.filter((page) => executedPageIds.has(page.outlineId ?? page.id)) : allPages;
+  const scopePages = [...outlines, ...pages];
+  const completeEvidence = course.content.courseEvidence
+    ? { ...course.content.courseEvidence,
+      items: await hydrateCourseEvidenceFigureReferences(course.content.courseEvidence.items) }
+    : undefined;
+  const availableResources = completeEvidence?.items?.some((item) => item.source?.revisionId)
+    ? await resolveCourseTextbookFigures(completeEvidence, course.content.knowledgePoints)
+    : [];
+  const resources = scopeCourseTextbookFigures(availableResources, scopePages);
+  const sourceContracts = options.reviewContent !== false
+    ? scopeSourceSequenceContracts(resolveCourseSourceSequenceContracts(completeEvidence,
+      course.content.knowledgePoints ?? []), scopePages) : [];
+  const sequenceContracts: FigureSequenceContract[] = [...resources.map((resource) => ({
+    resourceId: resource.id, required: resource.required, knowledgePointIds: resource.knowledgePointIds,
+    orderedSteps: resource.orderedSteps,
+  })), ...sourceContracts];
+  const declared = pages.flatMap((page) => (page.resourceNeeds ?? []).flatMap((need) => (
+    need.required && need.kind === "source-image" && need.assetId
+      ? [{ pageId: page.outlineId ?? page.id, assetId: need.assetId }]
+      : []
+  )));
+  const required = [...declared];
+  const missingPlacementIssues: CourseResourceIssue[] = [];
+  for (const resource of resources.filter((item) => item.required)) {
+    const resourceIds = new Set([resource.id, ...(resource.assetId ? [resource.assetId] : [])]);
+    const groupIds = new Set(resources.filter((candidate) => resource.groupKey
+      && candidate.groupKey === resource.groupKey).flatMap((candidate) =>
+      [candidate.id, ...(candidate.assetId ? [candidate.assetId] : [])]));
+    const actualTargets = (ids: ReadonlySet<string>): string[] => {
+      const selectedOutlines = outlines.filter((outline) => outline.type === "slide"
+        && pageUsesSourceImage(outline, ids));
+      if (selectedOutlines.length) return selectedOutlines.map((outline) =>
+        typeof outline.spatialParentId === "string" ? outline.spatialParentId : outline.id);
+      return pages.filter((page) => page.type === "slide" && pageUsesSourceImage(page, ids))
+        .map((page) => page.outlineId ?? page.id);
+    };
+    let targetPageIds = actualTargets(resourceIds);
+    if (!targetPageIds.length && groupIds.size) targetPageIds = actualTargets(groupIds);
+    if (!targetPageIds.length) {
+      // Accepted legacy plans without explicit figure choices retain their
+      // source obligation. New plans are scoped by actual authoring choices.
+      const blueprintTarget = pages.find((page) => page.type === "slide"
+        && page.knowledgePointIds?.some((id) => resource.knowledgePointIds.includes(id)));
+      const outlineTarget = outlines.find((outline) => outline.type === "slide"
+        && outline.knowledgePointIds?.some((id) => resource.knowledgePointIds.includes(id)));
+      const legacyId = blueprintTarget?.outlineId ?? blueprintTarget?.id
+        ?? (outlineTarget ? (typeof outlineTarget.spatialParentId === "string"
+          ? outlineTarget.spatialParentId : outlineTarget.id) : undefined);
+      if (legacyId) targetPageIds = [legacyId];
+    }
+    for (let index = required.length - 1; index >= 0; index -= 1) {
+      if (resourceIds.has(required[index]!.assetId)) required.splice(index, 1);
+    }
+    if (targetPageIds.length) required.push(...[...new Set(targetPageIds)]
+      .map((pageId) => ({ pageId, assetId: resource.id })));
+    else missingPlacementIssues.push({
+      id: `media:source-image:unassigned:${resource.id}`,
+      type: "media", title: "指定教材图片",
+      detail: "教材证据要求使用原图，但教学蓝图和大纲均缺少对应知识讲解页",
+    });
+  }
+  const figureIds = [...new Set([...resources.map((resource) => resource.figureId), ...(course.content.courseEvidence?.items.flatMap((item) => (
+    item.figureRefs?.map((reference) => reference.figureId) ?? item.figureIds ?? []
+  )) ?? [])])];
+  const figures = figureIds.length ? await prisma.textbookFigure.findMany({
+    where: { id: { in: figureIds } },
+    select: { id: true, fileAssetId: true, status: true },
+  }) : [];
+  const figureByResourceId = new Map(figures.map((figure) => [
+    `textbook_fig_${createHash("sha256").update(figure.id).digest("hex").slice(0, 12)}`,
+    figure,
+  ]));
+  const outlineIdsByParent = new Map<string, Set<string>>();
+  for (const outline of outlines) {
+    for (const parentId of new Set([outline.id, outline.spatialParentId, ...(outline.sourcePageIds ?? [])]
+      .filter((id): id is string => typeof id === "string" && Boolean(id)))) {
+      const ids = outlineIdsByParent.get(parentId) ?? new Set<string>();
+      ids.add(outline.id);
+      outlineIdsByParent.set(parentId, ids);
+    }
+  }
+
+  const imageIssues = (await Promise.all(required.map(async ({ pageId, assetId }): Promise<CourseResourceIssue | null> => {
+    const outlineIds = outlineIdsByParent.get(pageId);
+    // An actually selected source image still needs its executing page.
+    if (!outlineIds?.size) return {
+      id: `media:source-image:${pageId}:${assetId}`, type: "media", title: "指定教材图片",
+      detail: "指定教材原图的讲解页不在当前课程大纲中",
+    };
+    const pageScenes = classroom.scenes.filter((scene) => sceneMatchesOutlineIds(scene, outlineIds));
+    if (!pageScenes.length) return {
+      id: `media:source-image:${pageId}:${assetId}`, type: "media", title: "指定教材图片",
+      detail: "指定教材原图的课堂页面尚未生成",
+    };
+    const figure = figureByResourceId.get(assetId);
+    const expectedSrc = figure ? `${UPLOAD_MEDIA_PREFIX}${figure.fileAssetId}` : undefined;
+    const present = expectedSrc && pageScenes.some((scene) => scene.content?.type === "slide"
+      && scene.content.canvas.elements.some((element) => element.type === "image"
+        && element.src === expectedSrc));
+    const integrity = present && figure?.status === "AVAILABLE"
+      ? await checkResourceIntegrity(expectedSrc!, "image") : undefined;
+    if (integrity?.ok) return null;
+    return {
+      id: `media:source-image:${pageId}:${assetId}`,
+      type: "media",
+      title: "指定教材图片",
+      detail: !figure || figure.status !== "AVAILABLE"
+        ? "绑定的教材原图记录不可用"
+        : !present ? "指定的教材原图未进入对应课堂页面"
+          : integrity && !integrity.ok ? integrity.detail : "指定教材原图文件无法读取",
+    };
+  }))).filter((issue): issue is CourseResourceIssue => Boolean(issue));
+  if (options.reviewContent === false) return [...missingPlacementIssues, ...imageIssues];
+  const sequenceIssues: CourseResourceIssue[] = [];
+  const blueprintIssues = course.content.teachingBlueprint
+    ? findBlueprintFigureSequenceIssues(course.content.teachingBlueprint, sequenceContracts)
+    : [];
+  const sourceContractIds = new Set(sourceContracts.map((contract) => contract.resourceId));
+  for (const issue of blueprintIssues) {
+    const isSourceList = sourceContractIds.has(issue.resourceId);
+    sequenceIssues.push({
+      id: `content:source-sequence:${issue.pageId}:${issue.resourceId}:blueprint`,
+      type: "source-consistency", title: isSourceList ? "教材完整步骤" : "教材流程步骤",
+      detail: `教学蓝图与${isSourceList ? "教材原文" : "教材原图"}不一致：${issue.detail}`,
+    });
+  }
+  for (const resource of resources.filter((item) => item.required && item.orderedSteps?.length)) {
+    const resourceIds = new Set([resource.id, ...(resource.assetId ? [resource.assetId] : [])]);
+    const target = outlines.find((outline) => outline.type === "slide"
+      && outline.generationPurpose === "knowledge-teaching" && pageUsesSourceImage(outline, resourceIds))
+      ?? outlines.find((outline) => outline.type === "slide"
+      && outline.generationPurpose === "knowledge-teaching"
+      && outline.knowledgePointIds?.some((id) => resource.knowledgePointIds.includes(id)));
+    if (!target) continue;
+    const relatedSequences = sequenceContracts.filter((contract) => contract.required
+      && (target.knowledgePointIds?.some((id) => contract.knowledgePointIds.includes(id))
+        || hasExplicitNativeSourceSequenceUse(target, contract)));
+    const outlineProblems = inspectFigureSequence({ orderedSteps: resource.orderedSteps!,
+      statements: [], contentGroups: outlineSequenceContent(target, classroom.scenes),
+      relatedSequences, requireCompleteText: true });
+    if (outlineProblems.length) sequenceIssues.push({
+      id: `content:source-sequence:${target.id}:${resource.id}:outline`,
+      type: "source-consistency", title: "教材流程步骤",
+      detail: `课程大纲与教材原图不一致：${outlineProblems.join("；")}`,
+    });
+    const parentId = typeof target.spatialParentId === "string" ? target.spatialParentId : target.id;
+    const pageIds = outlineIdsByParent.get(parentId) ?? new Set([target.id]);
+    const scenes = classroom.scenes.filter((scene) => sceneMatchesOutlineIds(scene, pageIds));
+    const sceneProblems = inspectFigureSequence({ orderedSteps: resource.orderedSteps!,
+      statements: [], contentGroups: scenes.map((scene) => sceneSequenceContent(scene, true)), relatedSequences });
+    if (sceneProblems.length) sequenceIssues.push({
+      id: `content:source-sequence:${target.id}:${resource.id}:classroom`,
+      type: "source-consistency", title: "教材流程步骤",
+      detail: `课堂页面或讲解与教材原图不一致：${sceneProblems.join("；")}`,
+    });
+  }
+  for (const [index, issue] of findKnowledgeSourceSequenceIssues(course.content.knowledgePoints ?? [],
+    completeEvidence).entries()) sequenceIssues.push({
+    id: `content:source-sequence:knowledge:${index}`,
+    type: "source-consistency", title: "教材完整步骤", detail: issue,
+  });
+  for (const contract of sourceContracts.filter((source) => source.required)) {
+    const orderedSteps = contract.orderedSteps;
+    if (!orderedSteps?.length) continue;
+    const targets = outlines.filter((outline) => outline.type === "slide"
+      && outline.generationPurpose === "knowledge-teaching"
+      && usesSourceSequence(outline, contract)
+      && (outline.knowledgePointIds?.some((id) => contract.knowledgePointIds.includes(id))
+        || hasExplicitNativeSourceSequenceUse(outline, contract)));
+    if (!targets.length) continue;
+    const relatedSequences = sequenceContracts.filter((related) => related.required
+      && targets.some((target) => target.knowledgePointIds?.some((id) => related.knowledgePointIds.includes(id))
+        || hasExplicitNativeSourceSequenceUse(target, related)));
+    const outlineProblems = inspectFigureSequence({ orderedSteps,
+      statements: [], contentGroups: targets.flatMap((target) => outlineSequenceContent(target, classroom.scenes)), relatedSequences,
+      sequenceSemantics: contract.sequenceSemantics, requireCompleteText: true,
+      requiredStepLabels: contract.requiredStepLabels });
+    if (outlineProblems.length) sequenceIssues.push({
+      id: `content:source-sequence:${targets[0]!.id}:${contract.resourceId}:outline`,
+      type: "source-consistency", title: "教材完整步骤",
+      detail: `课程大纲与教材原文不一致：${outlineProblems.join("；")}`,
+    });
+    const sceneIds = new Set(targets.flatMap((target) => [
+      ...(outlineIdsByParent.get(typeof target.spatialParentId === "string"
+        ? target.spatialParentId : target.id) ?? []), target.id,
+    ]));
+    const scenes = classroom.scenes.filter((scene) => sceneMatchesOutlineIds(scene, sceneIds));
+    const sceneProblems = inspectFigureSequence({ orderedSteps,
+      statements: [], contentGroups: scenes.map((scene) => sceneSequenceContent(scene)), relatedSequences,
+      sequenceSemantics: contract.sequenceSemantics, requireCompleteText: true,
+      requiredStepLabels: contract.requiredStepLabels });
+    if (sceneProblems.length) sequenceIssues.push({
+      id: `content:source-sequence:${targets[0]!.id}:${contract.resourceId}:classroom`,
+      type: "source-consistency", title: "教材完整步骤",
+      detail: `课堂页面或讲解与教材原文不一致：${sceneProblems.join("；")}`,
+    });
+  }
+  return [...missingPlacementIssues, ...imageIssues, ...sequenceIssues];
+}
+
+export async function auditCourseGeneratedResources(
+  courseId: string,
+  snapshot?: CourseResourceAuditSnapshot,
+  options: CourseResourceAuditOptions = {},
+): Promise<{
+  classroomId?: string;
+  issues: CourseResourceIssue[];
+}> {
+  const course = snapshot?.course ?? await getCourse(courseId);
+  if (!course) return { issues: [] };
+  const classroomId = course.aiLearningClassroomId || course.content._openmaicClassroomId;
+  const classroom = snapshot?.classroom ?? (classroomId ? await readClassroom(classroomId) : null);
+  const classroomIssues: CourseResourceIssue[] = !classroomId
+    ? [{
+        id: "classroom:missing",
+        type: "classroom",
+        title: "课程课堂文件",
+        detail: "课程课堂尚未生成",
+      }]
+    : !classroom
+      ? [{
+          id: `classroom:${classroomId}`,
+          type: "classroom",
+          title: "课程课堂文件",
+          detail: "课堂文件尚未持久化，需要自动恢复",
+        }]
+      : classroom.scenes.length === 0
+        ? [{
+            id: `classroom:${classroomId}:empty`,
+            type: "classroom",
+            title: "课程课堂文件",
+            detail: "课堂没有可播放页面，需要重新生成",
+          }]
+        : [];
+  const outlines = snapshot
+    ? course.content._openmaicSceneOutlines ?? []
+    : await resolveDurableCourseSceneOutlines(courseId, course.content._openmaicSceneOutlines ?? []);
+  const toolIssues = classroom
+    ? findMissingTeachingToolResources(outlines, classroom.scenes).map((issue) => ({
+        id: `tool:${issue.outlineId}:${issue.tool}`,
+        type: "teaching-tool" as const,
+        title: userFacingName(issue.title, "课程教学工具"),
+        detail: `${issue.tool === "whiteboard" ? "白板" : "教学工具"}计划动作未生成`,
+      }))
+    : [];
+  const ttsIssues = classroom
+    ? findMissingTtsResources(classroom.scenes).map((issue) => ({
+        id: `tts:${issue.sceneId}:${issue.actionId}`,
+        type: "tts" as const,
+        title: userFacingName(issue.title, "课程讲解页面"),
+        detail: "配置语音未生成",
+      }))
+    : [];
+  const speechSyncIssues = classroom
+    ? classroom.scenes.flatMap((scene) => {
+        const speech = (scene.actions ?? []).filter((action) => (
+          action.type === "speech" && Boolean(action.text.trim()) && Boolean(action.audioUrl)
+        ));
+        const unresolved = speech.filter((action) => (
+          action.type === "speech" && (
+            action.speechAlignment?.status !== "aligned" || Boolean(action.speechAlignment.error)
+          )
+        ));
+        if (!unresolved.length) return [];
+        const unaligned = unresolved.filter((action) => (
+          action.type === "speech" && action.speechAlignment?.status !== "aligned"
+        ));
+        const failed = unaligned.filter((action) => (
+          action.type === "speech" && action.speechAlignment?.status === "failed"
+        )).length;
+        const unalignedIds = new Set(unaligned.map((action) => action.id));
+        const affectedCues = (scene.actions ?? []).filter((action) => {
+          if (action.type !== "spotlight" && action.type !== "laser") return false;
+          const startAffected = Boolean(action.speechId && unalignedIds.has(action.speechId));
+          const endSpeechId = action.type === "spotlight" ? action.endSpeechId ?? action.speechId : action.speechId;
+          const endAffected = Boolean(endSpeechId && unalignedIds.has(endSpeechId));
+          return (startAffected && Boolean(action.speechAnchor))
+            || (endAffected && Boolean(action.endSpeechAnchor))
+            || (startAffected && action.type === "laser" && Boolean(action.waypoints?.some((waypoint) => waypoint.speechAnchor)));
+        }).length;
+        const bindingWarning = unresolved.find((action) => (
+          action.type === "speech"
+          && action.speechAlignment?.status === "aligned"
+          && action.speechAlignment.error
+        ));
+        const bindingError = bindingWarning?.type === "speech" ? bindingWarning.speechAlignment?.error : undefined;
+        const details: string[] = [];
+        if (unaligned.length) {
+          const pending = unaligned.length - failed;
+          const alignmentDetail = failed
+            ? `${failed} 段语音对齐失败${pending ? `，另有 ${pending} 段尚未完成精确时间对齐` : ""}`
+            : `${pending} 段语音尚未完成精确时间对齐`;
+          details.push(`${alignmentDetail}，音频可播放，相关字幕使用近似定位`);
+          if (affectedCues) details.push(`${affectedCues} 处关联指示动作暂无法按音频同步`);
+        }
+        if (bindingError) details.push(/[\u3400-\u9fff]/u.test(bindingError)
+          ? bindingError : "部分指示动作未能与讲解词句可靠绑定，自动指示已停用");
+        return [{
+          id: `speech-sync:${scene.id}`,
+          type: "speech-sync" as const,
+          title: userFacingName(scene.title, "课程讲解页面"),
+          detail: details.join("；"),
+        }];
+      })
+    : [];
+  const classroomReads = new Map<string, Promise<PersistedClassroomData | null>>();
+  if (classroomId && classroom) classroomReads.set(classroomId, Promise.resolve(classroom));
+  const resourceChecks = new Map<string, Promise<ResourceIntegrity>>();
+  const mainFileIssues = classroom
+    ? await auditClassroomFiles(classroom, resourceChecks)
+    : { tts: [], media: [] };
+  const textbookImageIssues = classroom
+    ? await auditRequiredTextbookImages(course, outlines, classroom, options)
+    : [];
+  const adaptiveIssues: CourseResourceIssue[] = [];
+  if (course.content.classroomGenerationRun?.scope !== "test-lesson"
+    && course.content.adaptiveLearningPlan?.enabled) {
+    for (const branch of course.content.adaptiveLearningPlan.branches) {
+      if (branch.enabled === false || branch.status !== "teacher-confirmed") continue;
+      const prepared = branch.preparedResource;
+      const title = userFacingName(branch.title, "个性化学习资源");
+      if (prepared?.status !== "ready" || !prepared.classroomId || !isValidClassroomId(prepared.classroomId)) {
+        adaptiveIssues.push({
+          id: `adaptive:${branch.id}`,
+          type: "adaptive-resource",
+          title,
+          detail: prepared?.status === "failed" ? "资源生成未完成，请重新生成" : "个性化学习资源尚未生成",
+        });
+        continue;
+      }
+      const pending = classroomReads.get(prepared.classroomId) ?? readClassroom(prepared.classroomId);
+      classroomReads.set(prepared.classroomId, pending);
+      const adaptiveClassroom = await pending;
+      if (!adaptiveClassroom || adaptiveClassroom.scenes.length === 0) {
+        adaptiveIssues.push({
+          id: `adaptive:${branch.id}`,
+          type: "adaptive-resource",
+          title,
+          detail: "个性化学习课堂不存在或没有可播放页面",
+        });
+        continue;
+      }
+      const adaptiveFiles = await auditClassroomFiles(adaptiveClassroom, resourceChecks);
+      const missingTts = findMissingTtsResources(adaptiveClassroom.scenes);
+      const unresolvedMedia = findUnresolvedClassroomMedia([], adaptiveClassroom.scenes);
+      if (missingTts.length || adaptiveFiles.tts.length || adaptiveFiles.media.length || unresolvedMedia.length) {
+        adaptiveIssues.push({
+          id: `adaptive:${branch.id}`,
+          type: "adaptive-resource",
+          title,
+          detail: "个性化学习课堂仍有语音或媒体资源未就绪",
+        });
+      }
+    }
+  }
+  const unresolvedMedia = classroom
+    ? findUnresolvedClassroomMedia(outlines, classroom.scenes)
+    : [];
+  // Generation diagnostics describe an earlier attempt. Once the slide no
+  // longer references that placeholder, only the current asset matters.
+  const mediaIssues = unresolvedMedia.flatMap((failure) =>
+    failure.type === "image" || failure.type === "video"
+      ? [{
+          id: `media:${failure.type}:${failure.elementId}`,
+          type: "media" as const,
+          title: failure.type === "image" ? "课程图片" : "课程视频",
+          detail: `${failure.type === "image" ? "图片" : "视频"}生成未完成，请重新生成`,
+        }]
+      : [],
+  );
+  const dedupe = (issues: CourseResourceIssue[]) => Array.from(new Map(
+    issues.map((issue) => [issue.id, issue]),
+  ).values());
+  return {
+    classroomId,
+    issues: dedupe([
+      ...classroomIssues,
+      ...adaptiveIssues,
+      ...toolIssues,
+      ...ttsIssues,
+      ...mainFileIssues.tts,
+      ...speechSyncIssues,
+      ...mediaIssues,
+      ...textbookImageIssues,
+      ...mainFileIssues.media,
+    ]),
+  };
+}

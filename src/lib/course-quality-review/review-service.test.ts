@@ -1,0 +1,266 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { Course } from '@/lib/session/types';
+import type { PersistedClassroomData } from '@/lib/openmaic/server/classroom-storage';
+const mocks = vi.hoisted(() => ({ get: vi.fn(), save: vi.fn(), read: vi.fn(), audit: vi.fn(), readiness: vi.fn() }));
+vi.mock('@/lib/session/server-store', () => ({ getCourse: mocks.get, updateCourse: mocks.save }));
+vi.mock('@/lib/openmaic/server/classroom-storage', () => ({ readClassroom: mocks.read, isValidClassroomId: (id: string) => /^[\w-]+$/.test(id) }));
+vi.mock('@/lib/classroom/new-system-course', () => ({ getNewSystemCourseReadiness: mocks.readiness }));
+vi.mock('@/lib/course-generation/resource-audit-server', () => ({ auditCourseGeneratedResources: mocks.audit }));
+import { assertCourseTeacherReview, confirmCourseTeacherReview, freshQualityReport, freshRenderReview, saveCourseRenderPage, startCourseRenderReview } from './review-service';
+import { computeCourseQualitySignature } from './signature';
+import { audioPublicationSnapshotFingerprint, hashJson, signCourseAudioPublication } from './audio-publication';
+import { COURSE_QUALITY_REVIEW_POLICY_VERSION } from './types';
+
+afterEach(() => vi.unstubAllEnvs());
+
+let course: Course;
+let classroom: PersistedClassroomData;
+
+async function publishAudioReceiptForTest() {
+  await confirmCourseTeacherReview('course', 'teacher', computeCourseQualitySignature(course, classroom), []);
+  const source = structuredClone(classroom);
+  const previousReview = structuredClone(course.content.teacherReview!);
+  classroom = { ...structuredClone(classroom), id: 'updated-audio-classroom', revision: 2 };
+  const speech = classroom.scenes[0]!.actions![0]!;
+  if (speech.type === 'speech') speech.text = '同学们，我们先来看核心认识为什么需要这些条件。';
+  course.aiLearningClassroomId = classroom.id;
+  course.content.teachingRevisionState = { schemaVersion: 1, baseClassroomRevision: 1, classroomRevision: 2,
+    changeType: 'narration', affectedSceneIds: ['slide'], invalidated: [], updatedAt: new Date().toISOString() };
+  course.content.teachingRevisionState.audioPublication = signCourseAudioPublication({
+    schemaVersion: 1, kind: 'course-audio-publication', courseId: course.id, teacherId: 'teacher',
+    sourceVersionId: 'original-v3', sourceClassroomId: source.id, sourceSnapshotFingerprint: 'source-snapshot-hash',
+    sourceClassroomFingerprint: hashJson(source), teacherReviewSeal: previousReview.seal,
+    classroomId: classroom.id, classroomFingerprint: hashJson(classroom), snapshotFingerprint: audioPublicationSnapshotFingerprint(course),
+    signature: computeCourseQualitySignature(course, classroom), publishedAt: new Date().toISOString(),
+  });
+  return previousReview;
+}
+beforeEach(() => {
+  mocks.audit.mockReset();
+  mocks.audit.mockResolvedValue({ issues: [] });
+  mocks.readiness.mockReturnValue([]);
+  vi.stubEnv('JWT_SECRET', 'test-course-review-secret-more-than-thirty-two-characters');
+  classroom = { id: 'classroom', revision: 1, stage: { id: 'stage' }, scenes: [{
+    id: 'slide', outlineId: 'slide', type: 'slide', title: '核心内容',
+    content: { type: 'slide', canvas: { elements: [{ type: 'text', content: '核心认识' }] } },
+    actions: [{ type: 'speech', text: '解释核心认识及其必要条件。' }],
+  }], createdAt: '2026-09-12' } as unknown as PersistedClassroomData;
+  course = { id: 'course', name: '课程', grade: '本科一年级', hours: 2.25, aiLearningClassroomId: 'classroom', content: { qualityReviewRequired: true, knowledgePoints: [], _openmaicSceneOutlines: [] } } as unknown as Course;
+  const signature = computeCourseQualitySignature(course, classroom);
+  course.content.qualityReview = { schemaVersion: 1, reviewPolicyVersion: COURSE_QUALITY_REVIEW_POLICY_VERSION, runId: 'saved-run', reviewScope: { kind: 'full-course', checkedOutlineIds: [], uncheckedOutlineCount: 0 }, signature, courseId: 'course', classroomId: 'classroom', classroomRevision: 1, status: 'completed', issues: [] };
+  mocks.get.mockImplementation(async () => course);
+  mocks.read.mockImplementation(async () => classroom);
+  mocks.save.mockImplementation(async (_id: string, updater: (current: Course) => Course) => { course = updater(course); return course; });
+});
+describe('teacher confirmation of an exact teaching draft', () => {
+  it('requires review for new courses and retains old-course compatibility', async () => {
+    await expect(assertCourseTeacherReview(course, 'teacher')).rejects.toThrow('教师终审');
+    await expect(assertCourseTeacherReview({ ...course, content: { ...course.content, qualityReviewRequired: false } })).resolves.toBeUndefined();
+  });
+  it('rejects teacher confirmation and publication for a bounded test lesson', async () => {
+    course.content.classroomGenerationRun = {
+      scope: 'test-lesson', status: 'completed', generatedOutlineIds: [], fullOutlineCount: 8,
+    };
+    const signature = computeCourseQualitySignature(course, classroom);
+    await expect(confirmCourseTeacherReview('course', 'teacher', signature, [], false, true)).rejects.toThrow('单节测试样本');
+    await expect(assertCourseTeacherReview(course, 'teacher')).rejects.toThrow('单节测试样本');
+    expect(course.status).not.toBe('ready');
+  });
+  it('accepts a server confirmation but rejects changed content, changed classroom and forged stamps', async () => {
+    const signature = computeCourseQualitySignature(course, classroom);
+    await confirmCourseTeacherReview('course', 'teacher', signature, []);
+    await expect(assertCourseTeacherReview(course, 'teacher')).resolves.toBeUndefined();
+    await expect(assertCourseTeacherReview({ ...course, grade: '小学' }, 'teacher')).rejects.toThrow('内容已变更');
+    classroom = { ...classroom, revision: 2 };
+    await expect(assertCourseTeacherReview(course, 'teacher')).rejects.toThrow('内容已变更');
+    classroom = { ...classroom, revision: 1 };
+    course.content.teacherReview!.teacherId = 'another-teacher';
+    await expect(assertCourseTeacherReview(course, 'another-teacher')).rejects.toThrow('教师终审');
+  });
+  it('does not invalidate a teaching confirmation when students download resources', async () => {
+    course.resources = [{ id: 'launch', title: '启动课件', type: 'PPTX', size: '1MB', downloadedBy: [] }];
+    const signature = computeCourseQualitySignature(course, classroom);
+    course.content.qualityReview!.signature = signature;
+    await confirmCourseTeacherReview('course', 'teacher', signature, []);
+    course.resources[0].downloadedBy = ['student-1'];
+    await expect(assertCourseTeacherReview(course, 'teacher')).resolves.toBeUndefined();
+  });
+  it('accepts an authentic operational audio receipt while retaining the original teacher review and old reports', async () => {
+    const review = await publishAudioReceiptForTest();
+    await expect(assertCourseTeacherReview(course, 'teacher')).resolves.toBeUndefined();
+    expect(course.content.teacherReview).toEqual(review);
+    const currentSignature = computeCourseQualitySignature(course, classroom);
+    expect(freshQualityReport(course, currentSignature)).toBeUndefined();
+    expect(course.content.qualityReview!.signature).toBe(review.signature);
+    expect(mocks.audit).toHaveBeenCalledWith(course.id, { course, classroom });
+  });
+  it.each(['receipt', 'course', 'classroom', 'owner', 'review', 'reused'] as const)(
+    'rejects an audio receipt after changing its %s binding', async (change) => {
+      await publishAudioReceiptForTest();
+      const proof = course.content.teachingRevisionState!.audioPublication!;
+      if (change === 'receipt') proof.sourceVersionId = 'forged-source';
+      if (change === 'course') course.summary = '未经授权的新课程摘要';
+      if (change === 'classroom') classroom.scenes[0]!.actions!.push({ id: 'added-action', type: 'wb_open' });
+      if (change === 'owner') {
+        await expect(assertCourseTeacherReview(course, 'another-teacher')).rejects.toMatchObject({ code: 'TEACHER_REVIEW_REQUIRED' });
+        return;
+      }
+      if (change === 'review') course.content.teacherReview!.seal = 'f'.repeat(64);
+      if (change === 'reused') {
+        classroom.id = 'another-classroom';
+        course.aiLearningClassroomId = classroom.id;
+      }
+      await expect(assertCourseTeacherReview(course, 'teacher')).rejects.toMatchObject({
+        code: change === 'review' ? 'TEACHER_REVIEW_REQUIRED' : 'REVIEW_STALE',
+      });
+    },
+  );
+  it('still rejects missing technical resources after an authorized audio publication', async () => {
+    await publishAudioReceiptForTest();
+    mocks.audit.mockResolvedValue({ issues: [{ id: 'tts:slide:speech', type: 'tts' }] });
+    await expect(assertCourseTeacherReview(course, 'teacher')).rejects.toMatchObject({ code: 'RESOURCES_NOT_READY' });
+  });
+  it('keeps an authorized audio publication valid when optional diagnostic reports are refreshed', async () => {
+    await publishAudioReceiptForTest();
+    course.content.qualityReview = { ...course.content.qualityReview!, signature: computeCourseQualitySignature(course, classroom), issues: [] };
+    course.content.renderReview = { schemaVersion: 1, signature: computeCourseQualitySignature(course, classroom),
+      classroomId: classroom.id, status: 'completed', pages: [], updatedAt: new Date().toISOString() };
+    await expect(assertCourseTeacherReview(course, 'teacher')).resolves.toBeUndefined();
+  });
+  it('records explicit teacher review when automated content checking failed', async () => {
+    course.content.qualityReview!.status = 'failed';
+    const review = await confirmCourseTeacherReview('course', 'teacher', computeCourseQualitySignature(course, classroom), [], true);
+    expect(review.manualContentReview).toBe(true);
+    await expect(assertCourseTeacherReview(course, 'teacher')).resolves.toBeUndefined();
+  });
+  it('hides reports produced by obsolete literal-coverage rules', () => {
+    const signature = computeCourseQualitySignature(course, classroom);
+    course.content.qualityReview!.reviewPolicyVersion = 'literal-coverage-v1';
+    expect(freshQualityReport(course, signature)).toBeUndefined();
+  });
+  it('hides a report if the selected lesson scope changed without changing the draft', () => {
+    const signature = computeCourseQualitySignature(course, classroom);
+    course.content.classroomGenerationRun = { scope: 'test-lesson', status: 'completed', generatedOutlineIds: ['page-a'], fullOutlineCount: 3,
+      testLesson: { sectionId: 'section-a', sectionTitle: '小节 A', sceneOutlineIds: ['page-a'], durationSeconds: 60 } };
+    expect(freshQualityReport(course, signature)).toBeUndefined();
+  });
+  it('retains required-content diagnostics without blocking confirmation or purchasing another authoring call', async () => {
+    course.content.knowledgePoints = [{ id: 'required', name: '必需知识' }] as Course['content']['knowledgePoints'];
+    const before = JSON.stringify(classroom);
+    await expect(confirmCourseTeacherReview('course', 'teacher', computeCourseQualitySignature(course, classroom), [])).resolves.toBeTruthy();
+    expect(course.content.qualityReview?.issues).toContainEqual(expect.objectContaining({
+      title: '课程体系知识节点缺少讲授页面', blocking: false, evidence: '必需知识',
+    }));
+    expect(JSON.stringify(classroom)).toBe(before);
+    await expect(assertCourseTeacherReview(course, 'teacher')).resolves.toBeUndefined();
+  });
+  it('keeps source-image and source-content quality diagnostics during publication and later use', async () => {
+    mocks.audit.mockResolvedValue({ issues: [
+      { id: 'media:source-image:figure', type: 'media', title: '教材原图', detail: '实际页面未展示教材图' },
+      { id: 'content:source-sequence:source', type: 'source-consistency', title: '教材条目', detail: '尚缺最后一个条目' },
+    ] });
+    const before = JSON.stringify(classroom);
+    await expect(confirmCourseTeacherReview('course', 'teacher', computeCourseQualitySignature(course, classroom), [], false, true))
+      .resolves.toBeTruthy();
+    expect(course.status).toBe('ready');
+    expect(course.content.qualityReview?.issues).toEqual(expect.arrayContaining([
+      expect.objectContaining({ evidence: '实际页面未展示教材图', blocking: false }),
+      expect.objectContaining({ evidence: '尚缺最后一个条目', blocking: false }),
+    ]));
+    expect(JSON.stringify(classroom)).toBe(before);
+    await expect(assertCourseTeacherReview(course, 'teacher')).resolves.toBeUndefined();
+  });
+  it('records actual timing differences without scaling content or blocking a teacher', async () => {
+    mocks.readiness.mockReturnValue([{ id: 'timing', label: '讲授时长', ok: false, message: '实际比规划长二十秒' }]);
+    await confirmCourseTeacherReview('course', 'teacher', computeCourseQualitySignature(course, classroom), []);
+    expect(course.content.qualityReview?.issues).toContainEqual(expect.objectContaining({
+      id: 'readiness:timing', evidence: '实际比规划长二十秒', blocking: false,
+    }));
+  });
+  it('rejects an actually empty classroom independently of quality diagnostics', async () => {
+    classroom.scenes = [];
+    await expect(confirmCourseTeacherReview('course', 'teacher', computeCourseQualitySignature(course, classroom), []))
+      .rejects.toMatchObject({ code: 'CLASSROOM_NOT_READY' });
+  });
+  it.each([undefined, 'pending', 'running', 'failed', 'completed'] as const)('allows teacher publication with optional report status %s and no layout report', async (status) => {
+    if (status) {
+      course.content.qualityReview!.status = status;
+      course.content.qualityReview!.issues = [{ id: 'suggestion', origin: 'semantic', severity: 'suggestion', title: '核对概念', evidence: '定义', suggestion: '核对' }];
+    } else course.content.qualityReview = undefined;
+    classroom.scenes = [{ id: 'slide', type: 'slide', content: { type: 'slide', canvas: { elements: [] } } }] as unknown as PersistedClassroomData['scenes'];
+    const signature = computeCourseQualitySignature(course, classroom);
+    if (course.content.qualityReview) course.content.qualityReview.signature = signature;
+    await expect(confirmCourseTeacherReview('course', 'teacher', signature, [], false, true)).resolves.toBeTruthy();
+    expect(course.status).toBe('ready');
+    expect(mocks.audit).toHaveBeenCalledWith('course', {
+      course: expect.objectContaining({ id: 'course' }),
+      classroom,
+    });
+    await expect(assertCourseTeacherReview(course, 'teacher')).resolves.toBeUndefined();
+  });
+  it('retains resource-integrity and asset-generation gates', async () => {
+    const signature = computeCourseQualitySignature(course, classroom);
+    mocks.audit.mockResolvedValue({ issues: [{ id: 'missing-audio' }] });
+    await expect(confirmCourseTeacherReview('course', 'teacher', signature, [], false, true)).rejects.toThrow('资源尚未就绪');
+    classroom.assetGeneration = { status: 'running' } as PersistedClassroomData['assetGeneration'];
+    await expect(confirmCourseTeacherReview('course', 'teacher', computeCourseQualitySignature(course, classroom), [])).rejects.toThrow('仍在生成');
+  });
+  it('rechecks resources when a saved confirmation is published through another entry point', async () => {
+    const signature = computeCourseQualitySignature(course, classroom);
+    await confirmCourseTeacherReview('course', 'teacher', signature, [], false, false);
+    expect(mocks.audit).not.toHaveBeenCalled();
+
+    mocks.audit.mockResolvedValue({ issues: [{ id: 'tts:slide:speech', type: 'tts' }] });
+    await expect(assertCourseTeacherReview(course, 'teacher')).rejects.toMatchObject({
+      code: 'RESOURCES_NOT_READY',
+    });
+    expect(mocks.audit).toHaveBeenCalledWith('course', { course, classroom });
+  });
+  it('optional browser checks preserve an existing teacher confirmation', async () => {
+    classroom.scenes = [{ id: 'slide', type: 'slide', content: { type: 'slide', canvas: { elements: [] } } }] as unknown as PersistedClassroomData['scenes'];
+    const signature = computeCourseQualitySignature(course, classroom);
+    const review = await confirmCourseTeacherReview('course', 'teacher', signature, []);
+    const batch = await startCourseRenderReview('course', signature);
+    await saveCourseRenderPage('course', signature, batch.runId!, { sceneId: 'slide', status: 'completed', checkedAt: '', issues: [] });
+    expect(course.content.teacherReview).toEqual(review);
+    await expect(assertCourseTeacherReview(course, 'teacher')).resolves.toBeUndefined();
+  });
+  it('rejects stale or foreign-page browser reports', async () => {
+    const signature = computeCourseQualitySignature(course, classroom);
+    const batch = await startCourseRenderReview('course', signature);
+    await expect(saveCourseRenderPage('course', 'outdated', batch.runId!, { sceneId: 'foreign', status: 'completed', checkedAt: '', issues: [] })).rejects.toThrow('最新版本');
+    await expect(saveCourseRenderPage('course', signature, batch.runId!, { sceneId: 'foreign', status: 'completed', checkedAt: '', issues: [] })).rejects.toThrow('不属于');
+  });
+  it('clears completed pages for a full recheck and rejects the previous batch result', async () => {
+    classroom.scenes = [{ id: 'slide', type: 'slide', content: { type: 'slide', canvas: { elements: [] } } }] as unknown as PersistedClassroomData['scenes'];
+    const signature = computeCourseQualitySignature(course, classroom);
+    const first = await startCourseRenderReview('course', signature);
+    const page = { sceneId: 'slide', status: 'completed' as const, checkedAt: '', issues: [] };
+    await saveCourseRenderPage('course', signature, first.runId!, page);
+    expect(freshRenderReview(course, signature)?.status).toBe('completed');
+    const second = await startCourseRenderReview('course', signature);
+    expect(second.runId).not.toBe(first.runId);
+    expect(second.pages).toEqual([]);
+    expect(second.status).toBe('pending');
+    await expect(saveCourseRenderPage('course', signature, first.runId!, page)).rejects.toMatchObject({ code: 'RENDER_BATCH_STALE' });
+    expect(freshRenderReview(course, signature)?.pages).toEqual([]);
+  });
+  it('retries failed pages while retaining current completed pages only', async () => {
+    classroom.scenes = ['a', 'b'].map((id) => ({ id, type: 'slide', content: { type: 'slide', canvas: { elements: [] } } })) as unknown as PersistedClassroomData['scenes'];
+    const signature = computeCourseQualitySignature(course, classroom);
+    const first = await startCourseRenderReview('course', signature);
+    await saveCourseRenderPage('course', signature, first.runId!, { sceneId: 'a', status: 'completed', checkedAt: '', issues: [] });
+    await saveCourseRenderPage('course', signature, first.runId!, { sceneId: 'b', status: 'failed', checkedAt: '', issues: [] });
+    const retry = await startCourseRenderReview('course', signature, 'retry');
+    expect(retry.pages.map((page) => page.sceneId)).toEqual(['a']);
+    expect(retry.status).toBe('pending');
+  });
+  it('hides obsolete render reports without invalidating a signed teacher confirmation', async () => {
+    const signature = computeCourseQualitySignature(course, classroom);
+    const review = await confirmCourseTeacherReview('course', 'teacher', signature, []);
+    course.content.renderReview = { schemaVersion: 1, signature, classroomId: classroom.id, status: 'completed', pages: [], updatedAt: new Date().toISOString() };
+    expect(freshRenderReview(course, signature)).toBeUndefined();
+    await expect(assertCourseTeacherReview(course, 'teacher')).resolves.toBeUndefined();
+    expect(course.content.teacherReview).toEqual(review);
+  });
+});

@@ -1,0 +1,286 @@
+import { Prisma, type GenerationJob } from "@prisma/client";
+import { prisma } from "@/lib/db/client";
+import { runMutationTransaction } from "@/lib/db/transaction-retry";
+import { CLASSROOM_MEDIA_ORIGIN_PREFIX, preserveClassroomMediaOrigins } from './classroom-media-origin';
+
+type JobKind = "COURSE_DESIGN" | "COURSE_CONTENT" | "COURSE_RESOURCE_PACKAGE" | "COURSE_QUALITY_REVIEW";
+type Json = Prisma.JsonValue;
+export type CourseGenerationJob = {
+  id: string; courseId: string; requestedBy: string | null; status: string; step: string; progress: number;
+  message: string; scenesGenerated: number; totalScenes: number; estimatedRemainingSeconds: number | null;
+  tokenUsage: number; tokenUsageCalls: number;
+  activePages: Json; stageProgress: Json; currentStage: string | null; currentCall: Json;
+  events: Json; trace: Json; request: Json; result: Json; qualityReport: Json; preparedOutlines: Json;
+  reviewStatus: string; reviewAvailableUntil: Date | null; stepIndex: number; version: number; attempt: number;
+  executionId: string | null; executionOwner: string | null; leaseExpiresAt: Date | null;
+  error: string | null; startedAt: Date | null; completedAt: Date | null; lastHeartbeatAt: Date | null; retryAt: Date | null;
+  createdAt: Date; updatedAt: Date;
+};
+export type CourseDesignGenerationJob = CourseGenerationJob;
+type Filter = string | number | Date | null | { in?: string[]; not?: string; lt?: Date; lte?: Date; gt?: Date };
+export type JobWhere = { [K in keyof CourseGenerationJob]?: Filter } & { OR?: JobWhere[]; AND?: JobWhere[] };
+type Patch = Partial<{ [K in keyof CourseGenerationJob]: CourseGenerationJob[K] | null | { increment: number } | Prisma.InputJsonValue | typeof Prisma.JsonNull }>;
+type Find = { where: JobWhere; select?: Record<string, boolean>; orderBy?: { createdAt?: "asc" | "desc" } };
+export type GenerationCheckpointPolicy =
+  | "all"
+  | "prepared-outlines"
+  | { steps?: readonly string[]; prefixes?: readonly string[]; unvalidatedResponses?: boolean };
+function object(value: unknown): Record<string, unknown> { return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {}; }
+function json(value: unknown): Prisma.InputJsonValue { return JSON.parse(JSON.stringify(value === Prisma.JsonNull ? null : value)); }
+function date(value: unknown): Date | null { return typeof value === "string" ? new Date(value) : null; }
+export function projectGenerationJob(row: GenerationJob): CourseGenerationJob {
+  const envelope = object(row.trace); const state = object(envelope.state);
+  return {
+    id: row.id, courseId: row.targetId, requestedBy: typeof state.requestedBy === "string" ? state.requestedBy : null,
+    status: row.status.toLowerCase(), step: row.step ?? "queued", progress: row.progress, message: String(state.message ?? "等待生成"),
+    scenesGenerated: Number(state.scenesGenerated ?? 0), totalScenes: Number(state.totalScenes ?? 0),
+    estimatedRemainingSeconds: state.estimatedRemainingSeconds == null ? null : Number(state.estimatedRemainingSeconds),
+    tokenUsage: Number(state.tokenUsage ?? 0), tokenUsageCalls: Number(state.tokenUsageCalls ?? 0),
+    activePages: (state.activePages ?? []) as Json, stageProgress: (state.stageProgress ?? []) as Json,
+    currentStage: typeof state.currentStage === "string" ? state.currentStage : null,
+    currentCall: (state.currentCall ?? null) as Json,
+    events: (state.events ?? []) as Json, trace: (envelope.entries ?? []) as Json, request: row.request, result: row.result, qualityReport: row.qualityReport,
+    preparedOutlines: (state.preparedOutlines ?? null) as Json,
+    reviewStatus: String(state.reviewStatus ?? "unavailable"), reviewAvailableUntil: date(state.reviewAvailableUntil), stepIndex: Number(state.stepIndex ?? 0), version: Number(state.version ?? 1),
+    executionId: typeof state.executionId === "string" ? state.executionId : null,
+    executionOwner: typeof state.executionOwner === "string" ? state.executionOwner : null,
+    leaseExpiresAt: date(state.leaseExpiresAt),
+    attempt: row.attempt, error: row.error, startedAt: row.startedAt, completedAt: row.completedAt, lastHeartbeatAt: row.heartbeatAt, retryAt: row.retryAt, createdAt: row.createdAt, updatedAt: row.updatedAt,
+  };
+}
+function matches(row: CourseGenerationJob, where: JobWhere): boolean {
+  return Object.entries(where).every(([key, filter]) => {
+    if (key === "OR") return (filter as JobWhere[]).some((part) => matches(row, part));
+    if (key === "AND") return (filter as JobWhere[]).every((part) => matches(row, part));
+    const value = row[key as keyof CourseGenerationJob];
+    if (filter === null || typeof filter !== "object" || filter instanceof Date) return value instanceof Date && filter instanceof Date ? value.getTime() === filter.getTime() : value === filter;
+    const condition = filter as Exclude<Filter, string | number | Date | null>;
+    if (condition.in && !condition.in.includes(String(value))) return false;
+    if (condition.not !== undefined && value === condition.not) return false;
+    if (condition.lt && !(value instanceof Date && value < condition.lt)) return false;
+    if (condition.lte && !(value instanceof Date && value <= condition.lte)) return false;
+    if (condition.gt && !(value instanceof Date && value > condition.gt)) return false;
+    return true;
+  });
+}
+/** SQL candidates are a superset of the projected predicate; matches remains authoritative.
+ * Never apply a database take before residual JSON/default-value predicates are checked.
+ */
+function candidateWhere(where: JobWhere): Prisma.GenerationJobWhereInput {
+  const fields: Record<string, { column: string; kind: "string" | "number" | "date"; nullable?: boolean }> = {
+    id: { column: "id", kind: "string" }, courseId: { column: "targetId", kind: "string" },
+    status: { column: "status", kind: "string" }, progress: { column: "progress", kind: "number" },
+    attempt: { column: "attempt", kind: "number" }, error: { column: "error", kind: "string", nullable: true },
+    startedAt: { column: "startedAt", kind: "date", nullable: true },
+    completedAt: { column: "completedAt", kind: "date", nullable: true },
+    lastHeartbeatAt: { column: "heartbeatAt", kind: "date", nullable: true },
+    retryAt: { column: "retryAt", kind: "date", nullable: true },
+    createdAt: { column: "createdAt", kind: "date" }, updatedAt: { column: "updatedAt", kind: "date" },
+  };
+  const terms: Prisma.GenerationJobWhereInput[] = [];
+  for (const [key, filter] of Object.entries(where)) {
+    if (key === "OR" || key === "AND") {
+      const children = (filter as JobWhere[]).map(candidateWhere);
+      // Prisma's empty OR objects are not logical TRUE: explicitly retain the
+      // whole OR as residual if any branch has no safe SQL restriction.
+      if (key === "OR") {
+        if (!children.length) terms.push({ id: { in: [] } });
+        else if (children.every(child => Object.keys(child).length)) terms.push({ OR: children });
+      } else terms.push(...children.filter(child => Object.keys(child).length));
+      continue;
+    }
+    const field = fields[key];
+    if (!field) continue; // JSON projections and step's default remain residual.
+    const normalized = (value: string) => key === "status" ? value.toUpperCase() : value;
+    const condition = (value: unknown) => ({ [field.column]: value }) as Prisma.GenerationJobWhereInput;
+    if (filter === null) {
+      terms.push(field.nullable ? condition(null) : { id: { in: [] } });
+    } else if (filter instanceof Date) {
+      if (field.kind === "date" && Number.isFinite(filter.getTime())) terms.push(condition(filter));
+    } else if (typeof filter === "string" && field.kind === "string") {
+      terms.push(condition(normalized(filter)));
+    } else if (typeof filter === "number" && field.kind === "number" && Number.isFinite(filter)) {
+      terms.push(condition(filter));
+    } else if (filter && typeof filter === "object" && !Array.isArray(filter)) {
+      const native: Record<string, unknown> = {};
+      if (field.kind === "string" && filter.in) native.in = filter.in.map(normalized);
+      if (field.kind === "date") for (const operator of ["lt", "lte", "gt"] as const) {
+        const date = filter[operator];
+        if (date instanceof Date && Number.isFinite(date.getTime())) native[operator] = date;
+      }
+      if (Object.keys(native).length) terms.push(condition(native));
+      if (field.kind === "string" && typeof filter.not === "string"
+        && (key !== "status" || filter.not === filter.not.toLowerCase())) {
+        const different = condition({ not: normalized(filter.not) });
+        terms.push(field.nullable ? { OR: [condition(null), different] } : different);
+      }
+    }
+  }
+  if (!terms.length) return {};
+  return terms.length === 1 ? terms[0] : { AND: terms };
+}
+function sqlWhere(kind: JobKind, where: JobWhere): Prisma.GenerationJobWhereInput {
+  return { targetType: "CLASSROOM_TEMPLATE", jobType: kind, ...candidateWhere(where) };
+}
+function updateData(row: CourseGenerationJob, patch: Patch): Prisma.GenerationJobUpdateInput {
+  const values = { ...row } as Record<string, unknown>;
+  for (const [key, value] of Object.entries(patch)) {
+    if (value === undefined) continue;
+    values[key] = value && typeof value === "object" && "increment" in value ? Number(values[key] ?? 0) + Number(value.increment) : value === Prisma.JsonNull ? null : value;
+  }
+  const next = values as CourseGenerationJob;
+  // Heartbeats and progress updates must leave the adopted request and saved
+  // output in PostgreSQL: they can contain several megabytes of course input.
+  const data: Prisma.GenerationJobUpdateInput = {};
+  if (patch.status !== undefined) data.status = next.status.toUpperCase();
+  if (patch.step !== undefined) data.step = next.step;
+  if (patch.progress !== undefined) data.progress = next.progress;
+  if (patch.request !== undefined) data.request = next.request === null ? Prisma.JsonNull : json(next.request);
+  if (patch.result !== undefined) data.result = next.result === null ? Prisma.JsonNull : json(next.result);
+  if (patch.qualityReport !== undefined) data.qualityReport = next.qualityReport === null ? Prisma.JsonNull : json(next.qualityReport);
+  if (patch.error !== undefined) data.error = next.error;
+  if (patch.attempt !== undefined) data.attempt = next.attempt;
+  if (patch.startedAt !== undefined) data.startedAt = next.startedAt;
+  if (patch.completedAt !== undefined) data.completedAt = next.completedAt;
+  if (patch.lastHeartbeatAt !== undefined) data.heartbeatAt = next.lastHeartbeatAt;
+  if (patch.retryAt !== undefined) data.retryAt = next.retryAt;
+  const stateFields: readonly (keyof CourseGenerationJob)[] = [
+    "trace", "requestedBy", "message", "scenesGenerated", "totalScenes",
+    "estimatedRemainingSeconds", "tokenUsage", "tokenUsageCalls", "events", "reviewStatus",
+    "activePages", "stageProgress", "currentStage", "currentCall", "reviewAvailableUntil",
+    "stepIndex", "version", "preparedOutlines", "executionId", "executionOwner", "leaseExpiresAt",
+  ];
+  if (stateFields.some((key) => patch[key] !== undefined)) {
+    data.trace = json({ schemaVersion: 1, entries: next.trace, state: {
+        requestedBy: next.requestedBy, message: next.message, scenesGenerated: next.scenesGenerated, totalScenes: next.totalScenes,
+        estimatedRemainingSeconds: next.estimatedRemainingSeconds, tokenUsage: next.tokenUsage, tokenUsageCalls: next.tokenUsageCalls,
+        events: next.events, reviewStatus: next.reviewStatus,
+        activePages: next.activePages, stageProgress: next.stageProgress, currentStage: next.currentStage,
+        currentCall: next.currentCall,
+        reviewAvailableUntil: next.reviewAvailableUntil, stepIndex: next.stepIndex, version: next.version, preparedOutlines: next.preparedOutlines,
+        executionId: next.executionId, executionOwner: next.executionOwner, leaseExpiresAt: next.leaseExpiresAt,
+    } });
+  }
+  return data;
+}
+async function deleteCheckpoints(
+  tx: Prisma.TransactionClient,
+  jobId: string,
+  policy: GenerationCheckpointPolicy,
+): Promise<void> {
+  if (policy === "all") {
+    await tx.generationCheckpoint.deleteMany({ where: { jobId, NOT: [
+      { step: { startsWith: CLASSROOM_MEDIA_ORIGIN_PREFIX } },
+      { step: { startsWith: 'model-usage:' } },
+      { step: { startsWith: 'authoring-history:' } },
+    ] } });
+    return;
+  }
+  if (policy === "prepared-outlines") {
+    await tx.generationCheckpoint.deleteMany({ where: { jobId, step: "prepared-outlines" } });
+    return;
+  }
+  const steps = [...new Set(policy.steps ?? [])];
+  const prefixes = [...new Set(policy.prefixes ?? [])];
+  if (steps.length === 0 && prefixes.length === 0 && !policy.unvalidatedResponses) return;
+  await tx.generationCheckpoint.deleteMany({
+    where: {
+      jobId,
+      NOT: [{ step: { startsWith: 'model-usage:' } }, { step: { startsWith: 'authoring-history:' } }],
+      OR: [
+        ...(steps.length ? [{ step: { in: steps } }] : []),
+        ...prefixes.map((prefix) => ({ step: { startsWith: prefix } })),
+        ...(policy.unvalidatedResponses ? [{ state: { path: ["status"], equals: "response-complete" } }] : []),
+      ],
+    },
+  });
+}
+function storage(kind: JobKind) {
+  async function findIn(db: Prisma.TransactionClient, input: Find) {
+    const records = await db.generationJob.findMany({ where: sqlWhere(kind, input.where), orderBy: { createdAt: input.orderBy?.createdAt ?? "desc" } });
+    return records.map(projectGenerationJob).filter((row) => matches(row, input.where));
+  }
+  async function lock(tx: Prisma.TransactionClient) { await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`generation-jobs:${kind}`}, 0))`; }
+  async function createIn(tx: Prisma.TransactionClient, data: Patch) {
+    if (typeof data.courseId !== "string") throw new Error("GENERATION_TEMPLATE_REQUIRED");
+    if (!await tx.classroomTemplate.findUnique({ where: { id: data.courseId }, select: { id: true } })) throw new Error("GENERATION_TEMPLATE_NOT_FOUND");
+    const existing = await findIn(tx, { where: { courseId: data.courseId } });
+    if (existing[0]) return existing[0];
+    const row = await tx.generationJob.create({ data: { targetType: "CLASSROOM_TEMPLATE", targetId: data.courseId, jobType: kind, status: "QUEUED", request: json(data.request ?? {}) } });
+    return projectGenerationJob(await tx.generationJob.update({ where: { id: row.id }, data: updateData(projectGenerationJob(row), data) }));
+  }
+  return {
+    async findUnique(input: Find): Promise<CourseGenerationJob | null> { return (await findIn(prisma, input))[0] ?? null; },
+    async findFirst(input: Find): Promise<CourseGenerationJob | null> { return (await findIn(prisma, input))[0] ?? null; },
+    async create(input: { data: Patch }) { return runMutationTransaction(async (tx) => { await lock(tx); return createIn(tx, input.data); }); },
+    async update(input: { where: JobWhere; data: Patch }) {
+      return runMutationTransaction(async (tx) => {
+        await lock(tx); const row = (await findIn(tx, { where: input.where }))[0];
+        if (!row) throw new Error("GENERATION_JOB_NOT_FOUND");
+        return projectGenerationJob(await tx.generationJob.update({ where: { id: row.id }, data: updateData(row, input.data) }));
+      });
+    },
+    async updateMany(input: { where: JobWhere; data: Patch }) {
+      return runMutationTransaction(async (tx) => {
+        await lock(tx); const rows = await findIn(tx, { where: input.where });
+        for (const row of rows) await tx.generationJob.update({ where: { id: row.id }, data: updateData(row, input.data) });
+        return { count: rows.length };
+      });
+    },
+    async replace(input: {
+      where: JobWhere;
+      data: Patch;
+      checkpointPolicy: GenerationCheckpointPolicy;
+    }) {
+      return runMutationTransaction(async (tx) => {
+        await lock(tx);
+        const row = (await findIn(tx, { where: input.where }))[0];
+        if (!row) throw new Error("GENERATION_JOB_NOT_FOUND");
+        if (kind === 'COURSE_CONTENT' && input.data.result !== undefined) {
+          await preserveClassroomMediaOrigins(tx, row);
+        }
+        // Explicit new authoring requests preserve raw drafts and their spent
+        // attempts before replacing active checkpoints. Usage receipts survive
+        // every checkpoint reset and are never folded into token totals twice.
+        const oldDrafts = await tx.generationCheckpoint.findMany({ where: { jobId: row.id,
+          OR: [{ step: { startsWith: 'authoring-response:' } },
+            { step: { startsWith: 'aux-authoring:' } },
+            { step: { startsWith: 'authoring-acceptance:' } },
+            { step: { startsWith: 'stage-attempt:' } },
+            { step: { startsWith: 'native-render-repair:' } },
+            { step: { startsWith: 'stage:' } }, { step: { startsWith: 'page:' } },
+            { step: { startsWith: 'design-authoring:' } },
+            { step: { startsWith: 'design-page-capacity' } },
+            { step: { startsWith: 'course-design' } }, { step: 'teaching-blueprint' }] } });
+        for (const draft of oldDrafts) await tx.generationCheckpoint.upsert({
+          where: { jobId_step: { jobId: row.id, step: `authoring-history:v${row.version}:${draft.step}` } },
+          create: { jobId: row.id, step: `authoring-history:v${row.version}:${draft.step}`, state: json(draft.state) },
+          update: {},
+        });
+        await tx.generationCheckpoint.upsert({
+          where: { jobId_step: { jobId: row.id, step: `authoring-history:v${row.version}:usage-summary` } },
+          create: { jobId: row.id, step: `authoring-history:v${row.version}:usage-summary`,
+            state: json({ tokenUsage: row.tokenUsage, tokenUsageCalls: row.tokenUsageCalls, request: row.request }) },
+          update: {},
+        });
+        await deleteCheckpoints(tx, row.id, input.checkpointPolicy);
+        return projectGenerationJob(await tx.generationJob.update({
+          where: { id: row.id },
+          data: updateData(row, input.data),
+        }));
+      });
+    },
+    async upsert(input: { where: JobWhere; create: Patch; update: Patch; rejectStatuses?: readonly string[] }) {
+      return runMutationTransaction(async (tx) => {
+        await lock(tx); const row = (await findIn(tx, { where: input.where }))[0];
+        if (row && input.rejectStatuses?.includes(row.status)) throw new Error("GENERATION_JOB_BUSY");
+        if (!row) return createIn(tx, input.create);
+        return projectGenerationJob(await tx.generationJob.update({ where: { id: row.id }, data: updateData(row, input.update) }));
+      });
+    },
+  };
+}
+export const contentGenerationJobs = storage("COURSE_CONTENT");
+export const designGenerationJobs = storage("COURSE_DESIGN");
+export const resourcePackageJobs = storage("COURSE_RESOURCE_PACKAGE");
+export const qualityReviewJobs = storage("COURSE_QUALITY_REVIEW");

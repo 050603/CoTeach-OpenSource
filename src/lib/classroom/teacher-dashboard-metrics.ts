@@ -1,0 +1,461 @@
+import { courseQuestionSet, latestCourseReflection, latestExperienceSurvey } from "@/lib/course-reflection";
+import type {
+  Course,
+  CourseResource,
+  LearningEvent,
+  Student,
+} from "@/lib/session/types";
+import { summarizeAiLearningStudent } from "@/components/views/teacher/ai-learning";
+import { aggregateKnowledgePointMastery, firstKnowledgeLectureAttempts, isCurrentAiLearningEntry, verifiedKnowledgeLectureScorePoints, verifiedKnowledgeLectureOverallScorePoints } from "@/lib/knowledge-lecture";
+import {
+  latestReflectionByStudent,
+  normalizeReflectionSurvey,
+} from "@/lib/reflection-survey";
+import {
+  REFLECTION_SUMMARY_CATEGORY_DEFINITIONS,
+  normalizeReflectionClassSummary,
+  reflectionClassSummaryIsStale,
+} from "@/lib/reflection-summary";
+import { buildShowcaseQueue } from "@/lib/showcase/queue";
+import type { ShowcaseData, ShowcaseQueueItem } from "@/lib/showcase/types";
+import { deriveProjectPracticeRows } from "@/lib/classroom/project-practice-analytics";
+
+export type TeacherDashboardTone = "neutral" | "info" | "success" | "warning" | "danger";
+
+export type TeacherDashboardMetric = {
+  metricId: string;
+  label: string;
+  value: string;
+  helper?: string;
+  tone?: TeacherDashboardTone;
+  /** The population represented by the denominator. */
+  scope?: "classroom-participants" | "active-enrollments" | "showcase-queue";
+  sampleCount?: number;
+  dataStatus?: "observed" | "missing" | "pending";
+  updatedAt?: string;
+};
+
+export type TeacherStageFocus =
+  | {
+      stageKey: "launch";
+      target: "reading";
+      resourceId?: string;
+      studentId?: string;
+      status?: LaunchResourceStatus;
+    }
+  | {
+      stageKey: "ai-learning";
+      target: "student";
+      studentId: string;
+      tab: "trajectory" | "answers";
+    }
+  | {
+      stageKey: "make";
+      target: "student";
+      studentId: string;
+      section: "artifact" | "conversation" | "signal";
+    }
+  | {
+      stageKey: "showcase";
+      target: "student";
+      studentId: string;
+    }
+  | {
+      stageKey: "reflection";
+      target: "student-list";
+      filter: "all" | "pending" | "low-score";
+      studentId?: string;
+    };
+
+export type LaunchResourceStatus = "not-opened" | "opened" | "in-progress" | "completed";
+
+export type LaunchStudentResourceState = {
+  studentId: string;
+  resourceId: string;
+  status: LaunchResourceStatus;
+  progressPercent: number;
+  lastOccurredAt?: string;
+};
+
+export type LaunchResourceCoverage = {
+  resource: CourseResource;
+  openedCount: number;
+  completedCount: number;
+  inProgressCount: number;
+};
+
+export type LaunchDashboardMetrics = {
+  studentCount: number;
+  startedCount: number;
+  completedAllCount: number;
+  states: LaunchStudentResourceState[];
+  resourceCoverage: LaunchResourceCoverage[];
+  studentRows: Array<{
+    student: Student;
+    status: "not-started" | "in-progress" | "completed";
+    openedCount: number;
+    completedCount: number;
+  }>;
+  projection: {
+    active: boolean;
+    title?: string;
+  };
+  headlines: TeacherDashboardMetric[];
+};
+
+export type KnowledgeDashboardMetrics = {
+  overallAverageScore?: number;
+  headlines: TeacherDashboardMetric[];
+  stateCounts: { notStarted: number; learning: number; completed: number; unverified: number };
+  masteryRows: ReturnType<typeof aggregateKnowledgePointMastery>;
+  sectionRows: Array<{
+    id: string;
+    title: string;
+    answeredCount: number;
+    gradedCount: number;
+    averageScore?: number;
+    averageScoreExact?: number;
+    maxScore?: number;
+    estimatedMinutes: number;
+  }>;
+  attentionRows: ReturnType<typeof summarizeAiLearningStudent>[];
+  studentRows: ReturnType<typeof summarizeAiLearningStudent>[];
+};
+
+export type MakeDashboardMetrics = {
+  headlines: TeacherDashboardMetric[];
+  draftStudentIds: Set<string>;
+  submittedStudentIds: Set<string>;
+  highPriorityStudentIds: Set<string>;
+  collaborationStudentIds: Set<string>;
+  decisionCounts: { adopted: number; rejected: number };
+  boundaryTriggerCount: number;
+  attentionRows: Array<{ student: Student; reasons: string[]; severity: "warning" | "high" }>;
+};
+
+export type ShowcaseDashboardMetrics = {
+  headlines: TeacherDashboardMetric[];
+  expectedEndAt?: string;
+  queue: ShowcaseQueueItem[];
+  statusCounts: Record<ShowcaseQueueItem["status"], number>;
+  pendingApprovals: ShowcaseQueueItem[];
+  actualDurations: Array<{ studentName: string; actualMinutes: number; plannedMinutes: number }>;
+  current?: ShowcaseQueueItem;
+  next?: ShowcaseQueueItem;
+};
+
+export type ReflectionDashboardMetrics = {
+  headlines: TeacherDashboardMetric[];
+  submittedCount: number;
+  lowScoreRows: Array<{ student: Student; dimensions: string[] }>;
+  pendingStudents: Student[];
+  averages: { aiHelpfulness?: number; systemUsability?: number; reuseIntention?: number };
+  summary: ReturnType<typeof normalizeReflectionClassSummary>;
+  summaryStale: boolean;
+};
+
+function ratio(numerator: number, denominator: number): string {
+  return denominator > 0 ? `${numerator}/${denominator}` : "—";
+}
+
+function observedRatio(numerator: number, denominator: number, observed: boolean): string {
+  return observed ? ratio(numerator, denominator) : "—";
+}
+
+function median(values: number[]): number | undefined {
+  if (!values.length) return undefined;
+  const sorted = [...values].sort((left, right) => left - right);
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[middle] : Math.round((sorted[middle - 1]! + sorted[middle]!) / 2);
+}
+
+function numericMetadata(event: LearningEvent, key: string): number | undefined {
+  const value = event.metadata?.[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function resourceIdForEvent(event: LearningEvent): string | undefined {
+  const fromMetadata = event.metadata?.resourceId;
+  return typeof fromMetadata === "string" && fromMetadata ? fromMetadata : event.sceneId;
+}
+
+function resourceState(
+  course: Course,
+  studentId: string,
+  resource: CourseResource,
+): LaunchStudentResourceState {
+  const events = (course.learningEvents ?? [])
+    .filter((event) => event.studentId === studentId && event.stageKey === "launch" && resourceIdForEvent(event) === resource.id)
+    .filter((event) => event.metadata?.source !== "teacher-projection")
+    .filter((event, index, all) => all.findIndex((candidate) => (candidate.idempotencyKey || candidate.id) === (event.idempotencyKey || event.id)) === index)
+    .sort((left, right) => Date.parse(left.occurredAt) - Date.parse(right.occurredAt));
+  let opened = false;
+  let completed = false;
+  let maxProgress = 0;
+  let lastOccurredAt: string | undefined;
+  for (const event of events) {
+    if (event.type !== "resource-open" && event.type !== "resource-progress" && event.type !== "resource-complete") continue;
+    opened = true;
+    completed ||= event.type === "resource-complete";
+    maxProgress = Math.max(maxProgress, numericMetadata(event, "progressPercent") ?? (event.progressMarker === "completed" ? 100 : 0));
+    lastOccurredAt = event.occurredAt;
+  }
+  // Existing launch records only contain downloadedBy. It means the student
+  // opened the resource, never that they reached its end.
+  if (!opened && (resource.downloadedBy ?? []).includes(studentId)) opened = true;
+  if (completed || maxProgress >= 90) {
+    return { studentId, resourceId: resource.id, status: "completed", progressPercent: Math.max(90, maxProgress), lastOccurredAt };
+  }
+  if (maxProgress > 0) {
+    return { studentId, resourceId: resource.id, status: "in-progress", progressPercent: maxProgress, lastOccurredAt };
+  }
+  return { studentId, resourceId: resource.id, status: opened ? "opened" : "not-opened", progressPercent: 0, lastOccurredAt };
+}
+
+export function deriveLaunchDashboardMetrics(course: Course): LaunchDashboardMetrics {
+  const resources = (course.resources ?? [])
+    .filter((resource) => resource.stageKey === "launch" || !resource.stageKey)
+    .filter((resource, index, all) => all.findIndex((candidate) => candidate.id === resource.id) === index);
+  const studentStates = course.students.flatMap((student) => resources.map((resource) => resourceState(course, student.id, resource)));
+  const statesByKey = new Map(studentStates.map((state) => [`${state.studentId}:${state.resourceId}`, state]));
+  const resourceCoverage = resources.map((resource) => {
+    const states = course.students.map((student) => statesByKey.get(`${student.id}:${resource.id}`)!);
+    return {
+      resource,
+      openedCount: states.filter((state) => state.status !== "not-opened").length,
+      completedCount: states.filter((state) => state.status === "completed").length,
+      inProgressCount: states.filter((state) => state.status === "in-progress").length,
+    };
+  });
+  const studentRows = course.students.map((student) => {
+    const states = resources.map((resource) => statesByKey.get(`${student.id}:${resource.id}`)!);
+    const openedCount = states.filter((state) => state.status !== "not-opened").length;
+    const completedCount = states.filter((state) => state.status === "completed").length;
+    return {
+      student,
+      status: resources.length > 0 && completedCount === resources.length
+        ? "completed" as const
+        : openedCount > 0
+          ? "in-progress" as const
+          : "not-started" as const,
+      openedCount,
+      completedCount,
+    };
+  });
+  const startedCount = studentRows.filter((row) => row.openedCount > 0).length;
+  const completedAllCount = studentRows.filter((row) => row.status === "completed").length;
+  const hasEvidence = studentStates.some((state) => state.status !== "not-opened");
+  const projected = course.uiState?.resourceProjection;
+  return {
+    studentCount: course.students.length,
+    startedCount,
+    completedAllCount,
+    states: studentStates,
+    resourceCoverage,
+    studentRows,
+    projection: { active: Boolean(projected?.stageKey === "launch"), title: projected?.stageKey === "launch" ? projected.title : undefined },
+    headlines: [
+      { metricId: "launch-started", label: "已开始浏览", value: observedRatio(startedCount, course.students.length, hasEvidence), helper: hasEvidence ? "至少打开一份启动资料" : resources.length ? "等待学生打开启动资料" : "尚未发布启动资料" },
+      { metricId: "launch-completed", label: "全部资料浏览完成", value: resources.length ? observedRatio(completedAllCount, course.students.length, hasEvidence) : "—", helper: resources.length ? (hasEvidence ? `${resources.length} 份资料均达到完成边界` : "等待首份有效浏览记录") : "尚未发布启动资料", tone: completedAllCount === course.students.length && resources.length > 0 ? "success" : "info" },
+      { metricId: "launch-projection", label: "当前投屏", value: projected?.stageKey === "launch" ? projected.title : "未投屏", helper: projected?.stageKey === "launch" ? "学生端正在同步" : "可从资料预览开始投屏", tone: projected?.stageKey === "launch" ? "success" : "neutral" },
+    ],
+  };
+}
+
+export function deriveKnowledgeDashboardMetrics(course: Course): KnowledgeDashboardMetrics {
+  const studentRows = course.students.map((student) => summarizeAiLearningStudent(course, student));
+  const progressEntries = course.students.flatMap((student) => {
+    const entry = course.aiLearningProgress?.[student.id];
+    return entry && isCurrentAiLearningEntry(course, entry) ? [[student.id, entry] as const] : [];
+  });
+  const answeredStudents = new Set(
+    progressEntries.flatMap(([studentId, entry]) => firstKnowledgeLectureAttempts(entry).length ? [studentId] : []),
+  );
+  const highPriorityStudentIds = new Set(studentRows.flatMap((row) => row.signals.some((signal) => signal.severity === "high") ? [row.student.id] : []));
+  const stateCounts = {
+    notStarted: studentRows.filter((row) => row.preciseProgress === 0 && !row.hasEvidence).length,
+    learning: studentRows.filter((row) => row.preciseProgress !== undefined && row.preciseProgress < 100 && row.hasEvidence).length,
+    completed: studentRows.filter((row) => row.preciseProgress === 100).length,
+    unverified: studentRows.filter((row) => row.preciseProgress === undefined).length,
+  };
+  const masteryRows = aggregateKnowledgePointMastery(course);
+  const sectionRows = (course.content.knowledgeLectureSections ?? []).map((section) => {
+    const sectionAttempts = progressEntries.flatMap(([studentId, entry]) => firstKnowledgeLectureAttempts(entry)
+      .filter((attempt) => attempt.sectionId === section.id)
+      .map((attempt) => ({ studentId, attempt })));
+    const verifiedScores = sectionAttempts.flatMap(({ attempt }) => {
+      const score = verifiedKnowledgeLectureScorePoints(attempt);
+      return score === undefined ? [] : [score];
+    });
+    const averageScoreExact = verifiedScores.length
+      ? verifiedScores.reduce((sum, score) => sum + score, 0) / verifiedScores.length
+      : undefined;
+    return { id: section.id, title: section.title, answeredCount: new Set(sectionAttempts.map((item) => item.studentId)).size, gradedCount: verifiedScores.length, averageScore: averageScoreExact === undefined ? undefined : Math.round(averageScoreExact * 100) / 100, averageScoreExact, maxScore: section.maxScore ?? sectionAttempts[0]?.attempt.questions.reduce((sum, question) => sum + question.points, 0), estimatedMinutes: section.estimatedMinutes };
+  });
+  const overallScores = progressEntries.flatMap(([, entry]) => {
+    const score = verifiedKnowledgeLectureOverallScorePoints(firstKnowledgeLectureAttempts(entry));
+    return score === undefined ? [] : [score];
+  });
+  const progressValues = studentRows.flatMap((row) => row.preciseProgress === undefined ? [] : [row.preciseProgress]);
+  const hasProgressEvidence = studentRows.some((row) => row.hasEvidence || row.progress > 0 || row.accuracy !== undefined);
+  const hasQuizEvidence = answeredStudents.size > 0;
+  const hasSignalEvidence = (course.learningSignals ?? []).some((signal) => signal.stageKey === "ai-learning");
+  return {
+    headlines: [
+      { metricId: "knowledge-median-progress", label: "班级进度中位数", value: hasProgressEvidence && progressValues.length ? `${Math.round(median(progressValues)!)}%` : "—", helper: progressValues.length ? `按 ${progressValues.length}/${course.students.length} 名学生可靠学习记录计算` : "等待学生产生可靠学习进度", scope: "classroom-participants", sampleCount: progressValues.length, dataStatus: progressValues.length ? "observed" : "missing", updatedAt: course.updatedAt },
+      { metricId: "knowledge-quiz-coverage", label: "小测覆盖", value: observedRatio(answeredStudents.size, course.students.length, hasQuizEvidence), helper: hasQuizEvidence ? "至少提交一节节末小测" : "等待首份节末小测" },
+      { metricId: "knowledge-high-priority", label: "高优先级信号", value: hasSignalEvidence ? `${highPriorityStudentIds.size} 人` : "—", helper: hasSignalEvidence ? "需要教师优先判断的学习信号" : "尚无可排序的学习信号", tone: highPriorityStudentIds.size ? "warning" : "success" },
+    ],
+    stateCounts,
+    overallAverageScore: overallScores.length ? Math.round(overallScores.reduce((sum, score) => sum + score, 0) / overallScores.length * 100) / 100 : undefined,
+    masteryRows,
+    sectionRows,
+    attentionRows: [...studentRows]
+      .filter((row) => row.signals.length)
+      .sort((left, right) => {
+        const severity = (row: typeof left) => Math.max(...row.signals.map((signal) => signal.severity === "high" ? 3 : signal.severity === "warning" ? 2 : 1));
+        return severity(right) - severity(left) || right.signals.length - left.signals.length;
+      }),
+    studentRows,
+  };
+}
+
+export function deriveMakeDashboardMetrics(course: Course): MakeDashboardMetrics {
+  const rows = deriveProjectPracticeRows(course);
+  const draftStudentIds = new Set(rows.filter((row) => row.hasDraft).map((row) => row.student.id));
+  const submittedStudentIds = new Set(rows.filter((row) => row.submitted).map((row) => row.student.id));
+  const openSignals = rows.flatMap((row) => row.signals);
+  const highPriorityStudentIds = new Set(openSignals.filter((signal) => signal.severity === "high").map((signal) => signal.studentId));
+  const decisionRecords = rows.flatMap((row) => row.decisions);
+  const collaborationStudentIds = new Set(rows.filter((row) => row.participating).map((row) => row.student.id));
+  const decisionCounts = {
+    adopted: decisionRecords.filter((record) => record.decision === "adopted" || record.decision === "modified").length,
+    rejected: decisionRecords.filter((record) => record.decision === "rejected").length,
+  };
+  const inProgressCount = rows.filter((row) => row.progressState === "in-progress").length;
+  const boundaryTriggerCount = rows.reduce((total, row) => total + row.boundaryTriggerCount, 0);
+  const attentionRows = rows.flatMap(({ student, signals, boundaryTriggerCount }) => {
+    if (!signals.length && !boundaryTriggerCount) return [];
+    return [{ student, reasons: [...signals.slice(0, 3).map((signal) => signal.title), ...(boundaryTriggerCount ? [`AI 边界触发 ${boundaryTriggerCount} 次`] : [])], severity: signals.some((signal) => signal.severity === "high") ? "high" as const : "warning" as const }];
+  }).sort((left, right) => (left.severity === "high" ? -1 : 1) - (right.severity === "high" ? -1 : 1));
+  return {
+    headlines: [
+      { metricId: "make-in-progress", label: "任务进行中", value: ratio(inProgressCount, course.students.length), helper: "已有正文、代码或有效上传，尚未正式提交" },
+      { metricId: "make-submitted", label: "提交过成果", value: ratio(submittedStudentIds.size, course.students.length), helper: "至少成功提交一次；继续修改与迭代仍计入" },
+      { metricId: "make-attention", label: "需关注学生", value: course.students.length ? `${attentionRows.length} 人` : "—", helper: "本阶段开放学习信号或 AI 边界触发；不含外部内容提醒", tone: attentionRows.length ? "warning" : "success" },
+    ],
+    draftStudentIds,
+    submittedStudentIds,
+    highPriorityStudentIds,
+    collaborationStudentIds,
+    decisionCounts,
+    boundaryTriggerCount,
+    attentionRows,
+  };
+}
+
+function fallbackShowcaseQueue(course: Course): ShowcaseQueueItem[] {
+  const students = course.students.map((student) => {
+    const artifacts = [
+      ...(course.projectDocumentVersions ?? []).filter((version) => ["make", "showcase"].includes(version.stageKey) && version.studentId === student.id && version.status === "submitted").map((version) => ({ kind: "document" as const, versionId: version.id, title: version.title, sequence: version.sequence, submittedAt: version.submittedAt ?? version.createdAt, displayModes: ["continuous" as const] })),
+      ...(course.projectPdfVersions ?? []).filter((version) => ["make", "showcase"].includes(version.stageKey) && version.studentId === student.id && version.status === "submitted").map((version) => ({ kind: "pdf" as const, versionId: version.id, title: version.title, sequence: version.sequence, submittedAt: version.submittedAt, displayModes: ["continuous" as const, "slides" as const] })),
+    ];
+    return { studentId: student.id, name: student.name, groupId: course.groups?.find((group) => group.members.some((member) => member.studentId === student.id))?.id, artifacts };
+  });
+  return buildShowcaseQueue(students, course.showcasePresentations ?? [], course.presentingStudentId, course.uiState?.showcaseReporting ?? (course.content.stagePlan?.schemaVersion === 2 ? { schemaVersion: 2, selectionMode: "teacher-selected", selectedStudentIds: [], orderedStudentIds: [] } : undefined)).items;
+}
+
+export function deriveShowcaseDashboardMetrics(course: Course, data?: ShowcaseData): ShowcaseDashboardMetrics {
+  const queue = data?.queue ?? fallbackShowcaseQueue(course);
+  const statusCounts = queue.reduce<Record<ShowcaseQueueItem["status"], number>>((counts, item) => {
+    counts[item.status] = (counts[item.status] ?? 0) + 1;
+    return counts;
+  }, { "not-ready": 0, waiting: 0, called: 0, "pending-approval": 0, presenting: 0, evaluating: 0, rejected: 0, completed: 0 });
+  const presentations = data?.presentations ?? course.showcasePresentations ?? [];
+  const plannedMinutes = data?.minutesPerStudent ?? course.uiState?.showcaseReporting?.minutesPerStudent ?? 5;
+  const actualDurations = presentations.flatMap((presentation) => {
+    if (!presentation.startedAt || !presentation.endedAt) return [];
+    const startedAt = Date.parse(presentation.startedAt);
+    const endedAt = Date.parse(presentation.endedAt);
+    if (!Number.isFinite(startedAt) || !Number.isFinite(endedAt)) return [];
+    const elapsed = Math.max(0, (endedAt - startedAt) / 60_000);
+    const student = course.students.find((item) => item.id === presentation.studentId);
+    return [{ studentName: student?.name ?? presentation.studentName ?? "学生", actualMinutes: Math.round(elapsed * 10) / 10, plannedMinutes }];
+  });
+  const readyCount = queue.filter((item) => item.status !== "not-ready").length;
+  const completedCount = queue.filter((item) => ["completed", "evaluating"].includes(item.status)).length;
+  const now = Date.now();
+  const remainingMinutes = data?.budget ? data.budget.plannedRemainingSec / 60 : queue.filter((item) => !["completed", "not-ready"].includes(item.status)).reduce((sum, item) => {
+    if (item.status === "presenting" && item.startedAt) {
+      const startedAt = Date.parse(item.startedAt);
+      const elapsed = Number.isFinite(startedAt) ? Math.max(0, (now - startedAt) / 60_000) : 0;
+      return sum + Math.max(0, plannedMinutes - Math.min(plannedMinutes, elapsed));
+    }
+    if (item.status === "evaluating") return sum;
+    return sum + (item.estimatedWaitMinutes ?? plannedMinutes);
+  }, 0);
+  return {
+    headlines: [
+      { metricId: "showcase-ready", label: "成果已就绪", value: ratio(readyCount, queue.length), helper: "已有可投屏文档或 PDF" },
+      { metricId: "showcase-evaluated", label: "已汇报", value: ratio(completedCount, queue.length), helper: "已经结束作品汇报", tone: completedCount === queue.length && queue.length > 0 ? "success" : "info" },
+      { metricId: "showcase-eta", label: "预计剩余", value: remainingMinutes > 0 ? `${Math.round(remainingMinutes)} 分钟` : "—", helper: queue.length ? `按每人约 ${plannedMinutes} 分钟估算` : "暂无可汇报队列" },
+    ],
+    expectedEndAt: remainingMinutes > 0 ? new Date(now + remainingMinutes * 60_000).toISOString() : undefined,
+    queue,
+    statusCounts,
+    pendingApprovals: queue.filter((item) => item.status === "pending-approval"),
+    actualDurations,
+    current: (data?.currentQueueItem?.status === "evaluating" ? undefined : data?.currentQueueItem) ?? queue.find((item) => ["called", "pending-approval", "presenting", "rejected"].includes(item.status)),
+    next: data?.nextQueueItem ?? queue.find((item) => item.status === "waiting"),
+  };
+}
+
+function latestReflectionSummary(course: Course) {
+  const support = (course.aiSupports ?? [])
+    .filter((item) => item.kind === "reflection-class-summary" && item.targetType === "course")
+    .sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt))[0];
+  return normalizeReflectionClassSummary(support?.structuredPayload, new Set(course.students.map((student) => student.id)));
+}
+
+export function deriveReflectionDashboardMetrics(course: Course): ReflectionDashboardMetrics {
+  const latest = latestReflectionByStudent(course.reflections);
+  const records = course.students.map((student) => ({ student, reflection: courseQuestionSet(course) ? latestCourseReflection(course, student.id) : latest.get(student.id), survey: courseQuestionSet(course) ? latestExperienceSurvey(course, student.id) : normalizeReflectionSurvey(latest.get(student.id)?.survey) }));
+  const submitted = records.filter((item) => courseQuestionSet(course) ? Boolean(item.reflection?.courseReflection) : Boolean(item.survey));
+  const lowScoreRows = records.flatMap(({ student, survey }) => {
+    if (!survey) return [];
+    const dimensions = [
+      survey.aiHelpfulness <= 2 ? "AI 引导帮助" : "",
+      survey.systemUsability <= 2 ? "系统易理解" : "",
+      survey.reuseIntention <= 2 ? "继续使用意愿" : "",
+    ].filter(Boolean);
+    return dimensions.length ? [{ student, dimensions }] : [];
+  });
+  const summary = latestReflectionSummary(course);
+  const hasValidSurvey = submitted.length > 0;
+  const average = (key: "aiHelpfulness" | "systemUsability" | "reuseIntention") => {
+    const values = records.flatMap((item) => item.survey ? [item.survey[key]] : []);
+    return values.length ? Math.round(values.reduce((sum, value) => sum + value, 0) / values.length * 10) / 10 : undefined;
+  };
+  return {
+    headlines: [
+      { metricId: "reflection-coverage", label: "有效反思提交", value: observedRatio(submitted.length, course.students.length, hasValidSurvey), helper: courseQuestionSet(course) ? "按课程题集统计，体验问卷独立提交" : hasValidSurvey ? "仅统计新版结构化问卷" : "等待有效结构化问卷" },
+      { metricId: "reflection-ai-helpfulness", label: "AI 帮助度", value: average("aiHelpfulness")?.toFixed(1) ?? "—", helper: "满分 5 分" },
+      { metricId: "reflection-system-usability", label: "系统易理解度", value: average("systemUsability")?.toFixed(1) ?? "—", helper: "满分 5 分" },
+      { metricId: "reflection-reuse", label: "继续使用意愿", value: average("reuseIntention")?.toFixed(1) ?? "—", helper: "满分 5 分" },
+    ],
+    submittedCount: submitted.length,
+    lowScoreRows,
+    pendingStudents: records.filter((item) => courseQuestionSet(course) ? !item.reflection?.courseReflection : !item.survey).map((item) => item.student),
+    averages: {
+      aiHelpfulness: average("aiHelpfulness") ?? undefined,
+      systemUsability: average("systemUsability") ?? undefined,
+      reuseIntention: average("reuseIntention") ?? undefined,
+    },
+    summary,
+    summaryStale: reflectionClassSummaryIsStale(summary, course),
+  };
+}
+
+export function reflectionSummaryCategoryTitles(): string[] {
+  return REFLECTION_SUMMARY_CATEGORY_DEFINITIONS.map((definition) => definition.title);
+}

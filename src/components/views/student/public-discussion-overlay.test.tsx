@@ -1,0 +1,296 @@
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { PublicDiscussionSnapshot, PublicDiscussionStatus } from "@/lib/public-discussion/types";
+
+const mocks = vi.hoisted(() => ({
+  playbackBlock: vi.fn(),
+  subscribe: vi.fn<(courseId: string, listener: () => void) => () => void>(() => () => undefined),
+}));
+
+vi.mock("@openmaic/lib/playback/activity-events", () => ({
+  dispatchPlaybackModalBlock: mocks.playbackBlock,
+}));
+vi.mock("@/lib/public-discussion/realtime-client", () => ({
+  subscribePublicDiscussionUpdates: mocks.subscribe,
+}));
+
+import { PublicDiscussionStudentOverlay } from "./public-discussion-overlay";
+
+function snapshot(
+  status: PublicDiscussionStatus = "awaiting-student",
+  current = true,
+  version = 3,
+): PublicDiscussionSnapshot {
+  return {
+    enabled: true,
+    session: {
+      id: "session-1",
+      courseId: "course-1",
+      knowledgePointId: "kp-1",
+      topic: "证据链",
+      mode: "inquiry",
+      openingPrompt: "你的判断依据是什么？",
+      status,
+      version,
+      roundCount: 0,
+      currentStudent: { id: "student-a", name: "安同学" },
+      isCurrentStudent: current,
+      turns: [],
+      createdAt: "2026-09-16T00:00:00.000Z",
+      updatedAt: "2026-09-16T00:00:00.000Z",
+      shouldSuggestSummary: false,
+    },
+  };
+}
+
+function mediaStream(): MediaStream {
+  return { getTracks: () => [{ stop: vi.fn() }] } as unknown as MediaStream;
+}
+
+class MockMediaRecorder {
+  static isTypeSupported = vi.fn<(type: string) => boolean>(() => true);
+  state: RecordingState = "inactive";
+  mimeType: string;
+  ondataavailable: ((event: BlobEvent) => void) | null = null;
+  onstop: (() => void) | null = null;
+
+  constructor(_stream: MediaStream, options?: MediaRecorderOptions) {
+    this.mimeType = options?.mimeType ?? "audio/webm";
+  }
+
+  start() {
+    this.state = "recording";
+  }
+
+  stop() {
+    this.state = "inactive";
+    this.ondataavailable?.({ data: new Blob(["recorded-audio"], { type: this.mimeType }) } as BlobEvent);
+    this.onstop?.();
+  }
+}
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  MockMediaRecorder.isTypeSupported.mockReturnValue(true);
+  vi.stubGlobal("fetch", vi.fn(async () => Response.json(snapshot())));
+});
+
+afterEach(() => {
+  vi.useRealTimers();
+  vi.unstubAllGlobals();
+  Object.defineProperty(navigator, "mediaDevices", { configurable: true, value: undefined });
+});
+
+describe("student public discussion overlay", () => {
+  it("falls back to text when automatic microphone access is denied", async () => {
+    const getUserMedia = vi.fn().mockRejectedValue(new Error("麦克风权限已拒绝"));
+    Object.defineProperty(navigator, "mediaDevices", { configurable: true, value: { getUserMedia } });
+    render(<PublicDiscussionStudentOverlay courseId="course-1" />);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("麦克风权限已拒绝");
+    expect(screen.getByRole("textbox", { name: "文字回答" })).toBeEnabled();
+    expect(mocks.playbackBlock).toHaveBeenCalledWith({ blocked: true, source: "public-discussion" });
+  });
+
+  it("does not render discussion UI for students who were not selected", async () => {
+    vi.mocked(fetch).mockResolvedValue(Response.json(snapshot("awaiting-student", false)));
+    render(<PublicDiscussionStudentOverlay courseId="course-1" />);
+
+    await waitFor(() => expect(mocks.subscribe).toHaveBeenCalledWith("course-1", expect.any(Function)));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.queryByRole("button", { name: /点击回答|重新回答|结束回答/ })).toBeNull();
+    await waitFor(() => expect(mocks.playbackBlock).toHaveBeenCalledWith({ blocked: true, source: "public-discussion" }));
+  });
+
+  it("shows only the question and answer controls in a lightweight selected-student dialog", async () => {
+    vi.mocked(fetch).mockResolvedValue(Response.json(snapshot("inviting")));
+    render(<PublicDiscussionStudentOverlay courseId="course-1" />);
+
+    expect(await screen.findByRole("dialog", { name: "回答课堂提问" })).toBeVisible();
+    expect(screen.getByText("你的判断依据是什么？")).toBeVisible();
+    expect(screen.getByRole("button", { name: "接受并打开麦克风" })).toBeVisible();
+    expect(screen.queryByText(/文字记录|关键结论|误解澄清/)).toBeNull();
+  });
+
+  it.each(["awaiting-retry", "awaiting-confirmation"] as const)(
+    "allows recording again from %s",
+    async (status) => {
+      const getUserMedia = vi.fn().mockResolvedValue(mediaStream());
+      Object.defineProperty(navigator, "mediaDevices", { configurable: true, value: { getUserMedia } });
+      vi.stubGlobal("MediaRecorder", MockMediaRecorder as unknown as typeof MediaRecorder);
+      vi.mocked(fetch).mockImplementation(async (_input, init) => {
+        if (init?.method === "POST") return Response.json(snapshot("recording", true, 4));
+        return Response.json(snapshot(status));
+      });
+
+      render(<PublicDiscussionStudentOverlay courseId="course-1" />);
+      fireEvent.click(await screen.findByRole("button", { name: "重新回答" }));
+
+      expect(await screen.findByRole("button", { name: "结束回答" })).toBeVisible();
+      expect(getUserMedia).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(fetch)).toHaveBeenCalledWith(
+        "/api/courses/course-1/public-discussion",
+        expect.objectContaining({ method: "POST", body: expect.stringContaining('"action":"start-recording"') }),
+      );
+    },
+  );
+
+  it("automatically starts recording only once for a waiting session version", async () => {
+    const getUserMedia = vi.fn().mockResolvedValue(mediaStream());
+    Object.defineProperty(navigator, "mediaDevices", { configurable: true, value: { getUserMedia } });
+    vi.stubGlobal("MediaRecorder", MockMediaRecorder as unknown as typeof MediaRecorder);
+    let startCalls = 0;
+    vi.mocked(fetch).mockImplementation(async (_input, init) => {
+      if (init?.method === "POST") {
+        startCalls += 1;
+        return Response.json(snapshot("recording", true, 4));
+      }
+      return Response.json(snapshot());
+    });
+
+    render(<PublicDiscussionStudentOverlay courseId="course-1" />);
+    expect(await screen.findByRole("button", { name: "结束回答" })).toBeVisible();
+    const listener = mocks.subscribe.mock.calls[0]?.[1] as (() => void) | undefined;
+    listener?.();
+
+    await waitFor(() => expect(startCalls).toBe(1));
+    expect(getUserMedia).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([["audio/webm;codecs=opus", "webm"], ["audio/mp4", "m4a"]])("uploads %s recording with the matching filename", async (mimeType, extension) => {
+    MockMediaRecorder.isTypeSupported.mockImplementation((type) => type === mimeType);
+    const getUserMedia = vi.fn().mockResolvedValue(mediaStream());
+    Object.defineProperty(navigator, "mediaDevices", { configurable: true, value: { getUserMedia } });
+    vi.stubGlobal("MediaRecorder", MockMediaRecorder as unknown as typeof MediaRecorder);
+    vi.mocked(fetch).mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url.endsWith("/transcription")) {
+        return Response.json({ text: "实验记录能够支持判断。", snapshot: snapshot("ai-generating", true, 6) });
+      }
+      if (init?.method === "POST") return Response.json(snapshot("recording", true, 4));
+      return Response.json(snapshot());
+    });
+
+    render(<PublicDiscussionStudentOverlay courseId="course-1" />);
+    fireEvent.click(await screen.findByRole("button", { name: "结束回答" }));
+
+    await waitFor(() => expect(vi.mocked(fetch)).toHaveBeenCalledWith(
+      "/api/courses/course-1/public-discussion/transcription",
+      expect.objectContaining({ method: "POST", body: expect.any(FormData) }),
+    ));
+    const upload = vi.mocked(fetch).mock.calls.find(([input]) => String(input).endsWith("/transcription"));
+    const audio = (upload![1]!.body as FormData).get("audio") as File;
+    expect(audio.name).toBe(`classroom-answer.${extension}`);
+    expect(audio.type).toBe(mimeType);
+    expect(screen.queryByRole("button", { name: "提交给 AI" })).toBeNull();
+  });
+
+  it("returns to voice-first automatic recording after a text fallback turn", async () => {
+    const getUserMedia = vi.fn().mockResolvedValue(mediaStream());
+    Object.defineProperty(navigator, "mediaDevices", { configurable: true, value: { getUserMedia } });
+    vi.stubGlobal("MediaRecorder", MockMediaRecorder as unknown as typeof MediaRecorder);
+    let nextRound = false;
+    let startCalls = 0;
+    vi.mocked(fetch).mockImplementation(async (_input, init) => {
+      if (init?.method === "POST") {
+        const body = JSON.parse(String(init.body)) as { action: string };
+        if (body.action === "submit-answer") {
+          nextRound = true;
+          return Response.json(snapshot("ai-ready", true, 4));
+        }
+        if (body.action === "start-recording") {
+          startCalls += 1;
+          return Response.json(snapshot("recording", true, 6));
+        }
+      }
+      return Response.json(nextRound
+        ? snapshot("awaiting-student", true, 5)
+        : snapshot("awaiting-retry", true, 3));
+    });
+
+    render(<PublicDiscussionStudentOverlay courseId="course-1" />);
+    fireEvent.click(await screen.findByRole("button", { name: "改用文字" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "文字回答" }), {
+      target: { value: "用文字说明实验条件。" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "提交回答" }));
+    await waitFor(() => expect(nextRound).toBe(true));
+
+    const listener = mocks.subscribe.mock.calls[0]?.[1] as (() => void) | undefined;
+    listener?.();
+
+    expect(await screen.findByRole("button", { name: "结束回答" })).toBeVisible();
+    expect(startCalls).toBe(1);
+    expect(getUserMedia).toHaveBeenCalledTimes(1);
+  });
+});
+
+
+it("coalesces slow ordinary polls and follows realtime hints with one fresh read", async () => {
+  vi.useFakeTimers();
+  const pending: Array<(response: Response) => void> = [];
+  vi.mocked(fetch).mockImplementation(() => new Promise<Response>(resolve => pending.push(resolve)));
+  const { unmount } = render(<PublicDiscussionStudentOverlay courseId="course-1" />);
+  await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+  await act(async () => { await vi.advanceTimersByTimeAsync(10000); });
+  expect(pending).toHaveLength(1);
+  const notify = mocks.subscribe.mock.calls.at(-1)![1];
+  act(() => { notify(); notify(); }); expect(pending).toHaveLength(1);
+  await act(async () => { pending[0](Response.json(snapshot("inviting", true, 3))); });
+  expect(pending).toHaveLength(2);
+  await act(async () => { pending[1](Response.json(snapshot("inviting", true, 4))); });
+  expect(pending).toHaveLength(2); expect(screen.getByRole("dialog")).toBeVisible(); unmount();
+});
+
+it("aborts a previous course read and ignores its late result even if fetch ignores cancellation", async () => {
+  vi.useFakeTimers();
+  const pending: Array<{ signal?: AbortSignal | null; resolve: (response: Response) => void }> = [];
+  vi.mocked(fetch).mockImplementation((_url, init) => new Promise<Response>(resolve => pending.push({ signal: init?.signal, resolve })));
+  const { rerender, unmount } = render(<PublicDiscussionStudentOverlay courseId="course-1" />);
+  await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+  rerender(<PublicDiscussionStudentOverlay courseId="course-2" />);
+  await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+  expect(pending[0].signal?.aborted).toBe(true);
+  const next = snapshot("inviting"); next.session = { ...next.session!, courseId: "course-2", openingPrompt: "New course question" };
+  await act(async () => { pending[1].resolve(Response.json(next)); });
+  await act(async () => { pending[0].resolve(Response.json(snapshot("inviting"))); });
+  expect(screen.getByText("New course question")).toBeVisible();
+  expect(screen.queryByText("你的判断依据是什么？")).toBeNull(); unmount();
+});
+
+it("rejects an older version of the same session while allowing a fresh session to take over", async () => {
+  vi.useFakeTimers();
+  const current = snapshot("inviting", true, 5); current.session!.openingPrompt = "Version five";
+  vi.mocked(fetch).mockResolvedValueOnce(Response.json(current));
+  const { unmount } = render(<PublicDiscussionStudentOverlay courseId="course-1" />);
+  await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+  const notify = mocks.subscribe.mock.calls.at(-1)![1];
+  const stale = snapshot("inviting", true, 3); stale.session!.openingPrompt = "Stale question";
+  vi.mocked(fetch).mockResolvedValueOnce(Response.json(stale));
+  await act(async () => { notify(); });
+  expect(screen.getByText("Version five")).toBeVisible(); expect(screen.queryByText("Stale question")).toBeNull();
+  const next = snapshot("inviting", true, 1); next.session!.id = "session-2"; next.session!.openingPrompt = "New session";
+  vi.mocked(fetch).mockResolvedValueOnce(Response.json(next));
+  await act(async () => { notify(); });
+  expect(screen.getByText("New session")).toBeVisible(); unmount();
+});
+
+it("keeps a newer action receipt when an older GET returns a different prior session afterward", async () => {
+  vi.useFakeTimers();
+  let finishOld!: (response: Response) => void; let reads = 0;
+  vi.mocked(fetch).mockImplementation(async (_url, init) => {
+    if (init?.method === "POST") {
+      const next = snapshot("inviting", false, 1); next.session!.id = "replacement-session";
+      return Response.json(next);
+    }
+    if (++reads === 1) return Response.json(snapshot("inviting", true, 5));
+    return new Promise<Response>(resolve => { finishOld = resolve; });
+  });
+  const { unmount } = render(<PublicDiscussionStudentOverlay courseId="course-1" />);
+  await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+  await act(async () => { mocks.subscribe.mock.calls.at(-1)![1](); });
+  await act(async () => { fireEvent.click(screen.getByRole("button", { name: "暂不参与" })); });
+  expect(screen.queryByRole("dialog")).toBeNull();
+  await act(async () => { finishOld(Response.json(snapshot("inviting", true, 5))); });
+  expect(screen.queryByRole("dialog")).toBeNull(); unmount();
+});

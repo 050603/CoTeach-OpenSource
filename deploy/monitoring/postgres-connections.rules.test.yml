@@ -1,0 +1,257 @@
+# Run from this directory: promtool test rules postgres-connections.rules.test.yml
+rule_files:
+  - alerts.yml
+evaluation_interval: 15s
+tests:
+  - name: "known cluster client occupancy above 80 percent fires only after five minutes"
+    interval: 15s
+    input_series:
+      - series: "up{job=\"openpbl\",instance=\"app\"}"
+        values: "1+0x40"
+      - series: "openpbl_postgres_connections{job=\"openpbl\",instance=\"app\"}"
+        values: "81+0x40"
+      - series: "openpbl_postgres_connection_limit{job=\"openpbl\",instance=\"app\"}"
+        values: "100+0x40"
+      - series: "openpbl_health_sample_available{job=\"openpbl\",instance=\"app\",component=\"database\"}"
+        values: "1+0x40"
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: OpenPblPostgresConnectionsHigh
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: OpenPblPostgresConnectionsHigh
+        exp_alerts:
+          - exp_labels:
+              severity: "warning"
+              job: "openpbl"
+              instance: "app"
+            exp_annotations:
+              summary: "PostgreSQL client backend sessions exceed 80% of max_connections"
+      - eval_time: 10m
+        alertname: OpenPblHealthTelemetryUnknown
+        exp_alerts: []
+  - name: "80 percent boundary and normal occupancy remain clear with per-instance limits"
+    interval: 15s
+    input_series:
+      - series: "up{job=\"openpbl\",instance=\"boundary\"}"
+        values: "1+0x40"
+      - series: "openpbl_postgres_connections{job=\"openpbl\",instance=\"boundary\"}"
+        values: "80+0x40"
+      - series: "openpbl_postgres_connection_limit{job=\"openpbl\",instance=\"boundary\"}"
+        values: "100+0x40"
+      - series: "openpbl_health_sample_available{job=\"openpbl\",instance=\"boundary\",component=\"database\"}"
+        values: "1+0x40"
+      - series: "up{job=\"openpbl\",instance=\"normal\"}"
+        values: "1+0x40"
+      - series: "openpbl_postgres_connections{job=\"openpbl\",instance=\"normal\"}"
+        values: "7+0x40"
+      - series: "openpbl_postgres_connection_limit{job=\"openpbl\",instance=\"normal\"}"
+        values: "10+0x40"
+      - series: "openpbl_health_sample_available{job=\"openpbl\",instance=\"normal\",component=\"database\"}"
+        values: "1+0x40"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: OpenPblPostgresConnectionsHigh
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: OpenPblHealthTelemetryUnknown
+        exp_alerts: []
+  - name: "hidden backend types make client and lock samples unknown while max remains known"
+    interval: 15s
+    input_series:
+      - series: "up{job=\"openpbl\",instance=\"app\"}"
+        values: "1+0x40"
+      - series: "openpbl_postgres_connections{job=\"openpbl\",instance=\"app\"}"
+        values: "NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN"
+      - series: "openpbl_postgres_connection_limit{job=\"openpbl\",instance=\"app\"}"
+        values: "100+0x12"
+      - series: "openpbl_health_sample_available{job=\"openpbl\",instance=\"app\",component=\"database\"}"
+        values: "0+0x12"
+      - series: "openpbl_postgres_lock_waiters{job=\"openpbl\",instance=\"app\"}"
+        values: "NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN"
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: OpenPblHealthTelemetryUnknown
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: OpenPblPostgresConnectionsHigh
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: OpenPblDatabaseLockBacklog
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: OpenPblHealthTelemetryUnknown
+        exp_alerts:
+          - exp_labels:
+              severity: "warning"
+              job: "openpbl"
+              instance: "app"
+              component: "database"
+            exp_annotations:
+              summary: "CoTeach database telemetry is unavailable"
+  - name: "NaN occupancy cannot be considered healthy even if availability flag is inconsistent"
+    interval: 15s
+    input_series:
+      - series: "up{job=\"openpbl\",instance=\"app\"}"
+        values: "1+0x40"
+      - series: "openpbl_postgres_connections{job=\"openpbl\",instance=\"app\"}"
+        values: "NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN"
+      - series: "openpbl_postgres_connection_limit{job=\"openpbl\",instance=\"app\"}"
+        values: "100+0x40"
+      - series: "openpbl_health_sample_available{job=\"openpbl\",instance=\"app\",component=\"database\"}"
+        values: "1+0x40"
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: OpenPblPostgresConnectionsHigh
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: OpenPblHealthTelemetryUnknown
+        exp_alerts:
+          - exp_labels:
+              severity: "warning"
+              job: "openpbl"
+              instance: "app"
+              component: "database"
+            exp_annotations:
+              summary: "CoTeach database telemetry is unavailable"
+  - name: "restart unknown gap clears old high occupancy then known lower gauge recovers"
+    interval: 15s
+    input_series:
+      - series: "up{job=\"openpbl\",instance=\"app\"}"
+        values: "1+0x40"
+      - series: "openpbl_postgres_connections{job=\"openpbl\",instance=\"app\"}"
+        values: "90+0x20 NaN NaN NaN NaN NaN NaN NaN NaN NaN 20+0x10"
+      - series: "openpbl_postgres_connection_limit{job=\"openpbl\",instance=\"app\"}"
+        values: "100+0x40"
+      - series: "openpbl_health_sample_available{job=\"openpbl\",instance=\"app\",component=\"database\"}"
+        values: "1+0x20 0+0x8 1+0x10"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: OpenPblPostgresConnectionsHigh
+        exp_alerts:
+          - exp_labels:
+              severity: "warning"
+              job: "openpbl"
+              instance: "app"
+            exp_annotations:
+              summary: "PostgreSQL client backend sessions exceed 80% of max_connections"
+      - eval_time: 5m15s
+        alertname: OpenPblPostgresConnectionsHigh
+        exp_alerts: []
+      - eval_time: 7m15s
+        alertname: OpenPblHealthTelemetryUnknown
+        exp_alerts:
+          - exp_labels:
+              severity: "warning"
+              job: "openpbl"
+              instance: "app"
+              component: "database"
+            exp_annotations:
+              summary: "CoTeach database telemetry is unavailable"
+      - eval_time: 7m30s
+        alertname: OpenPblHealthTelemetryUnknown
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: OpenPblPostgresConnectionsHigh
+        exp_alerts: []
+  - name: "missing app series or either half of the ratio is unknown per live target"
+    interval: 15s
+    input_series:
+      - series: "up{job=\"openpbl\",instance=\"missing-all\"}"
+        values: "1+0x40"
+      - series: "up{job=\"openpbl\",instance=\"missing-count\"}"
+        values: "1+0x40"
+      - series: "openpbl_postgres_connection_limit{job=\"openpbl\",instance=\"missing-count\"}"
+        values: "100+0x40"
+      - series: "openpbl_health_sample_available{job=\"openpbl\",instance=\"missing-count\",component=\"database\"}"
+        values: "1+0x40"
+      - series: "up{job=\"openpbl\",instance=\"missing-limit\"}"
+        values: "1+0x40"
+      - series: "openpbl_postgres_connections{job=\"openpbl\",instance=\"missing-limit\"}"
+        values: "90+0x40"
+      - series: "openpbl_health_sample_available{job=\"openpbl\",instance=\"missing-limit\",component=\"database\"}"
+        values: "1+0x40"
+      - series: "up{job=\"openpbl\",instance=\"healthy\"}"
+        values: "1+0x40"
+      - series: "openpbl_postgres_connections{job=\"openpbl\",instance=\"healthy\"}"
+        values: "20+0x40"
+      - series: "openpbl_postgres_connection_limit{job=\"openpbl\",instance=\"healthy\"}"
+        values: "100+0x40"
+      - series: "openpbl_health_sample_available{job=\"openpbl\",instance=\"healthy\",component=\"database\"}"
+        values: "1+0x40"
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: OpenPblHealthTelemetryUnknown
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: OpenPblPostgresConnectionsHigh
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: OpenPblHealthTelemetryUnknown
+        exp_alerts:
+          - exp_labels:
+              severity: "warning"
+              job: "openpbl"
+              instance: "missing-all"
+              component: "database"
+            exp_annotations:
+              summary: "CoTeach database telemetry is unavailable"
+          - exp_labels:
+              severity: "warning"
+              job: "openpbl"
+              instance: "missing-count"
+              component: "database"
+            exp_annotations:
+              summary: "CoTeach database telemetry is unavailable"
+          - exp_labels:
+              severity: "warning"
+              job: "openpbl"
+              instance: "missing-limit"
+              component: "database"
+            exp_annotations:
+              summary: "CoTeach database telemetry is unavailable"
+  - name: "failed target belongs to existing target-down alert without fabricating database occupancy"
+    interval: 15s
+    input_series:
+      - series: "up{job=\"openpbl\",instance=\"app\"}"
+        values: "0+0x40"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: OpenPblPostgresConnectionsHigh
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: OpenPblHealthTelemetryUnknown
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: OpenPblTargetDown
+        exp_alerts:
+          - exp_labels:
+              severity: "critical"
+              job: "openpbl"
+              instance: "app"
+            exp_annotations:
+              summary: "CoTeach metrics target is unavailable"
+  - name: "existing non-database unknown components remain covered"
+    interval: 15s
+    input_series:
+      - series: "up{job=\"openpbl\",instance=\"app\"}"
+        values: "1+0x40"
+      - series: "openpbl_postgres_connections{job=\"openpbl\",instance=\"app\"}"
+        values: "20+0x40"
+      - series: "openpbl_postgres_connection_limit{job=\"openpbl\",instance=\"app\"}"
+        values: "100+0x40"
+      - series: "openpbl_health_sample_available{job=\"openpbl\",instance=\"app\",component=\"database\"}"
+        values: "1+0x40"
+      - series: "openpbl_health_sample_available{job=\"openpbl\",instance=\"app\",component=\"backup\"}"
+        values: "0+0x40"
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: OpenPblHealthTelemetryUnknown
+        exp_alerts:
+          - exp_labels:
+              severity: "warning"
+              job: "openpbl"
+              instance: "app"
+              component: "backup"
+            exp_annotations:
+              summary: "CoTeach backup telemetry is unavailable"

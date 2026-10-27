@@ -1,0 +1,267 @@
+import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+const transport = vi.hoisted(() => ({ fetch: vi.fn(), agent: vi.fn() }));
+vi.mock('undici', () => ({
+  fetch: transport.fetch,
+  Agent: class {
+    constructor(options: unknown) { transport.agent(options); }
+  },
+}));
+
+import {
+  SPEECH_ALIGNMENT_MODEL,
+  SPEECH_ALIGNMENT_MODEL_REVISION,
+  SPEECH_ALIGNMENT_VERSION,
+  SpeechAlignmentError,
+  alignSpeechFile,
+  createSpeechAlignmentInputHash,
+  normalizeSpeechAlignmentLanguage,
+  resolveSpeechAlignmentCacheDir,
+} from './speech-alignment';
+
+const directories: string[] = [];
+
+async function fixture() {
+  const directory = await mkdtemp(path.join(tmpdir(), 'speech-alignment-'));
+  directories.push(directory);
+  const audioPath = path.join(directory, 'narration.wav');
+  await writeFile(audioPath, Buffer.from('audio one'));
+  return { directory, audioPath, cacheDir: path.join(directory, 'cache') };
+}
+
+function serviceResponse(overrides: Record<string, unknown> = {}) {
+  return {
+    model: SPEECH_ALIGNMENT_MODEL,
+    revision: SPEECH_ALIGNMENT_MODEL_REVISION,
+    version: SPEECH_ALIGNMENT_VERSION,
+    device: 'cuda:0',
+    durationMs: 1_200,
+    spans: [
+      { text: '人', startChar: 0, endChar: 1, startMs: 80, endMs: 220 },
+      { text: '工', startChar: 1, endChar: 2, startMs: 230, endMs: 380 },
+      { text: 'AI', startChar: 3, endChar: 5, startMs: 450, endMs: 800 },
+    ],
+    ...overrides,
+  };
+}
+
+afterEach(async () => {
+  const { rm } = await import('node:fs/promises');
+  await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
+  vi.unstubAllEnvs();
+  transport.fetch.mockReset();
+  transport.agent.mockClear();
+});
+
+describe('alignSpeechFile', () => {
+  it('calls the loopback service and returns content fingerprints with UTF-16 spans', async () => {
+    const { audioPath, cacheDir } = await fixture();
+    const fetchImpl = vi.fn(async (url: URL | RequestInfo, init?: RequestInit) => {
+      expect(String(url)).toBe('http://127.0.0.1:3004/align');
+      expect(JSON.parse(String(init?.body))).toEqual({
+        audioPath,
+        text: '人工 AI',
+        language: 'Chinese',
+      });
+      return new Response(JSON.stringify(serviceResponse()), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }) as typeof fetch;
+
+    const result = await alignSpeechFile({ audioPath, text: '人工 AI', language: 'zh-CN', cacheDir, fetchImpl });
+
+    expect(result).toMatchObject({
+      version: SPEECH_ALIGNMENT_VERSION,
+      language: 'Chinese',
+      durationMs: 1_200,
+      spans: serviceResponse().spans,
+    });
+    expect(result.audioHash).toMatch(/^[a-f0-9]{64}$/);
+    expect(result.textHash).toMatch(/^[a-f0-9]{64}$/);
+    expect(result.inputHash).toMatch(/^[a-f0-9]{64}$/);
+    expect(fetchImpl).toHaveBeenCalledOnce();
+  });
+
+  it('reuses a disk cache and invalidates it when audio, text, or language changes', async () => {
+    const { audioPath, cacheDir } = await fixture();
+    const fetchImpl = vi.fn(async (_url: URL | RequestInfo, init?: RequestInit) => {
+      const { text } = JSON.parse(String(init?.body)) as { text: string };
+      return new Response(JSON.stringify(serviceResponse({
+        spans: [{ text, startChar: 0, endChar: text.length, startMs: 80, endMs: 800 }],
+      })));
+    }) as typeof fetch;
+    const base = { audioPath, text: '人工 AI', cacheDir, fetchImpl };
+
+    const first = await alignSpeechFile(base);
+    expect(await alignSpeechFile(base)).toEqual(first);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+
+    await alignSpeechFile({ ...base, text: '人工智能 AI' });
+    await alignSpeechFile({ ...base, language: 'English' });
+    await writeFile(audioPath, Buffer.from('audio two'));
+    await alignSpeechFile(base);
+    expect(fetchImpl).toHaveBeenCalledTimes(4);
+  });
+
+  it('coalesces concurrent requests for the same immutable input', async () => {
+    const { audioPath } = await fixture();
+    let resolveResponse!: (response: Response) => void;
+    const fetchImpl = vi.fn(() => new Promise<Response>((resolve) => { resolveResponse = resolve; })) as typeof fetch;
+    const input = { audioPath, text: '人工 AI', cacheDir: false as const, fetchImpl };
+
+    const first = alignSpeechFile(input);
+    const second = alignSpeechFile(input);
+    await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledOnce());
+    resolveResponse(new Response(JSON.stringify(serviceResponse())));
+    expect(await first).toEqual(await second);
+  });
+
+  it('rejects malformed spans instead of caching inaccurate timing', async () => {
+    const { audioPath, cacheDir } = await fixture();
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify(serviceResponse({
+      spans: [{ text: '人工', startChar: 0, endChar: 2, startMs: 900, endMs: 2_201 }],
+    })))) as typeof fetch;
+
+    await expect(alignSpeechFile({ audioPath, text: '人工 AI', cacheDir, fetchImpl }))
+      .rejects.toMatchObject({ code: 'INVALID_SPANS', retryable: false });
+    expect(fetchImpl).toHaveBeenCalledOnce();
+    expect(await readFile(path.join(cacheDir, 'missing'), 'utf8').catch(() => null)).toBeNull();
+  });
+
+  it('rejects spans that disagree with the source text or overlap in time', async () => {
+    const { audioPath } = await fixture();
+    const input = { audioPath, text: '人工 AI', cacheDir: false as const };
+
+    await expect(alignSpeechFile({
+      ...input,
+      fetchImpl: vi.fn(async () => new Response(JSON.stringify(serviceResponse({
+        spans: [{ text: '智', startChar: 0, endChar: 1, startMs: 80, endMs: 220 }],
+      })))) as typeof fetch,
+    })).rejects.toMatchObject({ code: 'INVALID_SPANS' });
+
+    await expect(alignSpeechFile({
+      ...input,
+      fetchImpl: vi.fn(async () => new Response(JSON.stringify(serviceResponse({
+        spans: [
+          { text: '人', startChar: 0, endChar: 1, startMs: 80, endMs: 300 },
+          { text: '工', startChar: 1, endChar: 2, startMs: 250, endMs: 380 },
+        ],
+      })))) as typeof fetch,
+    })).rejects.toMatchObject({ code: 'INVALID_SPANS' });
+  });
+
+  it.each([
+    { name: 'busy', response: () => new Response(JSON.stringify({ error: 'SERVICE_BUSY' }), { status: 503 }), code: 'SERVICE_BUSY', retryable: true, attempts: 3 },
+    { name: 'rejected', response: () => new Response(JSON.stringify({ error: 'INVALID_TIMESTAMPS' }), { status: 422 }), code: 'INVALID_SPANS', retryable: false, attempts: 1 },
+    { name: 'unreachable', response: () => { throw new TypeError('connection refused'); }, code: 'SERVICE_UNAVAILABLE', retryable: true, attempts: 3 },
+  ])('classifies $name errors and bounds retry attempts', async ({ response, code, retryable, attempts }) => {
+    const { audioPath } = await fixture();
+    const fetchImpl = vi.fn(async () => response()) as typeof fetch;
+    await expect(alignSpeechFile({ audioPath, text: '人工 AI', cacheDir: false, fetchImpl }))
+      .rejects.toMatchObject({ code, retryable });
+    expect(fetchImpl).toHaveBeenCalledTimes(attempts);
+  });
+
+  it.each(['busy', 'unreachable', 'interrupted response'] as const)('recovers from a transient $name failure and caches only the successful alignment', async (failure) => {
+    const { audioPath, cacheDir } = await fixture();
+    const fetchImpl = vi.fn()
+      .mockImplementationOnce(async () => {
+        if (failure === 'unreachable') throw new TypeError('connection refused');
+        if (failure === 'interrupted response') return { json: async () => { throw new TypeError('terminated'); } };
+        return new Response(JSON.stringify({ error: 'SERVICE_BUSY' }), { status: 503 });
+      })
+      .mockResolvedValueOnce(new Response(JSON.stringify(serviceResponse()))) as typeof fetch;
+    const input = { audioPath, text: '人工 AI', cacheDir, fetchImpl };
+
+    const first = alignSpeechFile(input);
+    const second = alignSpeechFile(input);
+    const result = await first;
+    expect(await second).toEqual(result);
+    expect(await alignSpeechFile(input)).toEqual(result);
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it('stops busy backoff immediately when the caller cancels', async () => {
+    const { audioPath } = await fixture();
+    const controller = new AbortController();
+    const reason = new Error('cancelled by caller');
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ error: 'SERVICE_BUSY' }), { status: 503 })) as typeof fetch;
+    const operation = alignSpeechFile({ audioPath, text: '人工 AI', cacheDir: false, signal: controller.signal, fetchImpl });
+    const rejection = expect(operation).rejects.toBe(reason);
+    await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledOnce());
+    controller.abort(reason);
+    await rejection;
+    expect(fetchImpl).toHaveBeenCalledOnce();
+  });
+
+  it('uses one deadline for the full retry sequence', async () => {
+    const { audioPath } = await fixture();
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ error: 'SERVICE_BUSY' }), { status: 503 })) as typeof fetch;
+    await expect(alignSpeechFile({ audioPath, text: '人工 AI', cacheDir: false, timeoutMs: 30, fetchImpl }))
+      .rejects.toMatchObject({ code: 'SERVICE_BUSY' });
+    expect(fetchImpl).toHaveBeenCalledOnce();
+    expect(vi.mocked(fetchImpl).mock.calls[0]?.[1]?.signal?.aborted).toBe(true);
+  });
+
+  it('aborts an in-progress request at the deadline without starting another inference', async () => {
+    const { audioPath } = await fixture();
+    const fetchImpl = vi.fn(async (_url: URL | RequestInfo, request?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      request?.signal?.addEventListener('abort', () => reject(request.signal?.reason), { once: true });
+    })) as typeof fetch;
+    await expect(alignSpeechFile({ audioPath, text: '人工 AI', cacheDir: false, timeoutMs: 30, fetchImpl }))
+      .rejects.toMatchObject({ code: 'SERVICE_UNAVAILABLE' });
+    expect(fetchImpl).toHaveBeenCalledOnce();
+  });
+
+  it('removes shorter transport timeouts while preserving the configured abort deadline', async () => {
+    const { audioPath } = await fixture();
+    const controller = new AbortController();
+    transport.fetch.mockResolvedValueOnce(new Response(JSON.stringify(serviceResponse())));
+    await alignSpeechFile({ audioPath, text: '人工 AI', cacheDir: false, timeoutMs: 600_000, signal: controller.signal });
+    expect(transport.agent).toHaveBeenCalledWith({ headersTimeout: 0, bodyTimeout: 0 });
+    const request = transport.fetch.mock.calls[0]?.[1] as RequestInit & { dispatcher?: unknown };
+    expect(request.dispatcher).toBeDefined();
+    expect(request.signal?.aborted).toBe(false);
+    controller.abort();
+    expect(request.signal?.aborted).toBe(true);
+  });
+
+  it('rejects non-loopback service origins before making a request', async () => {
+    const { audioPath } = await fixture();
+    const fetchImpl = vi.fn();
+    await expect(alignSpeechFile({
+      audioPath,
+      text: '讲稿',
+      serviceUrl: 'https://alignment.example',
+      cacheDir: false,
+      fetchImpl: fetchImpl as typeof fetch,
+    })).rejects.toMatchObject({ code: 'INVALID_INPUT', retryable: false });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+});
+
+describe('speech alignment fingerprints and configuration', () => {
+  it('normalizes supported language aliases', () => {
+    expect(normalizeSpeechAlignmentLanguage()).toBe('Chinese');
+    expect(normalizeSpeechAlignmentLanguage('en')).toBe('English');
+    expect(() => normalizeSpeechAlignmentLanguage('Thai')).toThrow(SpeechAlignmentError);
+  });
+
+  it('fingerprints every cache identity field', () => {
+    const base = { audioHash: 'audio', textHash: 'text', language: 'Chinese' };
+    const hash = createSpeechAlignmentInputHash(base);
+    expect(createSpeechAlignmentInputHash({ ...base, audioHash: 'changed' })).not.toBe(hash);
+    expect(createSpeechAlignmentInputHash({ ...base, textHash: 'changed' })).not.toBe(hash);
+    expect(createSpeechAlignmentInputHash({ ...base, language: 'English' })).not.toBe(hash);
+    expect(createSpeechAlignmentInputHash({ ...base, version: 'next' })).not.toBe(hash);
+  });
+
+  it('resolves a configurable durable cache directory', () => {
+    expect(resolveSpeechAlignmentCacheDir({}, '/app')).toBe('/app/.openpbl-data/speech-alignment-cache');
+    expect(resolveSpeechAlignmentCacheDir({ OPENPBL_SPEECH_ALIGNMENT_CACHE_DIR: './cache' }, '/app'))
+      .toBe(path.resolve('./cache'));
+  });
+});

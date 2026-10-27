@@ -1,0 +1,614 @@
+import { authoredQuestionFingerprint, knowledgeTutorEvidence, tutorEvidencePrompt } from "@/lib/courses/knowledge-tutor-evidence";
+import { createHash, randomUUID } from "node:crypto";
+import { isDatabaseConfigured, prisma } from "@/lib/db/client";
+import { loadKnowledgeLectureContext, persistKnowledgeLectureAttempt, QuizAlreadySubmittedError, sameSubmittedAnswers, withGradeSummary } from "@/lib/courses/knowledge-lecture-attempts";
+import { legacyAiError } from "@/lib/ai-collaboration/legacy-scope";
+import { PlatformError } from "@/lib/platform/repository";
+import { claimTutorRequest, finishTutorRequest, failTutorRequest, type TutorRequest } from "@/lib/courses/knowledge-tutor-requests";
+import { callLLM } from "@openmaic/lib/ai/llm";
+import { resolveModelFromRequest } from "@openmaic/lib/server/resolve-model";
+import type { NextRequest } from "next/server";
+import { isAuthConfigured, type AuthClaims } from "@/lib/auth/session";
+import { authenticateRequest, requireSameOrigin } from "@/lib/auth/request-guards";
+import { resolveStudentStateScope } from "@/lib/courses/student-state-scope";
+import { getCourse, updateCourse } from "@/lib/session/server-store";
+import type {
+  KnowledgeLectureAttempt,
+  KnowledgeLectureQuestionReview,
+  KnowledgeLectureSection,
+  KnowledgeLectureTutorMessage,
+  KnowledgeLectureTutorThread,
+  StudentAiProgress,
+  CourseContent,
+} from "@/lib/session/types";
+import { isOrdinaryQuestion, readPreparedExplanation, resolveKnowledgeTutorModel } from "@/lib/courses/knowledge-explanations";
+import type { KnowledgeLectureExplanation } from "@/lib/courses/knowledge-explanation-types";
+import { parseTutorPayload, TUTOR_EXECUTION_MS, TUTOR_SYSTEM } from "@/lib/courses/knowledge-tutor-payload";
+import { withClassroomAiUsage } from "@/lib/observability/classroom-ai";
+import { canAccessLegacyCourse } from "@/lib/platform/access";
+import { readClassroom } from "@openmaic/lib/server/classroom-storage";
+import { gradeChoiceQuestions } from "@openmaic/lib/quiz/grading";
+import { gradeKnowledgeLectureQuestion } from "@/lib/courses/knowledge-lecture-grading";
+import type { QuizQuestion, Scene } from "@openmaic/lib/types/stage";
+import { selectStudentLearningScenes } from "@openmaic/lib/pbl/scene-routing";
+import { adaptiveReviewResources } from "@/lib/courses/adaptive-review-resources";
+
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
+type KnowledgeLectureRequest = {
+  action?: "record-attempt" | "retry-grading" | "tutor-message" | "tutor-explain" | "review-explanation";
+  courseId?: string;
+  studentId?: string;
+  sectionId?: string;
+  quizOutlineId?: string;
+  runtimeSceneId?: string;
+  answers?: Record<string, unknown>;
+  attemptId?: string;
+  questionId?: string;
+  options?: KnowledgeLectureQuestionReview["options"];
+  matchingOptions?: KnowledgeLectureQuestionReview["matchingOptions"];
+  message?: string;
+  requestId?: string;
+};
+
+function text(value: unknown, max = 4_000): string {
+  return typeof value === "string" ? value.trim().slice(0, max) : "";
+}
+
+function sanitizeQuestionOptions(value: unknown): KnowledgeLectureQuestionReview["options"] {
+  if (!Array.isArray(value)) return undefined;
+  const options = value.slice(0, 12).flatMap((option) => {
+    const label = text(option?.label, 500);
+    const key = text(option?.value, 40);
+    return label && key ? [{ label, value: key }] : [];
+  });
+  return options.length ? options : undefined;
+}
+
+function sanitizeMatchingOptions(value: unknown): KnowledgeLectureQuestionReview["matchingOptions"] {
+  if (!value || typeof value !== "object") return undefined;
+  const candidate = value as { left?: unknown; right?: unknown };
+  if (!Array.isArray(candidate.left) || !Array.isArray(candidate.right)) return undefined;
+  const left = candidate.left.slice(0, 12).map((item) => text(item, 500)).filter(Boolean);
+  const right = candidate.right.slice(0, 12).map((item) => text(item, 500)).filter(Boolean);
+  return left.length && right.length ? { left, right } : undefined;
+}
+
+function questionChoicesText(question: Pick<KnowledgeLectureQuestionReview, "options" | "matchingOptions">): string {
+  if (question.options?.length) {
+    return `选项：\n${question.options.map((option) => `${option.value}. ${option.label}`).join("\n")}`;
+  }
+  if (question.matchingOptions) {
+    return `匹配项：\n左侧：${question.matchingOptions.left.join("；")}\n右侧候选：${question.matchingOptions.right.join("；")}`;
+  }
+  return "";
+}
+
+function emptyProgress(studentId: string, classroomId: string): StudentAiProgress {
+  return {
+    classroomId,
+    studentId,
+    currentSceneIndex: 0,
+    totalScenes: 0,
+    completedScenes: [],
+    lastActiveAt: new Date().toISOString(),
+    masteryLevel: "not-started",
+  };
+}
+
+async function authorized(request: Request, courseId: string, studentId: string, submitting: boolean, studentOnly = false): Promise<{ claims: AuthClaims | null } | { response: Response }> {
+  if (!isAuthConfigured()) return { claims: null };
+  const auth = await authenticateRequest(request, submitting || studentOnly ? "student" : undefined);
+  if ("response" in auth) return auth;
+  const { claims } = auth;
+  const forbidden = () => ({ response: Response.json({ error: "FORBIDDEN" }, { status: 403 }) });
+  if (claims.role === "teacher") return !submitting && !studentOnly && await canAccessLegacyCourse(claims, courseId, "read") ? { claims } : forbidden();
+  if (claims.sub !== studentId) return forbidden();
+  const studentScope = isDatabaseConfigured() ? await resolveStudentStateScope(prisma, courseId, studentId) : null;
+  const allowed = studentScope ? studentScope.accessible
+    : await canAccessLegacyCourse(claims, courseId, submitting && !isDatabaseConfigured() ? "write" : "read");
+  return allowed ? { claims } : forbidden();
+}
+
+function referenceExplanation(
+  question: Pick<KnowledgeLectureQuestionReview, "prompt" | "options" | "matchingOptions" | "referenceAnswer" | "authoredAnalysis" | "authoredQuestionFingerprint">,
+  analysis: string | undefined,
+  fallback = "这道题的参考讲解尚未准备好，可以向助教提出具体问题。",
+): KnowledgeLectureExplanation {
+  const parts = [analysis, question.referenceAnswer && question.referenceAnswer !== analysis ? question.referenceAnswer : undefined].filter(Boolean);
+  const fingerprint = question.authoredQuestionFingerprint || createHash("sha256").update(JSON.stringify([
+    question.prompt, question.options, question.matchingOptions, question.referenceAnswer, question.authoredAnalysis,
+  ])).digest("hex");
+  return { id: `reference-${fingerprint}`, questionFingerprint: fingerprint,
+    text: parts.join("\n\n") || fallback, boardNotes: [], source: "reference" };
+}
+
+/** Review only reads authored resources and immutable answers; it never starts an AI task. */
+async function reviewExplanation(body: KnowledgeLectureRequest, course: {
+  aiLearningClassroomId?: string; content: Partial<CourseContent>; aiLearningProgress?: Record<string, StudentAiProgress>;
+}, studentId: string): Promise<Response> {
+  const classroomId = course.aiLearningClassroomId || course.content._openmaicClassroomId;
+  if (!classroomId) return Response.json({ error: "QUIZ_SCENE_NOT_FOUND" }, { status: 404 });
+  const storedProgress = course.aiLearningProgress?.[studentId];
+  const progress = storedProgress?.classroomId === classroomId ? storedProgress : undefined;
+  const attemptId = text(body.attemptId, 200);
+  const runtimeSceneId = text(body.runtimeSceneId, 160);
+  const questionId = text(body.questionId, 160);
+  const attempt = attemptId ? progress?.knowledgeLectureAttempts?.find(item => item.id === attemptId)
+    : progress?.knowledgeLectureAttempts?.find(item => item.runtimeSceneId === runtimeSceneId);
+  const savedQuestion = attempt?.questions.find(item => item.questionId === questionId);
+  if (!questionId || (attemptId && !savedQuestion) || (!attemptId && !runtimeSceneId)) {
+    return Response.json({ error: "QUESTION_CONTEXT_NOT_FOUND" }, { status: 404 });
+  }
+  const requestedSceneId = attempt?.runtimeSceneId || runtimeSceneId;
+  const adaptiveSource = requestedSceneId.startsWith("adaptive:")
+    ? adaptiveReviewResources(progress?.adaptiveLearning)
+      .sort((a, b) => b.insertionId.length - a.insertionId.length)
+      .find(resource => requestedSceneId.startsWith(`adaptive:${resource.insertionId}:`))
+    : undefined;
+  if (requestedSceneId.startsWith("adaptive:") && !adaptiveSource) {
+    return Response.json({ error: "QUESTION_CONTEXT_NOT_FOUND" }, { status: 404 });
+  }
+  const sourceClassroomId = adaptiveSource?.classroomId || classroomId;
+  const sourceSceneId = adaptiveSource
+    ? requestedSceneId.slice(`adaptive:${adaptiveSource.insertionId}:`.length)
+    : requestedSceneId;
+  const classroom = await readClassroom(sourceClassroomId);
+  const scene = classroom && selectStudentLearningScenes(classroom.scenes).find(item => item.id === sourceSceneId);
+  const sourceQuestion = scene?.content.type === "quiz" ? scene.content.questions.find(item => item.id === questionId) : undefined;
+  if (!savedQuestion && !sourceQuestion) return Response.json({ error: "QUESTION_CONTEXT_NOT_FOUND" }, { status: 404 });
+  const section = course.content.knowledgeLectureSections?.find(item => item.quizOutlineId === (scene?.outlineId || scene?.id));
+  const sectionUnits = course.content.teachingBlueprint?.sections.find(item => item.id === section?.id)?.units.map(item => item.id) ?? [];
+  const adoptedPoints = sourceQuestion?.knowledgePointIds?.filter(id => section?.knowledgePointIds.includes(id)) ?? [];
+  const adoptedUnits = sourceQuestion?.teachingUnitIds?.filter(id => sectionUnits.includes(id)) ?? [];
+  const evidence = knowledgeTutorEvidence(course.content,
+    savedQuestion?.knowledgePointIds ?? (adoptedPoints.length ? adoptedPoints : section?.knowledgePointIds ?? []),
+    savedQuestion?.teachingUnitIds ?? (adoptedUnits.length ? adoptedUnits : sectionUnits));
+  const sourceFingerprint = sourceQuestion ? authoredQuestionFingerprint(sourceQuestion, evidence) : undefined;
+  const sourceMatches = Boolean(sourceFingerprint && sourceFingerprint === savedQuestion?.authoredQuestionFingerprint);
+  const fingerprint = savedQuestion?.authoredQuestionFingerprint || (!savedQuestion ? sourceFingerprint : undefined);
+  const ordinary = savedQuestion ? isOrdinaryQuestion({ type: savedQuestion.questionType ?? "single", format: savedQuestion.questionFormat })
+    || Boolean(sourceMatches && sourceQuestion && isOrdinaryQuestion(sourceQuestion)) || (!savedQuestion.questionFormat && !sourceMatches)
+    : isOrdinaryQuestion(sourceQuestion!);
+  if (ordinary && fingerprint) {
+    const explanation = await readPreparedExplanation({ classroomId: sourceClassroomId, sceneId: sourceSceneId, questionFingerprint: fingerprint });
+    if (explanation) return Response.json({ explanation, resultSource: "shared" });
+  }
+  const thread = attempt && progress?.knowledgeLectureTutorThreads?.find(item => item.attemptId === attempt.id && item.questionId === questionId);
+  if (thread?.messages.some(item => item.role === "assistant")) return Response.json({ thread, resultSource: "personalized" });
+  const authoredAnswer = sourceQuestion?.answer?.map(value => {
+    const option = sourceQuestion.options?.find(item => item.value === value);
+    return option ? `${value}（${option.label}）` : value;
+  }).join("、");
+  const question = savedQuestion ?? { prompt: sourceQuestion!.question, referenceAnswer: sourceQuestion!.referenceAnswer || (authoredAnswer ? `参考答案：${authoredAnswer}` : undefined),
+    authoredAnalysis: sourceQuestion!.analysis, authoredQuestionFingerprint: fingerprint };
+  const analysis = savedQuestion ? savedQuestion.authoredAnalysis || (sourceMatches ? sourceQuestion?.analysis : undefined) : sourceQuestion!.analysis;
+  return Response.json({ explanation: referenceExplanation(question, analysis, "这道题尚未提供解析或参考答案。"), resultSource: "reference" });
+}
+
+function submittedAnswers(
+  questions: readonly QuizQuestion[],
+  raw: unknown,
+): Record<string, string | string[]> | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw) || !questions.length || questions.length > 12) return null;
+  const input = raw as Record<string, unknown>;
+  const ids = new Set(questions.map((question) => question.id));
+  if (ids.size !== questions.length || Object.keys(input).length !== questions.length
+    || Object.keys(input).some((id) => !ids.has(id))) return null;
+  const answers: Record<string, string | string[]> = {};
+  for (const question of questions) {
+    const value = input[question.id];
+    if (question.type === "multiple" || question.type === "matching") {
+      if (!Array.isArray(value) || value.length > 12
+        || value.some((item) => typeof item !== "string" || item.length > 500)) return null;
+      answers[question.id] = value;
+    } else {
+      if (typeof value !== "string" || value.length > 4_000) return null;
+      answers[question.id] = value;
+    }
+  }
+  return answers;
+}
+
+function createAttempt(
+  scene: Scene,
+  section: KnowledgeLectureSection,
+  teachingUnitIds: readonly string[],
+  studentId: string,
+  answers: Record<string, string | string[]>,
+  courseContent: Partial<CourseContent>,
+): KnowledgeLectureAttempt {
+  if (scene.content?.type !== "quiz") throw new Error("QUIZ_SCENE_NOT_FOUND");
+  const allowedKnowledgePointIds = new Set(section.knowledgePointIds);
+  const allowedTeachingUnitIds = new Set(teachingUnitIds);
+  const questions = scene.content.questions.map((question): KnowledgeLectureQuestionReview => {
+    const points = question.points ?? 1;
+    if (!Number.isFinite(points) || points <= 0 || points > 100 || !question.question.trim()
+      || (question.type !== "short_answer" && !question.answer?.length)) {
+      throw new Error("QUIZ_QUESTION_INVALID");
+    }
+    const rawAnswer = answers[question.id];
+    const answer = Array.isArray(rawAnswer) ? rawAnswer.join("、") : rawAnswer;
+    const objective = question.type !== "short_answer";
+    const empty = !objective && !answer.trim();
+    const grade = objective ? gradeChoiceQuestions([question], answers)[0] : undefined;
+    const knowledgePointIds = (question.knowledgePointIds ?? []).filter((id) => allowedKnowledgePointIds.has(id));
+    const units = (question.teachingUnitIds ?? []).filter((id) => allowedTeachingUnitIds.has(id));
+    const matchingPairs = question.matchingPairs;
+    return {
+      questionId: question.id,
+      prompt: question.question,
+      options: sanitizeQuestionOptions(question.options),
+      matchingOptions: matchingPairs ? {
+        left: matchingPairs.map((pair) => pair.left),
+        right: matchingPairs.map((pair) => pair.right),
+      } : undefined,
+      answer,
+      rawAnswer,
+      questionType: question.type,
+      questionFormat: question.format,
+      authoredAnalysis: question.analysis,
+      authoredQuestionFingerprint: authoredQuestionFingerprint(question, knowledgeTutorEvidence(courseContent, knowledgePointIds.length ? knowledgePointIds : section.knowledgePointIds, units.length ? units : teachingUnitIds)),
+      gradingRubric: question.commentPrompt,
+      scoringRubric: question.scoringRubric,
+      points,
+      earned: grade?.earned ?? 0,
+      correct: objective ? grade?.correct ?? false : null,
+      gradingStatus: objective || empty ? "graded" : "pending",
+      feedback: objective
+        ? (question.analysis || (grade?.correct ? "回答正确。" : "请对照题目解析复习。"))
+        : empty ? "未作答。" : "答案已提交，等待 AI 批阅。",
+      referenceAnswer: question.referenceAnswer || question.analysis,
+      knowledgePointIds: knowledgePointIds.length ? knowledgePointIds : [...section.knowledgePointIds],
+      teachingUnitIds: units.length ? units : [...teachingUnitIds],
+    };
+  });
+  return withGradeSummary({
+    id: `lecture-attempt-${studentId}-${section.quizOutlineId}`,
+    sectionId: section.id,
+    quizOutlineId: section.quizOutlineId,
+    runtimeSceneId: scene.id,
+    submittedAt: new Date().toISOString(),
+    gradingSource: "server",
+    gradingStatus: "pending",
+    score: 0,
+    maxScore: 0,
+    knowledgePointIds: section.knowledgePointIds,
+    questions,
+  });
+}
+
+const gradingJobs = new Map<string, Promise<KnowledgeLectureAttempt>>();
+
+async function finishGrading(
+  request: NextRequest,
+  body: KnowledgeLectureRequest,
+  courseId: string,
+  studentId: string,
+  attempt: KnowledgeLectureAttempt,
+  classroomId: string,
+): Promise<KnowledgeLectureAttempt> {
+  const ungraded = attempt.questions.filter((question) => question.gradingStatus === "pending" || question.gradingStatus === "failed");
+  if (!ungraded.length) return attempt;
+  const key = `${courseId}:${studentId}:${attempt.id}`;
+  const pending = gradingJobs.get(key);
+  if (pending) return pending;
+  const job = (async () => {
+    const results = new Map<string, KnowledgeLectureQuestionReview>();
+    let model: ReturnType<typeof resolveModelFromRequest> | undefined;
+    for (const question of ungraded) {
+      const review = await gradeKnowledgeLectureQuestion({ courseId, studentId, classroomId, attemptId: attempt.id,
+        question, signal: request.signal, resolveModel: () => model ??= resolveModelFromRequest(request, body, "quiz-grade") });
+      results.set(question.questionId, review);
+    }
+    if (isDatabaseConfigured()) return persistKnowledgeLectureAttempt({ courseId, studentId, classroomId, attempt }, results);
+    let saved = attempt;
+    await updateCourse(courseId, (current) => {
+      const progress = current.aiLearningProgress?.[studentId];
+      const attempts = progress?.knowledgeLectureAttempts ?? [];
+      const currentAttempt = attempts.find((item) => item.id === attempt.id);
+      if (!progress || progress.classroomId !== (current.aiLearningClassroomId || current.content._openmaicClassroomId)
+        || !currentAttempt || currentAttempt.gradingSource !== "server") return current;
+      saved = withGradeSummary({
+        ...currentAttempt,
+        questions: currentAttempt.questions.map((question) =>
+          question.gradingStatus === "graded" ? question : results.get(question.questionId) ?? question),
+      });
+      return {
+        ...current,
+        aiLearningProgress: {
+          ...current.aiLearningProgress,
+          [studentId]: {
+            ...progress,
+            knowledgeLectureAttempts: attempts.map((item) => item.id === attempt.id ? saved : item),
+            lastActiveAt: new Date().toISOString(),
+          },
+        },
+      };
+    }, { targetStudentId: studentId });
+    return saved;
+  })();
+  gradingJobs.set(key, job);
+  try {
+    return await job;
+  } finally {
+    gradingJobs.delete(key);
+  }
+}
+
+export async function POST(request: NextRequest) {
+  const csrfError = requireSameOrigin(request);
+  if (csrfError) return csrfError;
+  const body = await request.json().catch(() => null) as KnowledgeLectureRequest | null;
+  const courseId = text(body?.courseId, 160);
+  const studentId = text(body?.studentId, 160);
+  if (!body?.action || !["record-attempt", "retry-grading", "tutor-message", "tutor-explain", "review-explanation"].includes(body.action) || !courseId || !studentId) {
+    return Response.json({ error: "INVALID_REQUEST" }, { status: 400 });
+  }
+  const authorization = await authorized(request, courseId, studentId, body.action === "record-attempt", body.action === "review-explanation");
+  if ("response" in authorization) return authorization.response;
+  const course = isDatabaseConfigured() ? await loadKnowledgeLectureContext(courseId, studentId) : await getCourse(courseId, { studentId });
+  if (!course || !course.students.some((student) => student.id === studentId)) {
+    return Response.json({ error: "STUDENT_NOT_FOUND" }, { status: 404 });
+  }
+
+  if (body.action === "review-explanation" || (body.action === "tutor-explain" && course.status === "finished")) {
+    if (course.status !== "finished") return Response.json({ error: "CLASSROOM_NOT_FINISHED" }, { status: 409 });
+    try { return await reviewExplanation(body, course, studentId); }
+    catch (error) { return legacyAiError(error); }
+  }
+
+  // Reject newly requested grading after closure, including answer replays.
+  // Jobs already running may still finish their accepted original answers.
+  if (course.status === "finished" && (body.action === "record-attempt" || body.action === "retry-grading")) {
+    return Response.json({ error: "CLASSROOM_READ_ONLY", message: "课堂已结束，仅可查看已保存的作答与批阅记录" }, { status: 409 });
+  }
+
+  if (body.action === "retry-grading") {
+    const quizOutlineId = text(body.quizOutlineId, 160);
+    const classroomId = course.aiLearningClassroomId || course.content._openmaicClassroomId;
+    const currentProgress = course.aiLearningProgress?.[studentId];
+    const attempt = currentProgress && currentProgress.classroomId === classroomId
+      ? currentProgress.knowledgeLectureAttempts?.find((item) => item.quizOutlineId === quizOutlineId && item.gradingSource === "server")
+      : undefined;
+    if (!attempt) return Response.json({ error: "QUIZ_ATTEMPT_NOT_FOUND" }, { status: 404 });
+    try { return Response.json({ attempt: await finishGrading(request, body, courseId, studentId, attempt, classroomId!) }); }
+    catch (error) { return legacyAiError(error); }
+  }
+
+  if (body.action === "record-attempt") {
+    const sectionId = text(body.sectionId, 160);
+    const quizOutlineId = text(body.quizOutlineId, 160);
+    const runtimeSceneId = text(body.runtimeSceneId, 160);
+    const section = course.content.knowledgeLectureSections?.find((item) => item.id === sectionId);
+    if (!section || section.quizOutlineId !== quizOutlineId || !runtimeSceneId) {
+      return Response.json({ error: "SECTION_NOT_FOUND" }, { status: 404 });
+    }
+    const classroomId = course.aiLearningClassroomId || course.content._openmaicClassroomId;
+    if (!classroomId) return Response.json({ error: "QUIZ_SCENE_NOT_FOUND" }, { status: 404 });
+    const classroom = await readClassroom(classroomId);
+    const scene = classroom?.scenes.find((item) => item.id === runtimeSceneId);
+    if (!scene || scene.content?.type !== "quiz"
+      || (scene.outlineId || scene.id) !== quizOutlineId
+      || (scene.lectureSectionId && scene.lectureSectionId !== sectionId)) {
+      return Response.json({ error: "QUIZ_SCENE_NOT_FOUND" }, { status: 404 });
+    }
+    const answers = submittedAnswers(scene.content.questions, body.answers);
+    if (!answers) return Response.json({ error: "QUIZ_ANSWERS_INVALID" }, { status: 400 });
+    const blueprintSection = course.content.teachingBlueprint?.sections.find((item) => item.id === sectionId);
+    const teachingUnitIds = blueprintSection?.units.map((unit) => unit.id) ?? [];
+    let attempt: KnowledgeLectureAttempt;
+    try {
+      attempt = createAttempt(scene, section, teachingUnitIds, studentId, answers, course.content);
+    } catch {
+      return Response.json({ error: "QUIZ_QUESTION_INVALID" }, { status: 400 });
+    }
+    let savedAttempt = attempt;
+    try {
+      if (isDatabaseConfigured()) {
+        savedAttempt = await persistKnowledgeLectureAttempt({ courseId, studentId, classroomId, attempt,
+          ...(authorization.claims?.role === "student" ? { sessionVersion: authorization.claims.sv } : {}) });
+      } else await updateCourse(courseId, (current) => {
+        if ((current.aiLearningClassroomId || current.content._openmaicClassroomId) !== classroomId) {
+          throw new Error("QUIZ_SCENE_CHANGED");
+        }
+        const storedProgress = current.aiLearningProgress?.[studentId];
+        const currentProgress = storedProgress?.classroomId === classroomId
+          ? storedProgress
+          : emptyProgress(studentId, classroomId);
+        const existingAttempt = (currentProgress.knowledgeLectureAttempts ?? [])
+          .filter((item) => item.quizOutlineId === quizOutlineId)
+          .sort((left, right) => Date.parse(left.submittedAt) - Date.parse(right.submittedAt))[0];
+        if (existingAttempt) {
+          if (existingAttempt.gradingSource !== "server" || !sameSubmittedAnswers(existingAttempt, answers)) {
+            throw new QuizAlreadySubmittedError(existingAttempt);
+          }
+          savedAttempt = existingAttempt;
+          return current;
+        }
+        return {
+          ...current,
+          aiLearningProgress: {
+            ...(current.aiLearningProgress ?? {}),
+            [studentId]: {
+              ...currentProgress,
+              knowledgeLectureAttempts: [
+                ...(currentProgress.knowledgeLectureAttempts ?? []),
+                attempt,
+              ],
+              lastActiveAt: attempt.submittedAt,
+            },
+          },
+        };
+      }, { targetStudentId: studentId, actor: { id: studentId, role: "student" } });
+    } catch (error) {
+      if (error instanceof QuizAlreadySubmittedError) {
+        return Response.json({ error: error.message, attempt: error.attempt }, { status: 409 });
+      }
+      if (error instanceof Error && error.message === "QUIZ_SCENE_CHANGED") {
+        return Response.json({ error: error.message }, { status: 409 });
+      }
+      return legacyAiError(error);
+    }
+    try { return Response.json({ attempt: await finishGrading(request, body, courseId, studentId, savedAttempt, classroomId) }); }
+    catch (error) { return legacyAiError(error); }
+  }
+
+  const attemptId = text(body.attemptId, 200);
+  const questionId = text(body.questionId, 160);
+  const initialExplanation = body.action === "tutor-explain";
+  if (!initialExplanation && (typeof body.message !== "string" || !body.message.trim())) {
+    return Response.json({ error: "INVALID_TUTOR_MESSAGE" }, { status: 400 });
+  }
+  if (!initialExplanation && body.message!.length > 1_000) {
+    return Response.json({ error: "TUTOR_MESSAGE_TOO_LONG", maxLength: 1_000 }, { status: 400 });
+  }
+  const message = initialExplanation
+    ? "请开始讲解这道题，先指出作答中最关键的问题，再用简短板书给出正确理解路径。"
+    : body.message!;
+  const storedProgress = course.aiLearningProgress?.[studentId];
+  const progress = storedProgress?.classroomId === (course.aiLearningClassroomId || course.content._openmaicClassroomId)
+    ? storedProgress
+    : undefined;
+  const attempt = progress?.knowledgeLectureAttempts?.find((item) => item.id === attemptId);
+  const question = attempt?.questions.find((item) => item.questionId === questionId);
+  if (!attempt || !question || !message) {
+    return Response.json({ error: "QUESTION_CONTEXT_NOT_FOUND" }, { status: 404 });
+  }
+  const choices = questionChoicesText({
+    options: question.options ?? sanitizeQuestionOptions(body.options),
+    matchingOptions: question.matchingOptions ?? sanitizeMatchingOptions(body.matchingOptions),
+  });
+  const threadId = `lecture-tutor-${attempt.id}-${question.questionId}`;
+  const existingThread = progress?.knowledgeLectureTutorThreads?.find((thread) => thread.id === threadId);
+  const sourceClassroom = await readClassroom(progress!.classroomId);
+  const sourceScene = sourceClassroom?.scenes.find(scene => scene.id === attempt.runtimeSceneId);
+  const sourceQuestion = sourceScene?.content?.type === "quiz"
+    ? sourceScene.content.questions.find(item => item.id === question.questionId) : undefined;
+  const sourceEvidence = knowledgeTutorEvidence(course.content, question.knowledgePointIds, question.teachingUnitIds);
+  const sourceMatches = sourceQuestion && question.authoredQuestionFingerprint === authoredQuestionFingerprint(sourceQuestion, sourceEvidence);
+  const ordinary = isOrdinaryQuestion({ type: question.questionType ?? "single", format: question.questionFormat })
+    || Boolean(sourceMatches && sourceQuestion && isOrdinaryQuestion(sourceQuestion))
+    // An old short-answer record may actually be a fill blank. If the original
+    // question cannot be verified, keep its saved reference rather than spend
+    // a model call guessing whether it was a deep response.
+    || (!question.questionFormat && !sourceMatches);
+  let sharedExplanation: KnowledgeLectureExplanation | null = null;
+  if (ordinary && question.authoredQuestionFingerprint) {
+    try {
+      sharedExplanation = await readPreparedExplanation({ classroomId: progress!.classroomId,
+        sceneId: attempt.runtimeSceneId, questionFingerprint: question.authoredQuestionFingerprint });
+    } catch (error) { return legacyAiError(error); }
+  }
+  if (initialExplanation && ordinary) {
+    const reference = question.authoredAnalysis || (sourceMatches ? sourceQuestion?.analysis : undefined);
+    const explanation = sharedExplanation ?? referenceExplanation(question, reference);
+    return Response.json({ explanation, resultSource: sharedExplanation ? "shared" : "reference" });
+  }
+  if (initialExplanation && existingThread?.messages.some(item => item.role === "assistant")) {
+    return Response.json({ thread: existingThread, resultSource: "personalized" });
+  }
+  const recentConversation = (existingThread?.messages ?? []).slice(-8)
+    .map((item) => `${item.role === "student" ? "学生" : "助教"}：${item.content}`)
+    .join("\n");
+  const knowledgePointNames = question.knowledgePointIds.map((id) =>
+    course.content.knowledgePoints.find((point) => point.id === id)?.name ?? id,
+  );
+  const durable = isDatabaseConfigured();
+  const requestId = text(body.requestId, 160) || (initialExplanation
+    ? `initial-${createHash("sha256").update(threadId).digest("hex")}` : "");
+  if (durable && !requestId) return Response.json({ error: "REQUEST_ID_REQUIRED" }, { status: 400 });
+  const tutorRequest: TutorRequest = { courseId, studentId, classroomId: progress!.classroomId, requestId: requestId || randomUUID(), threadId, attemptId: attempt.id, questionId: question.questionId, message, initial: initialExplanation };
+  let token: string | undefined;
+  let rawModelOutput: string | undefined;
+  const tutorSignal = durable ? AbortSignal.timeout(TUTOR_EXECUTION_MS) : AbortSignal.any([request.signal, AbortSignal.timeout(TUTOR_EXECUTION_MS)]);
+  try {
+    if (durable) {
+      const claim = await claimTutorRequest(tutorRequest);
+      if (!claim.run) {
+        if (claim.status === "COMPLETED") return Response.json({ thread: claim.thread, resultSource: claim.resultSource ?? "personalized" });
+        return Response.json({ error: claim.status === "RUNNING" ? "TUTOR_REQUEST_RUNNING" : "TUTOR_REQUEST_FAILED", status: claim.status }, { status: claim.status === "RUNNING" ? 202 : 409 });
+      }
+      token = claim.token;
+    }
+  const resolvedModel = await resolveKnowledgeTutorModel();
+  const resultSource = "personalized" as const;
+    const result = await withClassroomAiUsage({ courseId, studentId, requestId: tutorRequest.requestId, feature: "knowledge-tutor" }, () => callLLM({
+      model: resolvedModel.model, abortSignal: tutorSignal, maxRetries: 0, system: TUTOR_SYSTEM,
+      prompt: `知识点：${knowledgePointNames.join("、")}\n题目：${question.prompt}${choices ? `\n${choices}` : ""}\n学生答案：${question.answer || "未作答"}\n批阅状态：${question.gradingStatus || "历史记录未核验"}\n批阅反馈：${question.feedback}\n参考讲解：${question.referenceAnswer || "未提供"}\n统一讲解：${sharedExplanation?.text || question.authoredAnalysis || (sourceMatches ? sourceQuestion?.analysis : undefined) || "未提供"}\n已有对话：\n${recentConversation || "无"}\n学生追问：${message}\n${tutorEvidencePrompt(sourceMatches ? sourceEvidence : undefined)}`,
+    }, "quiz-grade", undefined, resolvedModel.thinkingConfig));
+    rawModelOutput = result.text;
+  tutorSignal.throwIfAborted();
+  const now = new Date().toISOString();
+  const tutorPayload = parseTutorPayload(rawModelOutput, now);
+  const studentMessage: KnowledgeLectureTutorMessage = {
+    id: `tutor-message-student-${tutorRequest.requestId}`,
+    role: "student",
+    content: message,
+    createdAt: now,
+  };
+  const assistantMessage: KnowledgeLectureTutorMessage = {
+    id: `tutor-message-assistant-${tutorRequest.requestId}`,
+    role: "assistant",
+    content: tutorPayload.answer,
+    createdAt: now,
+  };
+  if (token) {
+    const thread = await finishTutorRequest(tutorRequest, token, {
+      id: threadId, attemptId: attempt.id, questionId: question.questionId,
+      messages: [...(initialExplanation ? [] : [studentMessage]), assistantMessage],
+      boardNotes: tutorPayload.notes, createdAt: now, updatedAt: now,
+    }, rawModelOutput, resultSource, tutorPayload.syntaxRepair);
+    return Response.json({ thread, resultSource });
+  }
+  let savedThread: KnowledgeLectureTutorThread | undefined;
+  await updateCourse(courseId, (current) => {
+    const classroomId = current.aiLearningClassroomId || current.content._openmaicClassroomId || "";
+    const storedProgress = current.aiLearningProgress?.[studentId];
+    const currentProgress = storedProgress?.classroomId === classroomId
+      ? storedProgress
+      : emptyProgress(studentId, classroomId);
+    const threads = currentProgress.knowledgeLectureTutorThreads ?? [];
+    const currentThread = threads.find((thread) => thread.id === threadId);
+    savedThread = {
+      id: threadId,
+      attemptId: attempt.id,
+      questionId: question.questionId,
+      messages: [
+        ...(currentThread?.messages ?? []),
+        ...(initialExplanation ? [] : [studentMessage]),
+        assistantMessage,
+      ].slice(-30),
+      boardNotes: [...(currentThread?.boardNotes ?? []), ...tutorPayload.notes].slice(-12),
+      createdAt: currentThread?.createdAt ?? now,
+      updatedAt: now,
+    };
+    return {
+      ...current,
+      aiLearningProgress: {
+        ...(current.aiLearningProgress ?? {}),
+        [studentId]: {
+          ...currentProgress,
+          knowledgeLectureTutorThreads: [
+            ...threads.filter((thread) => thread.id !== threadId),
+            savedThread,
+          ].slice(-60),
+          lastActiveAt: now,
+        },
+      },
+    };
+  }, { targetStudentId: studentId });
+  return Response.json({ thread: savedThread, resultSource });
+  } catch (error) {
+    if (token) {
+      try { await failTutorRequest(tutorRequest, token, request.signal.aborted, rawModelOutput,
+        tutorSignal.aborted && !request.signal.aborted ? "TUTOR_REQUEST_TIMEOUT"
+          : error instanceof Error && error.message === "TUTOR_INVALID_OUTPUT" ? "TUTOR_INVALID_OUTPUT" : "TUTOR_GENERATION_FAILED"); }
+      catch { console.error("[knowledge-tutor] failure receipt unavailable; request lease retained"); }
+    }
+    if (error instanceof PlatformError) return Response.json({ error: error.code, message: error.message }, { status: error.status });
+    console.error("[knowledge-tutor] request failed", error);
+    return Response.json({ error: request.signal.aborted ? "TUTOR_REQUEST_CANCELLED" : tutorSignal.aborted ? "TUTOR_REQUEST_TIMEOUT" : "TUTOR_REQUEST_FAILED" }, { status: 503 });
+  }
+}

@@ -1,0 +1,29 @@
+.dots {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 3px;
+  height: 14px;
+}
+
+.dot {
+  display: block;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--pbl-ai);
+  animation: thinking-dot 1.2s ease-in-out infinite;
+}
+
+.dot:nth-child(2) { animation-delay: 160ms; }
+.dot:nth-child(3) { animation-delay: 320ms; }
+.dots[data-paused="true"] .dot { animation-play-state: paused; }
+
+@keyframes thinking-dot {
+  0%, 60%, 100% { opacity: 0.35; transform: translateY(0); }
+  30% { opacity: 1; transform: translateY(-3px); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dot { animation: none; }
+}

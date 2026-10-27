@@ -1,0 +1,5 @@
+{
+  "algorithmVersion": 4,
+  "source": "No offline voice calibration is bundled for Qwen Audio 3.0; use shared teacher calibration data when available.",
+  "profiles": []
+}

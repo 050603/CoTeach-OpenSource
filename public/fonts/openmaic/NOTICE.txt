@@ -1,0 +1,61 @@
+OpenMAIC font assets served locally by CoTeach
+
+These six WOFF2 files are redistributed unchanged from the font URLs declared
+in packages/@openmaic/renderer/fonts.config.mjs. The application CSS preserves
+the original exposed font-family names and serves the files from the same
+origin; no glyphs, embedded font names, or font metadata have been modified.
+The renderer package's MIT license does not replace the individual font licenses.
+
+Original files:
+https://file.maic.chat/fonts/SourceHanSans.woff2
+https://file.maic.chat/fonts/SourceHanSerif.woff2
+https://file.maic.chat/fonts/LXGWWenKai.woff2
+https://file.maic.chat/fonts/ZhuQueFangSong.woff2
+https://file.maic.chat/fonts/WenDingPLKaiTi.woff2
+https://file.maic.chat/fonts/ZcoolHappy.woff2
+
+SourceHanSans (思源黑体 CN VF)
+Embedded copyright: © 2014-2021 Adobe (http://www.adobe.com/), with
+Reserved Font Name 'Source'.
+Source: https://github.com/adobe-fonts/source-han-sans
+License: SIL Open Font License 1.1; see font-licenses/OFL.txt.
+
+SourceHanSerif (思源宋体 CN VF)
+Embedded copyright: © 2017-2023 Adobe (http://www.adobe.com/), with
+Reserved Font Name 'Source'.
+Source: https://github.com/adobe-fonts/source-han-serif
+License: SIL Open Font License 1.1; see font-licenses/OFL.txt.
+
+LXGWWenKai (LXGW WenKai GB Screen / 霞鹜文楷)
+Embedded copyrights:
+Copyright 2021-2023 LXGW (https://github.com/lxgw/LxgwWenKai-Screen)
+Copyright 2020 The Klee Project Authors (https://github.com/fontworks-fonts/Klee)
+Source: https://github.com/lxgw/LxgwWenKai-Screen
+License: SIL Open Font License 1.1; see font-licenses/OFL.txt.
+
+ZhuQueFangSong (朱雀仿宋 / Zhuque Fangsong technical preview)
+Copyright 2023 Zhejiang JadeFoci Technology Co. LTD.
+Embedded copyright: Copyright 2023 JadeFoci.
+Source: https://www.jadefoci.com/
+License: SIL Open Font License 1.1; see font-licenses/OFL.txt.
+
+WenDingPLKaiTi (文鼎 PL 简中楷 / AR PL KaitiM GB)
+Copyright 1994-1999 Arphic Technology Co., Ltd.
+Source: http://www.arphic.com.tw
+License: Arphic Public License 1999; see font-licenses/ARPHIC-PL.txt.
+Upstream conversion notice from the renderer's FONTS.md: this is the WOFF2
+conversion of AR PL KaitiM GB, exposed under the CSS alias WenDingPLKaiTi;
+no glyphs were modified. CoTeach redistributes that existing file verbatim.
+
+ZcoolHappy (站酷快乐体2016修订版 / HappyZcool-2016)
+Copyright ZCOOL (站酷); designers retain attribution.
+Embedded copyrights: (c) Copyright LuiBingKe 2016; (c) Copyright 刘兵克 2016.
+Design: 刘兵克学员及工作室团队 / thosefree.
+Source: https://www.zcool.com.cn/article/ZMTIxNjk0OA==.html
+License and attribution: font-licenses/ZcoolHappy-LICENSE.txt.
+Keep the original font name and designers' attribution; do not resell the
+font as a standalone commodity.
+
+The three accompanying license files are verbatim copies of the renderer's
+font-licenses directory. See packages/@openmaic/renderer/FONTS.md in the source
+repository for the upstream attribution and redistribution record.

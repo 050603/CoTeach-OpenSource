@@ -1,0 +1,478 @@
+import { describe, expect, it, vi } from "vitest";
+import { createPblTemplateCourse } from "@/lib/platform/pbl-template";
+import type { Scene } from "@/lib/openmaic/types/stage";
+import type { SceneOutline } from "@/lib/openmaic/types/generation";
+import { collectCourseStructureIssues, courseReviewSections, reviewCourseSection, reviewSceneEvidence } from "./semantic-review";
+import { selectReviewSource } from "./source-selection";
+import { normalizeTeachingBrief } from "@/lib/openmaic/generation/teaching-brief";
+import { emptyResourcePackageDraft, stagePlanFromResourcePackage } from "@/lib/resource-package/types";
+import { packageDraftSignature } from "@/lib/resource-package/compatibility";
+
+const outline: SceneOutline = { id: "outline", type: "slide", title: "边界条件", description: "依据样本条件解释结论", order: 0, keyPoints: ["独立测试数据才能用于检查泛化"], knowledgePointIds: ["kp"] };
+const scene = { id: "scene", outlineId: "outline", stageId: "stage", type: "slide", title: "边界条件", order: 0, actions: [{ id: "speech", type: "speech", text: "不能使用训练样本代替独立测试" }],
+  content: { type: "slide", canvas: { elements: [{ id: "text", type: "text", left: 80, top: 200, width: 800, height: 160, content: `<p>${"核心解释".repeat(30)}仅适用于独立测试</p>` }] } } } as unknown as Scene;
+
+function confirmedCourse() {
+  const course = createPblTemplateCourse("confirmed-course");
+  const draft = { ...emptyResourcePackageDraft(), courseName: "样本评估", grade: "本科一年级", drivingQuestion: "如何验证模型在新样本上的表现？", learningObjectives: ["区分训练与评估"], expectedOutcome: "个人评估报告", lessonCount: 3, minutesPerLesson: 45, totalMinutes: 135,
+    knowledgePoints: [{ id: "group", name: "模型评估", description: "评估基础", subPoints: [], children: [{ id: "kp", name: "独立测试", description: "使用独立数据评估" }] }],
+    stages: emptyResourcePackageDraft().stages.map((stage, index) => ({ ...stage, durationMin: [15, 30, 60, 20, 10][index] })) };
+  course.grade = draft.grade; course.drivingQuestion = draft.drivingQuestion; course.hours = 2.25;
+  course.content.resourcePackage = { schemaVersion: 2, id: "pack", revision: 3, confirmedAt: "2026-09-12T00:00:00Z", source: { id: "zip", fileName: "course.zip", url: "/api/uploads/zip" }, documents: {}, draft };
+  course.content.stagePlan = stagePlanFromResourcePackage(draft);
+  course.content.knowledgePoints = [{ id: "kp", name: "独立测试", description: "独立数据" }];
+  course.content._openmaicSceneOutlines = [{ ...outline }];
+  return course;
+}
+
+describe("fast draft and section-wide teaching review", () => {
+  it("reviews complete native text, narration and the shared teaching brief together", async () => {
+    const course = createPblTemplateCourse("course");
+    const page = { ...outline, teachingBrief: normalizeTeachingBrief(outline) };
+    const ai = vi.fn().mockResolvedValue(JSON.stringify({ issues: [{ sceneId: "scene", elementId: "text", title: "需要核对条件", evidence: "仅适用于独立测试", suggestion: "结合教案说明测试数据来源。" }] }));
+    const issues = await reviewCourseSection({ course, scenes: [scene], outlines: [page], sourceContext: "教师确认独立测试条件" }, ai);
+    const input = JSON.parse(ai.mock.calls[0][1]);
+    expect(input.scenes[0].content.elements[0].content).toContain("仅适用于独立测试");
+    expect(input.scenes[0].actions[0].text).toContain("不能使用训练样本");
+    expect(input.outlines[0].teachingBrief.explanation).toBe(outline.description);
+    expect(issues[0]).toMatchObject({ origin: "semantic", severity: "suggestion", sceneId: "scene", elementId: "text" });
+    expect(ai.mock.calls[0][0]).toContain("不是要求在课堂中逐字复现的最终目录");
+  });
+
+  it("sends each section only its mapped course nodes and textbook evidence", async () => {
+    const course = createPblTemplateCourse("course");
+    course.content.knowledgePoints = [
+      { id: "target-a", name: "教材概念 A", description: "教材解释 A", sourceKnowledgePointIds: ["source-a"], evidenceItemIds: ["evidence-a"] },
+      { id: "target-b", name: "教材概念 B", description: "教材解释 B", sourceKnowledgePointIds: ["source-b"], evidenceItemIds: ["evidence-b"] },
+    ];
+    course.content.knowledgeGraph = {
+      nodes: course.content.knowledgePoints.map((point) => ({ id: point.id, label: point.name, description: point.description, level: "core", instructionalRole: "lesson" })),
+      edges: [],
+    };
+    course.content.knowledgeScopePlan = {
+      schemaVersion: 1, planningDurationMin: 30, durationRangeMin: 30, durationRangeMax: 30,
+      durationSource: "resource-package", assessmentReserveMin: 4, explanationAndActivityMin: 26,
+      sourcePointCount: 2, targetPointCount: 2, rationale: "教材映射",
+      decisions: ["a", "b"].map((id) => ({
+        sourceKnowledgePointId: `source-${id}`, sourceKnowledgePointName: `来源 ${id}`,
+        disposition: "mapped" as const, targetKnowledgePointId: `target-${id}`,
+        targetKnowledgePointIds: [`target-${id}`], rationale: "教材化改写",
+      })),
+    };
+    course.content.courseEvidence = {
+      schemaVersion: 2, version: 1, fingerprint: "evidence-fingerprint", createdAt: new Date(0).toISOString(), retrievalMode: "hybrid",
+      selections: [], warnings: [],
+      mappings: ["a", "b"].map((id) => ({ sourceKnowledgePointId: `source-${id}`, sourceKnowledgePointName: `来源 ${id}`, status: "direct" as const, evidenceItemIds: [`evidence-${id}`], rationale: "教材支持" })),
+      items: ["a", "b"].map((id) => ({ id: `evidence-${id}`, kind: "concept" as const, title: `证据 ${id}`, content: `教材内容 ${id}`, source: { textbookId: "book", textbookTitle: "教材", revisionId: "revision", revisionVersion: 1, sectionPath: [] } })),
+    };
+    const sectionOutline = { ...outline, lectureSectionId: "section-a", knowledgePointIds: ["target-a"] };
+    const ai = vi.fn().mockResolvedValue('{"issues":[]}');
+    await reviewCourseSection({ course, scenes: [scene], outlines: [sectionOutline], sourceContext: "", includeKnowledgeGraph: true }, ai);
+    const payload = JSON.parse(ai.mock.calls[0][1]);
+    expect(payload.knowledgePoints.map((point: { id: string }) => point.id)).toEqual(["target-a"]);
+    expect(payload.knowledgeScopePlan.decisions.map((decision: { sourceKnowledgePointId: string }) => decision.sourceKnowledgePointId)).toEqual(["source-a"]);
+    expect(payload.courseEvidence.mappings.map((mapping: { sourceKnowledgePointId: string }) => mapping.sourceKnowledgePointId)).toEqual(["source-a"]);
+    expect(payload.courseEvidence.items.map((item: { id: string }) => item.id)).toEqual(["evidence-a"]);
+  });
+
+  it("never promotes a model-authored review into a hard structure error or trusts foreign locations", async () => {
+    const issues = await reviewCourseSection({ course: createPblTemplateCourse("course"), scenes: [scene], outlines: [outline], sourceContext: "" }, async () => JSON.stringify({ issues: [{ sceneId: "other", elementId: "secret", origin: "structure", severity: "error", title: "核对", evidence: "证据", suggestion: "检查" }] }));
+    expect(issues[0]).toMatchObject({ origin: "semantic", severity: "suggestion" });
+    expect(issues[0].sceneId).toBeUndefined();
+    expect(issues[0].elementId).toBeUndefined();
+  });
+
+  it("reports incomplete model results rather than claiming the section passed", async () => {
+    await expect(reviewCourseSection({ course: createPblTemplateCourse("course"), scenes: [scene], outlines: [outline], sourceContext: "" }, async () => "{}")).rejects.toThrow("有效问题报告");
+  });
+
+  it("selects relevant late source evidence and discloses omitted text instead of cutting at 60000", () => {
+    const source = `教师确认的课程条件\n${"其他资料。".repeat(18000)}\n独立测试数据才能用于检查泛化：不得训练后回看训练数据代替评估。`;
+    const selected = selectReviewSource(source, [outline]);
+    expect(selected.partial).toBe(true);
+    expect(selected.selectedChars).toBeLessThanOrEqual(60000);
+    expect(selected.text).toContain("教师确认的课程条件");
+    expect(selected.text).toContain("不得训练后回看训练数据代替评估");
+    expect(selected.totalChars).toBe(source.length);
+  });
+
+  it("keeps graph questions advisory but an absent teaching page is a hard structural error", () => {
+    const course = createPblTemplateCourse("course");
+    course.content.knowledgePoints = [{ id: "kp", name: "测试", description: "作用" }];
+    course.content._openmaicSceneOutlines = [{ ...outline }];
+    expect(collectCourseStructureIssues(course, []).some((issue) => issue.origin === "structure" && issue.severity === "error")).toBe(true);
+    expect(collectCourseStructureIssues(course, [scene]).filter((issue) => issue.origin === "semantic").every((issue) => issue.severity === "suggestion")).toBe(true);
+    expect(reviewSceneEvidence({ ...scene, actions: undefined })).toBeTruthy();
+  });
+
+  it("blocks authoring status labels in student artifacts without banning normal subject vocabulary", () => {
+    const course = confirmedCourse();
+    const leaked = structuredClone(scene);
+    if (leaked.content.type !== "slide" || leaked.content.canvas.elements[0]?.type !== "text") throw new Error("fixture must be a slide");
+    leaked.content.canvas.elements[0].content = "<p>证据状态：PARTIAL</p>";
+    expect(collectCourseStructureIssues(course, [leaked]).some((issue) => issue.title === "教师侧管理字段进入学生内容")).toBe(true);
+    leaked.content.canvas.elements[0].content = "<p><strong>PARTIAL</strong></p>";
+    expect(collectCourseStructureIssues(course, [leaked]).some((issue) => issue.title === "教师侧管理字段进入学生内容")).toBe(true);
+    leaked.content.canvas.elements[0].content = "<p>偏导数的英文是 partial derivative；本节还会讨论证据状态随实验条件变化的科学含义。</p>";
+    expect(collectCourseStructureIssues(course, [leaked]).some((issue) => issue.title === "教师侧管理字段进入学生内容")).toBe(false);
+  });
+
+  it("blocks changed confirmed audience, driving question and whole-course or stage minutes only for schema 2", () => {
+    const course = confirmedCourse();
+    expect(collectCourseStructureIssues(course, [scene]).filter((issue) => issue.origin === "structure")).toEqual([]);
+    course.grade = "小学"; course.drivingQuestion = "改写后的问题"; course.hours = 0.5;
+    course.content.stagePlan!.stages[1].durationMin = 20;
+    const titles = collectCourseStructureIssues(course, [scene]).filter((issue) => issue.origin === "structure").map((issue) => issue.title);
+    expect(titles).toEqual(expect.arrayContaining(["教学对象与教师确认内容不一致", "驱动问题与教师确认内容不一致", "整课时长与教师确认分钟数不一致", "知识讲授时间与教师确认计划不一致"]));
+    course.content.resourcePackage!.schemaVersion = 1;
+    expect(collectCourseStructureIssues(course, [scene]).filter((issue) => issue.origin === "structure")).toEqual([]);
+  });
+
+  it("requires actual confirmation and adaptation authorization bound to the confirmed source", () => {
+    const course = confirmedCourse();
+    const pack = course.content.resourcePackage!;
+    pack.confirmedAt = undefined;
+    pack.conflicts = [{ id: "organization", kind: "organization", summary: "原包要求真人组队", reason: "个人AI课堂", suggestion: "适配", evidence: [] }];
+    pack.conflictVersion = "conflict-v1";
+    expect(collectCourseStructureIssues(course, [scene]).map((issue) => issue.title)).toEqual(expect.arrayContaining(["资源包尚未由教师确认", "资源包组织或评价冲突尚未获有效适配授权"]));
+    pack.confirmedAt = "2026-09-12T00:00:00Z";
+    pack.adaptation = { sourceRevision: 1, conflictVersion: "conflict-v1", authorizedBy: "teacher", authorizedAt: "2026-09-11T00:00:00Z", draftSignature: packageDraftSignature(pack.draft), changes: ["个人AI伙伴"] };
+    expect(collectCourseStructureIssues(course, [scene]).filter((issue) => issue.origin === "structure")).toEqual([]);
+    pack.draft.expectedOutcome = "授权后被替换的要求";
+    expect(collectCourseStructureIssues(course, [scene]).some((issue) => issue.title.includes("未获有效适配授权"))).toBe(true);
+  });
+
+  it("reviews the active preparation plan while preserving an unrelated package draft", () => {
+    const course = confirmedCourse();
+    const draft = course.content.resourcePackage!.draft;
+    course.content.stagePlan!.source = "collaborative-preparation";
+    course.content.preparationSource = "collaborative-preparation";
+    course.content.confirmedPreparation = {
+      sessionId: "preparation", revision: 2, confirmedAt: "2026-10-23T00:00:00Z", confirmedBy: "teacher",
+      referenceIds: [], textbookSelections: [],
+      plan: { courseName: draft.courseName, subject: "信息科技", grade: draft.grade, totalMinutes: draft.totalMinutes!,
+        learnerContext: "已了解训练与测试", learningObjectives: draft.learningObjectives, knowledgePoints: [],
+        teachingApproach: "对比案例", teacherRequirements: [], stagePlan: structuredClone(course.content.stagePlan!) },
+    };
+    course.content.resourcePackage!.confirmedAt = undefined;
+    draft.grade = "旧交接包学段";
+    draft.drivingQuestion = "旧交接包问题";
+    draft.totalMinutes = 300;
+    expect(collectCourseStructureIssues(course, [scene]).filter((issue) => issue.origin === "structure")).toEqual([]);
+
+    course.grade = "与当前确认方案不同的学段";
+    course.content.stagePlan!.stages[1].durationMin = 31;
+    const titles = collectCourseStructureIssues(course, [scene]).map((issue) => issue.title);
+    expect(titles).toEqual(expect.arrayContaining(["教学对象与教师确认内容不一致", "知识讲授时间与教师确认计划不一致"]));
+    expect(titles).not.toContain("资源包尚未由教师确认");
+
+    course.content.confirmedPreparation = undefined;
+    expect(collectCourseStructureIssues(course, [scene]).map((issue) => issue.title)).toContain("协同备课方案尚未确认");
+  });
+
+  it("reviews textbook-shaped course nodes instead of requiring upstream ids or wording verbatim", () => {
+    const course = confirmedCourse();
+    course.content.knowledgePoints = [];
+    expect(collectCourseStructureIssues(course, [scene]).some((issue) => issue.title === "教师确认的必需知识未进入课程")).toBe(false);
+    course.content.knowledgePoints = [{
+      id: "textbook-evaluation-boundary",
+      sourceKnowledgePointIds: ["kp"],
+      name: "训练信息与评估信息的边界",
+      description: "依据教材区分参与模型选择的信息与独立检验信息。",
+    }];
+    course.content.knowledgeScopePlan = {
+      schemaVersion: 1,
+      policyVersion: "textbook-evidence-mapping-v2",
+      planningDurationMin: 30,
+      durationRangeMin: 30,
+      durationRangeMax: 30,
+      durationSource: "resource-package",
+      assessmentReserveMin: 4,
+      explanationAndActivityMin: 26,
+      sourcePointCount: 1,
+      targetPointCount: 1,
+      rationale: "按教材概念体系重新组织。",
+      decisions: [{
+        sourceKnowledgePointId: "kp",
+        sourceKnowledgePointName: "独立测试",
+        disposition: "mapped",
+        targetKnowledgePointId: "textbook-evaluation-boundary",
+        targetKnowledgePointIds: ["textbook-evaluation-boundary"],
+        rationale: "教材采用信息边界解释原有要求。",
+      }],
+    };
+    course.content._openmaicSceneOutlines![0].knowledgePointIds = ["textbook-evaluation-boundary"];
+    expect(collectCourseStructureIssues(course, [scene]).filter((issue) => issue.origin === "structure")).toEqual([]);
+    course.content._openmaicSceneOutlines![0].type = "quiz";
+    expect(collectCourseStructureIssues(course, [scene]).some((issue) => issue.title === "课程体系知识节点缺少讲授页面")).toBe(true);
+  });
+
+  it("reports only a genuinely unmapped upstream responsibility, without requiring its original wording", () => {
+    const course = confirmedCourse();
+    course.content.knowledgePoints = [{ id: "textbook-target", name: "教材化概念", description: "采用教材表述" }];
+    course.content._openmaicSceneOutlines![0].knowledgePointIds = ["textbook-target"];
+    course.content.knowledgeScopePlan = {
+      schemaVersion: 1, policyVersion: "textbook-evidence-mapping-v2",
+      planningDurationMin: 30, durationRangeMin: 30, durationRangeMax: 30,
+      durationSource: "resource-package", assessmentReserveMin: 4, explanationAndActivityMin: 26,
+      sourcePointCount: 1, targetPointCount: 1, rationale: "按教材体系组织",
+      decisions: [{
+        sourceKnowledgePointId: "source-original", sourceKnowledgePointName: "教师原始知识点",
+        disposition: "mapped", targetKnowledgePointId: "missing-target", targetKnowledgePointIds: ["missing-target"], rationale: "待补映射",
+      }],
+    };
+    const issues = collectCourseStructureIssues(course, [scene]);
+    expect(issues.filter((issue) => issue.title === "上游教学要求缺少课程映射")).toHaveLength(1);
+    expect(issues.some((issue) => issue.title === "教师确认的必需知识未进入课程")).toBe(false);
+  });
+
+  it("audits the actual custom canvas size and ratio rather than assuming 1000 by 562.5", () => {
+    const course = confirmedCourse();
+    const custom = structuredClone(scene);
+    if (custom.content.type !== "slide") throw new Error("fixture must be a slide");
+    custom.content.canvas.viewportSize = 1280; custom.content.canvas.viewportRatio = 0.625;
+    custom.content.canvas.elements[0].left = 1100; custom.content.canvas.elements[0].top = 630; custom.content.canvas.elements[0].width = 160;
+    if (custom.content.canvas.elements[0].type === "text") custom.content.canvas.elements[0].content = "<p>边界内文字</p>";
+    expect(collectCourseStructureIssues(course, [custom]).filter((issue) => issue.origin === "structure")).toEqual([]);
+    custom.content.canvas.elements[0].left = 1250;
+    expect(collectCourseStructureIssues(course, [custom]).some((issue) => issue.evidence.includes("outside the slide canvas"))).toBe(true);
+  });
+
+  it("blocks concrete overlap and unreadable type while keeping subjective composition advisory", () => {
+    const course = confirmedCourse();
+    const draft = structuredClone(scene);
+    if (draft.content.type !== "slide") throw new Error("fixture must be a slide");
+    const text = draft.content.canvas.elements[0];
+    if (text.type !== "text") throw new Error("fixture must contain text");
+    draft.content.canvas.elements.push({ ...text, id: "overlap", top: 210, content: '<p style="font-size:14px">与核心说明重叠的注释</p>' });
+    const issues = collectCourseStructureIssues(course, [draft]);
+    expect(issues).toEqual(expect.arrayContaining([
+      expect.objectContaining({ origin: "structure", severity: "error", sceneId: scene.id, evidence: expect.stringContaining("overlap substantially") }),
+      expect.objectContaining({ origin: "structure", severity: "error", evidence: expect.stringContaining("too small") }),
+    ]));
+  });
+
+  it("keeps missing design criteria and unbound media purposes reviewable without requiring a fixed layout", () => {
+    const course = confirmedCourse();
+    const savedOutline = course.content._openmaicSceneOutlines![0]!;
+    savedOutline.teachingBrief = {
+      schemaVersion: 1,
+      designVersion: "shared-page-contract-v11-dynamic-progression",
+      explanation: "独立测试数据不参与学习，因此能检查模型面对新数据的表现。",
+      examples: [], conditions: [], evidence: [], assessmentFocus: "解释独立性及理由",
+      teachingPlan: {
+        purpose: "解释独立测试",
+        priorKnowledge: "知道训练用于学习",
+        newContent: "测试数据不参与模型学习，并在模型确定后检查新数据表现。",
+        learnerQuestion: "为什么不能反复据此调参",
+        reasoningSteps: ["测试结果一旦用于调参，测试信息就进入了开发过程。"],
+        takeaway: "独立性来自测试信息不参与学习与选择",
+        visibleContent: ["测试数据不参与模型学习"],
+        narrationFocus: ["说明信息回流为何破坏独立性"],
+      },
+      understandingCriteria: {
+        goals: ["解释独立测试解决的问题"],
+        answerEssentials: ["指出测试信息不参与学习并说明理由"],
+        misconceptions: ["把更难的数据当成测试集定义"],
+        supportingUnitIds: ["unit-1"],
+      },
+      resourceNeeds: [{ kind: "image", purpose: "展示训练信息与测试信息分离", required: true }],
+    };
+    const teachingBlueprint: NonNullable<typeof course.content.teachingBlueprint> = {
+      schemaVersion: 2, inputFingerprint: "input", assessmentMode: "adaptive", createdAt: "2026-09-12T00:00:00Z",
+      budget: { totalDurationSec: 300, teachingDurationSec: 240, learnerActivityDurationSec: 0, assessmentDurationSec: 60, teachingRatio: 0.8, assessmentRatio: 0.2 },
+      sections: [{
+        id: "section-1", title: "独立测试", order: 0, learningObjective: "解释独立测试", knowledgePointIds: ["kp"],
+        sharedContext: { learningPurpose: "判断评估是否可信", caseId: "", caseFacts: [], fixedWording: [], stableTerms: ["独立测试"], conceptBoundaries: ["难度不是定义"] },
+        units: [{ id: "unit-1", title: "独立性", knowledgePointIds: ["kp"], learningOutcome: "解释独立性", explanation: "测试不参与学习。", mechanism: "信息回流会破坏独立性。", workedExample: "", conditions: [], misconceptions: ["难度不是定义"], sourceKind: "general-knowledge", evidenceQuotes: [] }],
+        pages: [{ id: savedOutline.id, outlineId: savedOutline.id, title: savedOutline.title, type: "slide", unitIds: ["unit-1"], knowledgePointIds: ["kp"], description: savedOutline.description ?? "", keyPoints: savedOutline.keyPoints ?? [], teachingObjective: "解释独立性", resourceNeeds: savedOutline.teachingBrief.resourceNeeds }],
+        assessmentFocus: ["解释理由"], understandingCriteria: savedOutline.teachingBrief.understandingCriteria!,
+        teachingDurationSec: 240, learnerActivityDurationSec: 0, assessmentDurationSec: 60,
+      }],
+    };
+    course.content.teachingBlueprint = teachingBlueprint;
+
+    const issues = collectCourseStructureIssues(course, [scene]);
+    expect(issues.some((issue) => issue.title === "课件缺少设计规定的必要材料")).toBe(false);
+    expect(issues).toEqual(expect.arrayContaining([
+      expect.objectContaining({ title: "必要视觉表达需要核对", severity: "suggestion" }),
+    ]));
+    teachingBlueprint.sections[0]!.understandingCriteria.answerEssentials = [];
+    expect(collectCourseStructureIssues(course, [scene])).toEqual(expect.arrayContaining([
+      expect.objectContaining({ title: "小节理解标准需要补全", severity: "suggestion" }),
+    ]));
+  });
+
+  it("does not demand a full core-concept title in narration, while still requiring actual narration", () => {
+    const course = confirmedCourse();
+    const savedOutline = course.content._openmaicSceneOutlines![0]!;
+    course.content.knowledgePoints = [{ id: "kp", name: "建构主义学习理论", description: "学习者主动建构意义。", teachingRole: "core-concept" }];
+    savedOutline.knowledgePointIds = ["kp"];
+    savedOutline.teachingBrief = normalizeTeachingBrief({ ...savedOutline, description: "解释学习者主动建构意义。", keyPoints: ["学习者主动建构意义"] } as SceneOutline);
+    savedOutline.teachingBrief.teachingPlan = {
+      purpose: "建立建构主义学习理论", priorKnowledge: "知道学习会改变已有认识",
+      newContent: "建构主义学习理论主张学习者主动建构意义。", learnerQuestion: "新经验怎样改变已有认知结构",
+      reasoningSteps: ["先建立理论，再说明同化与顺应。"], takeaway: "学习是主动建构意义的过程",
+      visibleContent: ["建构主义学习理论：学习者主动建构意义"], narrationFocus: ["解释基本含义和核心主张"],
+    };
+    course.content.teachingBlueprint = {
+      schemaVersion: 2, inputFingerprint: "input", assessmentMode: "adaptive", createdAt: "2026-09-12T00:00:00Z",
+      budget: { totalDurationSec: 300, teachingDurationSec: 240, learnerActivityDurationSec: 0, assessmentDurationSec: 60, teachingRatio: 0.8, assessmentRatio: 0.2 },
+      sections: [{
+        id: "section", title: "理论基础", order: 0, learningObjective: "解释建构主义学习理论", knowledgePointIds: ["kp"],
+        sharedContext: { learningPurpose: "理解教学原则", caseId: "", caseFacts: [], fixedWording: [], stableTerms: ["建构主义学习理论"], conceptBoundaries: [] },
+        units: [{ id: "unit", title: "理论定义", knowledgePointIds: ["kp"], learningOutcome: "解释理论", explanation: "学习者主动建构意义。", mechanism: "新经验与已有认知结构相互作用。", workedExample: "", conditions: [], misconceptions: [], sourceKind: "general-knowledge", evidenceQuotes: [], explanationNodes: [{ id: "definition", kind: "concept", content: "建构主义学习理论的基本含义与核心主张", knowledgePointIds: ["kp"], prerequisiteNodeIds: [], provenance: "general-knowledge" }] }],
+        pages: [{ id: savedOutline.id, outlineId: savedOutline.id, title: savedOutline.title, type: "slide", unitIds: ["unit"], knowledgePointIds: ["kp"], description: savedOutline.description ?? "", keyPoints: savedOutline.keyPoints ?? [], teachingObjective: "解释理论", introducesNodeIds: ["definition"] }],
+        assessmentFocus: ["解释理论"], understandingCriteria: { goals: ["解释理论"], answerEssentials: ["主动建构意义"], misconceptions: ["把学习看成被动接收"], supportingUnitIds: ["unit"] },
+        teachingDurationSec: 240, learnerActivityDurationSec: 0, assessmentDurationSec: 60,
+      }],
+    };
+    const actual = structuredClone(scene);
+    actual.actions = [{ id: "speech", type: "speech", text: "下面只讲同化和顺应两个机制。" }];
+    expect(collectCourseStructureIssues(course, [actual]).some((issue) => issue.blocking)).toBe(false);
+    actual.actions = [{ id: "speech", type: "speech", text: "建构主义学习理论主张学习者主动建构意义，同化和顺应说明认知结构怎样变化。" }];
+    expect(collectCourseStructureIssues(course, [actual]).some((issue) => issue.title === "核心概念解释未进入实际讲稿")).toBe(false);
+    actual.actions = [];
+    expect(collectCourseStructureIssues(course, [actual])).toEqual(expect.arrayContaining([
+      expect.objectContaining({ title: "讲授页面缺少实际讲稿", blocking: true }),
+    ]));
+  });
+
+  it("checks only a generated test section while full-course review still finds missing pages", () => {
+    const course = confirmedCourse();
+    course.content.resourcePackage = undefined;
+    course.content.knowledgePoints = [
+      { id: "kp", name: "当前小节", description: "已讲" },
+      { id: "later", name: "后续小节", description: "尚未生成" },
+    ];
+    course.content._openmaicSceneOutlines = [
+      { ...outline, id: "outline", knowledgePointIds: ["kp"] },
+      { ...outline, id: "later-outline", title: "后续讲授", knowledgePointIds: ["later"] },
+    ];
+    course.content.classroomGenerationRun = {
+      scope: "test-lesson", status: "completed", generatedOutlineIds: ["outline"], fullOutlineCount: 2,
+      testLesson: { sectionId: "section-1", sectionTitle: "当前小节", sceneOutlineIds: ["outline"], durationSeconds: 60 },
+      generatedAt: new Date(0).toISOString(),
+    };
+    const testIssues = collectCourseStructureIssues(course, [scene], { includePresentation: false });
+    expect(testIssues.some((issue) => issue.evidence.includes("后续"))).toBe(false);
+    course.content.classroomGenerationRun.generatedOutlineIds = [];
+    const missingSelected = collectCourseStructureIssues(course, [], { includePresentation: false });
+    expect(missingSelected).toEqual(expect.arrayContaining([
+      expect.objectContaining({ title: "课堂页面未生成", evidence: "边界条件", blocking: true }),
+    ]));
+    expect(missingSelected.some((issue) => issue.evidence.includes("后续"))).toBe(false);
+    course.content.classroomGenerationRun.scope = "full-course";
+    const fullIssues = collectCourseStructureIssues(course, [scene], { includePresentation: false });
+    expect(fullIssues).toEqual(expect.arrayContaining([
+      expect.objectContaining({ title: "课堂页面未生成", evidence: "后续讲授", blocking: true }),
+    ]));
+  });
+
+  it("checks split-page narration per child and a bound source image across the parent", () => {
+    const course = confirmedCourse();
+    course.content.resourcePackage = undefined;
+    const first = { ...outline, id: "outline--spatial-1", spatialParentId: "outline", knowledgePointIds: ["kp"] };
+    const second = { ...outline, id: "outline--spatial-2", spatialParentId: "outline", knowledgePointIds: ["kp"] };
+    course.content._openmaicSceneOutlines = [first, second];
+    course.content.teachingBlueprint = { schemaVersion: 2, sections: [{
+      id: "section", title: "边界条件", understandingCriteria: {
+        goals: ["能解释"], answerEssentials: ["独立测试"], misconceptions: ["训练数据不等于测试数据"], supportingUnitIds: ["unit"],
+      }, units: [], pages: [{ id: "outline", outlineId: "outline", title: "边界条件", type: "slide", resourceNeeds: [
+        { kind: "source-image", assetId: "figure-1", required: true, purpose: "观察教材图" },
+      ] }],
+    }] } as unknown as NonNullable<typeof course.content.teachingBlueprint>;
+    const partOne = { ...structuredClone(scene), outlineId: first.id };
+    const partTwo = { ...structuredClone(scene), id: "scene-2", outlineId: second.id };
+    course.content.knowledgeLectureSections = [{ id: "section", title: "边界条件", order: 0,
+      knowledgePointIds: ["kp"], sceneOutlineIds: ["outline"], quizOutlineId: "quiz", estimatedMinutes: 10 }];
+    expect(courseReviewSections(course, [partOne, partTwo])).toEqual([[partOne, partTwo]]);
+    if (partTwo.content.type !== "slide") throw new Error("fixture needs slide");
+    partTwo.content.canvas.elements.push({ id: "figure", type: "image", src: "/api/uploads/figure-1" } as never);
+    const issues = collectCourseStructureIssues(course, [partOne, partTwo], { includePresentation: false });
+    expect(issues.some((issue) => issue.blocking)).toBe(false);
+    partTwo.actions = [];
+    const missingSpeech = collectCourseStructureIssues(course, [partOne, partTwo], { includePresentation: false });
+    expect(missingSpeech.filter((issue) => issue.title === "讲授页面缺少实际讲稿")).toHaveLength(1);
+    partTwo.actions = structuredClone(scene.actions);
+    partTwo.content.canvas.elements.pop();
+    expect(collectCourseStructureIssues(course, [partOne, partTwo], { includePresentation: false })).toEqual(expect.arrayContaining([
+      expect.objectContaining({ title: "指定教材图片未进入课堂", blocking: true }),
+    ]));
+  });
+
+  it("keeps a five-part split page together during semantic review without lecture-section metadata", () => {
+    const course = confirmedCourse();
+    course.content._openmaicSceneOutlines = Array.from({ length: 5 }, (_, index) => ({
+      ...outline, id: `outline--spatial-${index + 1}`, spatialParentId: "outline",
+    }));
+    const parts = course.content._openmaicSceneOutlines.map((part, index) => ({
+      ...structuredClone(scene), id: `scene-${index}`, outlineId: part.id,
+    }));
+    expect(courseReviewSections(course, parts)).toEqual([parts]);
+  });
+
+  it("ignores internal attributes and code examples but catches visible teacher management labels", () => {
+    const course = confirmedCourse();
+    course.content.resourcePackage = undefined;
+    const actual = structuredClone(scene);
+    if (actual.content.type !== "slide" || actual.content.canvas.elements[0]?.type !== "text") throw new Error("fixture needs text slide");
+    actual.content.canvas.elements[0]!.content = '<p data-evidenceStatus="PARTIAL">解释测试边界</p><span hidden>证据状态：PARTIAL</span><script>const evidenceStatus="PARTIAL"</script>';
+    actual.content.canvas.elements.push({ id: "code", type: "code", lines: [{ content: 'const evidenceStatus = "PARTIAL"' }] } as never);
+    expect(collectCourseStructureIssues(course, [actual], { includePresentation: false }).some((issue) => issue.title === "教师侧管理字段进入学生内容")).toBe(false);
+    actual.content.canvas.elements[0]!.content = '<p>JSON 语法示例：<code>{"evidenceStatus":"SUPPORTED"}</code>，`"planningIssues": []`。</p>';
+    expect(collectCourseStructureIssues(course, [actual], { includePresentation: false }).some((issue) => issue.title === "教师侧管理字段进入学生内容")).toBe(false);
+    actual.content.canvas.elements[0]!.content = "<p>证据状态：PARTIAL</p>";
+    expect(collectCourseStructureIssues(course, [actual], { includePresentation: false })).toEqual(expect.arrayContaining([
+      expect.objectContaining({ title: "教师侧管理字段进入学生内容", blocking: true }),
+    ]));
+  });
+
+  it("keeps issue identities stable when unrelated issues are added", () => {
+    const course = confirmedCourse();
+    course.content.resourcePackage = undefined;
+    course.content._openmaicSceneOutlines = [{ ...outline }, { ...outline, id: "missing", title: "缺失页" }];
+    const original = collectCourseStructureIssues(course, [scene], { includePresentation: false })
+      .find((issue) => issue.title === "课堂页面未生成");
+    course.content.resourcePackage = confirmedCourse().content.resourcePackage;
+    course.grade = "不匹配的年级";
+    const withMore = collectCourseStructureIssues(course, [scene], { includePresentation: false })
+      .find((issue) => issue.title === "课堂页面未生成");
+    expect(withMore?.id).toBe(original?.id);
+  });
+
+  it("accepts a twelve-page lesson with nine definition pages and three abbreviated concept narrations", () => {
+    const course = createPblTemplateCourse("twelve-page-lesson");
+    const conceptNames = ["建构主义的知识建构观与同化—顺应机制", "具身认知的核心观点", "项目式教学模式的核心要素与实施要点"];
+    course.content.knowledgePoints = conceptNames.map((name, index) => ({
+      id: `concept-${index}`, name, description: "说明基本含义和机制", teachingRole: "core-concept" as const,
+    }));
+    course.content._openmaicSceneOutlines = Array.from({ length: 12 }, (_, index) => ({
+      ...outline, id: `page-${index}`, title: index < 9 ? `定义与关系 ${index + 1}` : conceptNames[index - 9]!,
+      knowledgePointIds: index < 9 ? [] : [`concept-${index - 9}`],
+      teachingBrief: {
+        ...normalizeTeachingBrief(outline),
+        teachingPlan: {
+          purpose: "解释概念", priorKnowledge: "", newContent: "给出概念定义与适用边界",
+          learnerQuestion: "", reasoningSteps: index < 9 ? [] : ["结合例子说明关系"],
+          takeaway: "理解概念", visibleContent: ["定义与边界"], narrationFocus: ["说明实际含义"],
+        },
+      },
+    }));
+    course.content.teachingBlueprint = { schemaVersion: 2, sections: [{
+      id: "section", title: "概念教学", units: [],
+      understandingCriteria: { goals: ["理解概念"], answerEssentials: ["说明依据"], misconceptions: ["只记名称"], supportingUnitIds: ["unit"] },
+      pages: course.content._openmaicSceneOutlines.map((page) => ({
+        id: page.id, outlineId: page.id, title: page.title, type: "slide", knowledgePointIds: page.knowledgePointIds,
+      })),
+    }] } as unknown as NonNullable<typeof course.content.teachingBlueprint>;
+    const lessonScenes = course.content._openmaicSceneOutlines.map((page, index) => ({
+      ...structuredClone(scene), id: `scene-${index}`, outlineId: page.id, title: page.title,
+      actions: [{ id: `speech-${index}`, type: "speech" as const, text: index < 9
+        ? "从具体例子解释这个定义为何成立，并说明它适用于什么情形。"
+        : ["先用已有经验理解新信息，再在冲突时调整结构。", "身体与环境互动共同参与认知形成。", "项目围绕核心知识组织探究，并交付作品。"][index - 9]! }],
+    }));
+    const issues = collectCourseStructureIssues(course, lessonScenes, { includePresentation: false });
+    expect(issues.filter((issue) => issue.blocking)).toEqual([]);
+  });
+});

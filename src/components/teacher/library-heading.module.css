@@ -1,0 +1,25 @@
+/* Keep the original platform layout and surfaces; teacher actions use BNU blue. */
+.theme {
+  --pbl-teacher: #003da5;
+  --pbl-teacher-hover: #003184;
+  --pbl-teacher-soft: #eaf0fd;
+  --pbl-teacher-border: #cad8f7;
+  --pbl-accent: var(--pbl-teacher);
+  --pbl-focus-color: var(--pbl-teacher);
+}
+.theme :global(.pbl-teacher-create-button:hover:not(:disabled)) { background: var(--pbl-teacher-hover); }
+.theme :global(.pbl-teacher-segmented button), .theme :global(.pbl-dialog-primary), .theme :global(.pbl-dialog-secondary) { min-height: 44px; }
+/* The search field's container already supplies the visible keyboard focus. */
+.theme :global(.pbl-teacher-search input:focus-visible) { outline: none; }
+.theme :global(.pbl-teacher-class-body h2), .theme :global(.pbl-template-card-title) { white-space: normal; overflow-wrap: anywhere; }
+/* The retained version/archive menu must remain visible outside its course card. */
+.theme :global(.pbl-teacher-card-grid .pbl-template-card) { overflow: visible; }
+.theme :global(.pbl-template-card details[open]) { z-index: 21; }
+.theme :global(.pbl-template-card-main:focus-visible) { outline: 2px solid var(--pbl-teacher); outline-offset: -3px; }
+@media (max-width: 380px) {
+  .theme :global(.pbl-platform-topbar-inner) { padding-inline: 16px; }
+  .theme :global(.pbl-platform-topbar-actions) { gap: 4px; }
+  .theme :global(.pbl-platform-topbar nav) { gap: 2px; }
+  .theme :global(.pbl-workspace-nav-link) { padding-inline: 5px; gap: 4px; }
+  .theme :global(.pbl-teacher-account-trigger) { gap: 3px; padding-inline: 2px; }
+}

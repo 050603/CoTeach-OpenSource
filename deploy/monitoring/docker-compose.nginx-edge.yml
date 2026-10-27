@@ -1,0 +1,34 @@
+# Optional. Append after docker-compose.prod.yml and docker-compose.ip.yml.
+# No additional service: this replaces the existing Nginx reload loop.
+services:
+  nginx:
+    environment:
+      OPENPBL_EDGE_LOG_GID: ${OPENPBL_EDGE_LOG_GID:?Set the host app primary group ID}
+    volumes:
+      - type: bind
+        source: ./.openpbl-data/nginx-edge
+        target: /var/log/openpbl-edge
+        bind: { create_host_path: false }
+      - type: bind
+        source: ./deploy/monitoring/nginx-edge-log.conf
+        target: /etc/nginx/conf.d/00-openpbl-edge-log.conf
+        read_only: true
+        bind: { create_host_path: false }
+      - type: bind
+        source: ./deploy/monitoring/nginx-edge-maintenance.sh
+        target: /usr/local/bin/openpbl-nginx-edge-maintenance
+        read_only: true
+        bind: { create_host_path: false }
+      - type: bind
+        source: ./deploy/monitoring/nginx-edge-actions.conf
+        target: /etc/nginx/openpbl-edge-location/actions.conf
+        read_only: true
+        bind: { create_host_path: false }
+    command: !override
+      - /bin/sh
+      - -ec
+      - |
+        /bin/sh /usr/local/bin/openpbl-nginx-edge-maintenance init
+        /bin/sh /etc/nginx/openpbl-templates/render-config.sh
+        /bin/sh /usr/local/bin/openpbl-nginx-edge-maintenance loop &
+        exec nginx -g 'daemon off;'

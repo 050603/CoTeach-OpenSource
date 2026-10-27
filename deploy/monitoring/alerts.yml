@@ -1,0 +1,393 @@
+groups:
+  - name: openpbl
+    rules:
+      - alert: OpenPblTargetDown
+        expr: up{job="openpbl"} == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: CoTeach metrics target is unavailable
+      # Prometheus observes this target through nginx from outside the app.
+      # It includes pre-Node delay, metrics generation and network transfer, so
+      # it is a monitoring-ingress signal, not a business-route latency SLO.
+      # Require >=16 samples in the normal 20-sample window, successful scrapes
+      # throughout, and a fresh up sample. Missing/failed/undersampled windows
+      # remain unknown; OpenPblTargetDown handles an observed failed target.
+      - alert: OpenPblMonitoringIngressSlow
+        expr: |
+          (quantile_over_time(0.95, scrape_duration_seconds{job="openpbl"}[5m]) > 1)
+          and on (job, instance) (count_over_time(scrape_duration_seconds{job="openpbl"}[5m]) >= 16)
+          and on (job, instance) (count_over_time(up{job="openpbl"}[5m]) >= 16)
+          and on (job, instance) (min_over_time(up{job="openpbl"}[5m]) == 1)
+          and on (job, instance) (up{job="openpbl"} == 1)
+          and on (job, instance) (time() - timestamp(up{job="openpbl"}) < 45)
+        for: 5m
+        labels: { severity: warning, measurement: prometheus-scrape }
+        annotations:
+          summary: CoTeach monitoring ingress scrape p95 exceeds 1 second
+          description: External metrics scrape through nginx is slow. Includes app ingress, metrics collection and network; correlate business routes before attributing a classroom SLO failure. Missing or failed scrapes are not zero latency.
+      - alert: OpenPblHttpErrorRateHigh
+        expr: |
+          sum(rate(http_requests_total{status=~"5.."}[5m]))
+          /
+          clamp_min(sum(rate(http_requests_total[5m])), 0.001)
+          > 0.005
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: CoTeach HTTP 5xx rate exceeds 0.5%
+      # Edge logs, not client-supplied clocks. Success latency is separate from
+      # rejected/aborted attempts. Missing/low-traffic latency remains unknown.
+      - alert: OpenPblEdgeReadP95High
+        expr: |
+          (
+            histogram_quantile(0.95,
+              sum by(job, instance, method, le, route, operation) (
+                rate(openpbl_edge_request_duration_seconds_bucket{operation=~"read|projection|realtime",outcome="success"}[1m])
+              )) > 1
+            and on(job, instance, method, route, operation)
+              sum by(job, instance, method, route, operation) (
+                max_over_time(openpbl_edge_request_duration_seconds_count{operation=~"read|projection|realtime",outcome="success"}[1m])
+                - min_over_time(openpbl_edge_request_duration_seconds_count{operation=~"read|projection|realtime",outcome="success"}[1m])
+              ) >= 20
+            and on(job, instance, method, route, operation)
+              sum by(job, instance, method, route, operation) (
+                resets(openpbl_edge_request_duration_seconds_count{operation=~"read|projection|realtime",outcome="success"}[1m])
+              ) == 0
+            and on(job, instance, method, route, operation)
+              min by(job, instance, method, route, operation) (
+                count_over_time(openpbl_edge_request_duration_seconds_count{operation=~"read|projection|realtime",outcome="success"}[1m])
+              ) >= 2
+          ) or (
+            histogram_quantile(0.95,
+              sum by(job, instance, method, le, route, operation) (
+                openpbl_edge_request_duration_seconds_bucket{operation=~"read|projection|realtime",outcome="success"}
+              )) > 1
+            and on(job, instance, method, route, operation)
+              sum by(job, instance, method, route, operation) (
+                openpbl_edge_request_duration_seconds_count{operation=~"read|projection|realtime",outcome="success"}
+              ) >= 20
+            and on(job, instance)
+              (time() - openpbl_edge_log_scope_started_seconds >= 0)
+            and on(job, instance)
+              (time() - openpbl_edge_log_scope_started_seconds < 60)
+          )
+        labels: { severity: warning, measurement: nginx-first-bytes-to-response-complete }
+        annotations:
+          summary: CoTeach edge read p95 exceeds 1 second for {{ $labels.route }}
+          description: Trusted Nginx complete-request duration includes pre-Node wait and response send. Known samples only; unknown collection and direct3000 remain separate, not green.
+      - alert: OpenPblEdgeWriteP95High
+        expr: |
+          (
+            histogram_quantile(0.95,
+              sum by(job, instance, method, le, route, operation) (
+                rate(openpbl_edge_request_duration_seconds_bucket{operation="write",outcome="success"}[1m])
+              )) > 2
+            and on(job, instance, method, route, operation)
+              sum by(job, instance, method, route, operation) (
+                max_over_time(openpbl_edge_request_duration_seconds_count{operation="write",outcome="success"}[1m])
+                - min_over_time(openpbl_edge_request_duration_seconds_count{operation="write",outcome="success"}[1m])
+              ) >= 20
+            and on(job, instance, method, route, operation)
+              sum by(job, instance, method, route, operation) (
+                resets(openpbl_edge_request_duration_seconds_count{operation="write",outcome="success"}[1m])
+              ) == 0
+            and on(job, instance, method, route, operation)
+              min by(job, instance, method, route, operation) (
+                count_over_time(openpbl_edge_request_duration_seconds_count{operation="write",outcome="success"}[1m])
+              ) >= 2
+          ) or (
+            histogram_quantile(0.95,
+              sum by(job, instance, method, le, route, operation) (
+                openpbl_edge_request_duration_seconds_bucket{operation="write",outcome="success"}
+              )) > 2
+            and on(job, instance, method, route, operation)
+              sum by(job, instance, method, route, operation) (
+                openpbl_edge_request_duration_seconds_count{operation="write",outcome="success"}
+              ) >= 20
+            and on(job, instance)
+              (time() - openpbl_edge_log_scope_started_seconds >= 0)
+            and on(job, instance)
+              (time() - openpbl_edge_log_scope_started_seconds < 60)
+          )
+        labels: { severity: warning, measurement: nginx-first-bytes-to-response-complete }
+        annotations:
+          summary: CoTeach edge save p95 exceeds 2 seconds for {{ $labels.route }}
+          description: Only explicitly classified writes. Mixed AI POST is excluded;202 never means model completion. Includes client upload/send, not browser render.
+      - alert: OpenPblEdgeTelemetryUnknown
+        expr: |
+          (up{job="openpbl"} == 1)
+          unless on(job, instance) (
+            (openpbl_edge_log_configured == 1)
+            and on(job, instance) (openpbl_edge_log_collection_available == 1)
+            and on(job, instance) (openpbl_edge_log_maintenance_available == 1)
+            and on(job, instance) (time() - openpbl_edge_log_last_refresh_seconds < 45)
+            and on(job, instance) (time() - openpbl_edge_log_last_refresh_seconds >= 0)
+          )
+          or absent(up{job="openpbl"})
+        for: 2m
+        labels: { severity: warning, measurement: nginx-log-collection }
+        annotations:
+          summary: CoTeach edge request telemetry is unknown or incomplete
+          description: Optional edge logging is off, inaccessible, behind, recently rotated/gapped, or maintenance is stale. This is not application readiness failure or zero latency. Direct3000 coverage is always outside this edge source.
+      - alert: OpenPblClassroomReadP95High
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le, route, operation) (rate(openpbl_http_operation_duration_seconds_bucket{operation="read"}[5m]))
+          ) > 1
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: CoTeach handler read p95 exceeds 1 second for {{ $labels.route }}
+      - alert: OpenPblStaticResourceP95High
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (job, instance, method, le, route) (
+              rate(openpbl_static_resource_duration_seconds_bucket{outcome="completed"}[5m])
+            )
+          ) > 1
+        for: 5m
+        labels: { severity: warning, measurement: node-parsed-to-response-finish }
+        annotations:
+          summary: CoTeach static resource p95 exceeds 1 second for {{ $labels.route }}
+          description: Native Node parsed-request to response finish; includes body streaming, excludes pre-Node waiting and browser receipt/rendering. Aborts are counted separately; missing or zero-traffic series are unknown.
+      - alert: OpenPblClassroomWriteP95High
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le, route, operation) (rate(openpbl_http_operation_duration_seconds_bucket{operation="write"}[5m]))
+          ) > 2
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: CoTeach handler save/submit/upload p95 exceeds 2 seconds for {{ $labels.route }}
+      - alert: OpenPblClassroomProjectionP95High
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le, route) (rate(openpbl_http_operation_duration_seconds_bucket{operation="projection"}[5m]))
+          ) > 1
+        for: 2m
+        labels: { severity: warning }
+        annotations:
+          summary: Classroom projection handler response p95 exceeds 1 second (client rendering measured separately)
+      # Retain the handler metrics above for compatibility. The following
+      # application metric starts at Node's parsed-request event, and therefore
+      # cannot detect waiting before Node, body streaming or browser rendering.
+      - alert: OpenPblApplicationEntryReadP95High
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (job, instance, method, le, route, operation) (
+              rate(openpbl_http_application_entry_duration_seconds_bucket{operation=~"read|projection|resource|realtime"}[5m])
+            )
+          ) > 1
+        for: 5m
+        labels: { severity: warning, measurement: node-http-request-start }
+        annotations:
+          summary: CoTeach Node-receipt-to-return p95 exceeds 1 second for {{ $labels.route }}
+          description: Validated Node ingress plus handler time; excludes pre-Node waiting, streamed body and browser rendering.
+      - alert: OpenPblApplicationEntryWriteP95High
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (job, instance, method, le, route, operation) (
+              rate(openpbl_http_application_entry_duration_seconds_bucket{operation="write"}[5m])
+            )
+          ) > 2
+        for: 5m
+        labels: { severity: warning, measurement: node-http-request-start }
+        annotations:
+          summary: CoTeach Node-receipt-to-return save p95 exceeds 2 seconds for {{ $labels.route }}
+          description: Validated Node ingress plus handler time; excludes pre-Node waiting and streamed body.
+      # Only observed timed routes form the denominator. No catalog of untimed
+      # routes and no absent-to-zero fallback: no samples/rate or a restart keeps
+      # coverage absent/NaN (unknown). A measured count of zero is used only when
+      # actual unknown observations exist for the same fixed route/operation.
+      - record: openpbl:http_application_entry_clock_coverage:ratio5m
+        expr: |
+          (
+            sum by (job, instance, method, route, operation) (
+              rate(openpbl_http_application_entry_measurements_total{measurement="measured"}[5m])
+            )
+            or on (job, instance, method, route, operation)
+            0 * sum by (job, instance, method, route, operation) (
+              rate(openpbl_http_application_entry_measurements_total[5m])
+            )
+          )
+          /
+          sum by (job, instance, method, route, operation) (
+            rate(openpbl_http_application_entry_measurements_total[5m])
+          )
+      - alert: OpenPblApplicationEntryClockCoverageLow
+        expr: openpbl:http_application_entry_clock_coverage:ratio5m < 0.99
+        for: 5m
+        labels: { severity: warning, measurement: node-http-request-start }
+        annotations:
+          summary: CoTeach native ingress clock coverage is incomplete for {{ $labels.route }}
+          description: More than 1% of observed timed requests lack usable clocks. Untimed routes and no-traffic/restarted series remain unknown, not zero latency.
+      - alert: OpenPblEventLoopLagHigh
+        expr: nodejs_eventloop_lag_p99_seconds > 0.2
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: CoTeach Node.js event-loop p99 lag exceeds 200 ms
+      - alert: OpenPblHeapPressure
+        expr: nodejs_heap_size_used_bytes / nodejs_heap_size_total_bytes > 0.8
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: CoTeach Node.js heap usage exceeds 80%
+      - alert: OpenPblHostDiskLow
+        expr: |
+          node_filesystem_avail_bytes{mountpoint="/"}
+          /
+          node_filesystem_size_bytes{mountpoint="/"} < 0.15
+        for: 10m
+        labels: { severity: critical }
+        annotations:
+          summary: CoTeach host disk has less than 15% free
+      - alert: OpenPblContainerRestarting
+        expr: changes(container_start_time_seconds{name=~".*openpbl.*"}[15m]) > 2
+        labels: { severity: warning }
+        annotations:
+          summary: A CoTeach container is repeatedly restarting
+      - alert: OpenPblPostgresConnectionsHigh
+        expr: |
+          (openpbl_postgres_connections / on(job, instance) openpbl_postgres_connection_limit > 0.8)
+          and on(job, instance) (openpbl_postgres_connection_limit > 0)
+          and on(job, instance) (openpbl_health_sample_available{component="database"} == 1)
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: PostgreSQL client backend sessions exceed 80% of max_connections
+      - alert: OpenPblRedisMemoryHigh
+        expr: redis_memory_used_bytes / redis_memory_max_bytes > 0.8
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: Redis memory usage exceeds 80%
+      - alert: OpenPblCertificateExpiring
+        expr: openpbl_certificate_expires_within_48h == 1
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: CoTeach TLS certificate expires within 48 hours
+      - alert: OpenPblLocalBackupStale
+        expr: time() - openpbl_local_backup_checkpoint_timestamp_seconds > 900
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: Local recovery checkpoint is older than the 15 minute target
+      - alert: OpenPblHealthTelemetryUnknown
+        expr: |
+          (openpbl_health_sample_available == 0)
+          or
+          label_replace(
+            (up{job="openpbl"} == 1)
+            unless on(job, instance) (
+              (openpbl_health_sample_available{component="database"} == 1)
+              and on(job, instance) (openpbl_postgres_connections >= 0)
+              and on(job, instance) (openpbl_postgres_connection_limit > 0)
+            ),
+            "component", "database", "job", ".+"
+          )
+        for: 2m
+        labels: { severity: warning }
+        annotations:
+          summary: CoTeach {{ $labels.component }} telemetry is unavailable
+      - alert: OpenPblDocumentConversionWorkerUnavailable
+        expr: openpbl_document_conversion_healthy == 0
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: Document conversion workers are unavailable
+      - alert: OpenPblDocumentReviewWorkerUnavailable
+        expr: openpbl_document_review_worker_healthy == 0 and on(job, instance) openpbl_document_review_worker_enabled == 1
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: Durable document review scheduler is unavailable or has stopped making progress
+      - alert: OpenPblCourseReadWorkersUnavailable
+        expr: |
+          (
+            max without(state) (openpbl_course_read_worker_state{state="healthy"} == 0)
+            or
+            (
+              max without(state) (openpbl_course_read_worker_state{state="ready"})
+              < on(job, instance)
+              max without(state) (openpbl_course_read_worker_state{state="target"})
+            )
+          )
+          and on(job, instance) max without(state) (openpbl_course_read_worker_state{state="enabled"} == 1)
+          and on(job, instance) (up{job="openpbl"} == 1)
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: Enabled course read workers are unhealthy or not ready
+      - alert: OpenPblCourseReadTelemetryUnknown
+        expr: |
+          (up{job="openpbl"} == 1)
+          unless on(job, instance) (
+            max without(state) (openpbl_course_read_worker_state{state="enabled"} == 0)
+            or
+            (
+              max without(state) (openpbl_course_read_worker_state{state="enabled"} == 1)
+              and on(job, instance) (
+                max without(state) (openpbl_course_read_worker_state{state="healthy"} == 0)
+                or max without(state) (openpbl_course_read_worker_state{state="healthy"} == 1)
+              )
+              and on(job, instance) (
+                max without(state) (openpbl_course_read_worker_state{state="target"} == 1)
+                or max without(state) (openpbl_course_read_worker_state{state="target"} == 2)
+              )
+              and on(job, instance) max without(state) (openpbl_course_read_worker_state{state="ready"} >= 0)
+              and on(job, instance) (
+                max without(state) (openpbl_course_read_worker_state{state="ready"})
+                <= on(job, instance)
+                max without(state) (openpbl_course_read_worker_state{state="target"})
+              )
+            )
+          )
+        for: 2m
+        labels: { severity: warning }
+        annotations:
+          summary: Course read worker readiness telemetry is missing or invalid
+      - alert: OpenPblDocumentReviewSettlementOverdue
+        expr: time() - openpbl_document_review_oldest_pending_timestamp_seconds > 300
+        for: 30s
+        labels: { severity: warning }
+        annotations:
+          summary: A durable document review has not finished within the 5 minute classroom settlement target
+      - alert: OpenPblPendingSaveUnconfirmed
+        expr: openpbl_pending_save_known_oldest_age_seconds > 60 and on(job, instance) openpbl_pending_save_known_count > 0
+        for: 30s
+        labels: { severity: warning }
+        annotations:
+          summary: An observed browser submission save remains unconfirmed for over 1 minute
+      - alert: OpenPblPendingSaveTelemetryUnknown
+        expr: openpbl_pending_save_sample_available == 0 and on(job, instance) openpbl_pending_save_clients > 0
+        for: 2m
+        labels: { severity: warning }
+        annotations:
+          summary: Observed browser pending-save diagnostics are unavailable or expired
+      - alert: OpenPblDatabaseLockBacklog
+        expr: openpbl_postgres_lock_waiters > 10
+        for: 1m
+        labels: { severity: warning }
+        annotations:
+          summary: Classroom writes are waiting on database locks
+      - alert: OpenPblClassroomAiQueue
+        expr: openpbl_classroom_ai_pending > 20
+        for: 1m
+        labels: { severity: warning }
+        annotations:
+          summary: Interactive classroom AI requests are queued
+      - alert: OpenPblAiAuditQuarantined
+        expr: openpbl_ai_audit_outbox_quarantined > 0
+        for: 1m
+        labels: { severity: warning }
+        annotations:
+          summary: Invalid AI audit batches are retained in quarantine and need repair

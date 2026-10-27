@@ -1,0 +1,16 @@
+name: 改进建议
+description: 描述教学或维护场景及期望行为
+body:
+  - type: textarea
+    id: scenario
+    attributes:
+      label: 使用场景和现有困难
+      description: 不要提供学生身份、内部资料或未获授权的教材。
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: 期望行为与验收方式
+    validations:
+      required: true

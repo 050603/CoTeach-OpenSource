@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 私密报告安全漏洞
+    url: https://github.com/050603/CoTeach-OpenSource/security/advisories/new
+    about: 通过私密报告入口联系维护者；请勿在公开 issue 中披露漏洞、凭据或学生数据。

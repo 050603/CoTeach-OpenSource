@@ -1,0 +1,232 @@
+// Next.js Proxy — optimistic auth gate for protected routes.
+//
+// When JWT_SECRET is not configured (demo mode), middleware is a no-op
+// and all routes pass through (preserving backward compatibility).
+//
+// When configured:
+//   - /teacher/* requires a valid teacher JWT, else redirect to /teacher/login
+//   - /student/* requires a valid student JWT, else redirect to / (home with join form)
+//   - teacher APIs, upload writes, and course actions
+//     require proper role; unauthenticated → 401
+//   - /api/openmaic/provider-config POST/DELETE requires teacher role
+//
+// Edge runtime: must use only Edge-compatible APIs (jose works on Edge).
+
+import { NextResponse, type NextRequest } from "next/server";
+import { verifyProxyCookie as verifyCookie } from "@/lib/auth/proxy-claims";
+import { contentSecurityPolicy, requestCspOrigin } from "@/lib/security/content-security-policy";
+import { ACTION_PROXY_STARTED_HEADER, ACTION_PROXY_ENDED_HEADER, isHttpEntryTimingRequest } from "@/lib/observability/action-entry-timing";
+
+export const config = {
+  matcher: [
+    // Public entry pages need the request-specific CSP as well.
+    "/",
+    "/student",
+    // 裸路径必须单独列出——Next.js 16 中 `:path*` 不匹配无子路径的裸路径
+    "/teacher",
+    "/teacher/:path*",
+    // /student 裸路径仍公开；仅受保护的子路径需要认证。
+    "/student/:path*",
+    // Upload and slide-image handlers perform their own same-origin and auth checks.
+    // Keep them out of Proxy: Next.js buffers matched request bodies and
+    // truncates them at 10 MiB by default, which corrupts streamed videos.
+    // These exact API route modules retain the complete optimistic gate,
+    // live authorization and every method boundary; APIs use static CSP. HTML
+    // pages retain the request-specific Proxy CSP.
+    // No broader courses pattern may OR-match these paths back into Proxy.
+    "/api/((?!uploads|server-providers/?$|courses/?$|courses/[^/]+/(?:state|events|projection|presence|public-discussion|showcase/(?:presentation|artifacts/pdf))/?$|openmaic/(?:classroom|progress|export/slide-image)/?$|learning-events/?$|ai-collaboration/(?:code|document|memory)/?$).*)",
+  ],
+};
+
+const TEACHER_COOKIE = "openpbl_teacher";
+const STUDENT_COOKIE = "openpbl_student";
+const LOGIN_PATH = "/teacher/login";
+
+function getSecret(): Uint8Array | null {
+  const raw = process.env.JWT_SECRET;
+  if (!raw || raw.length < 32) return null;
+  return new TextEncoder().encode(raw);
+}
+
+function readCookie(req: NextRequest, name: string): string | undefined {
+  const cookie = req.cookies.get(name);
+  return cookie?.value;
+}
+
+async function authProxy(req: NextRequest, diagnosticHeaders?: Headers) {
+  const next = () => {
+    if (!diagnosticHeaders) return NextResponse.next();
+    diagnosticHeaders.set(ACTION_PROXY_ENDED_HEADER, String(Date.now()));
+    return NextResponse.next({ request: { headers: diagnosticHeaders } });
+  };
+  // Authentication moved to V2. Teaching APIs retain their URLs with V2 persistence.
+  const retiredAuth = ["/api/auth/login", "/api/auth/register", "/api/auth/join"];
+  if (retiredAuth.includes(req.nextUrl.pathname)) {
+    return NextResponse.json({ code: "V2_AUTH_REQUIRED", message: "请使用课程平台登录与注册入口" }, { status: 410 });
+  }
+  const secret = getSecret();
+  // Demo mode: skip auth
+  if (!secret) return next();
+
+  const { pathname } = req.nextUrl;
+
+  // This allowlisted endpoint serves versioned public runtime assets, including
+  // opaque-origin iframe requests. Cookie signatures do not authorize it; keep
+  // the outer CSP and ingress timing while avoiding redundant crypto per asset.
+  if ((req.method === "GET" || req.method === "HEAD")
+    && pathname.startsWith("/api/openmaic/interactive-runtime/")) return next();
+
+  // ---------- Page guards ----------
+  // A teacher session is persisted across browser restarts. When the teacher
+  // returns through the role switch, skip the login form while the JWT is
+  // still valid. A known-expired session must keep showing the login page to
+  // avoid redirect loops when the server-side session version has changed.
+  if (pathname === LOGIN_PATH && !req.nextUrl.searchParams.has("reason")) {
+    const token = readCookie(req, TEACHER_COOKIE);
+    const claims = await verifyCookie(token ?? "", secret);
+    if (claims?.role === "teacher") {
+      const url = req.nextUrl.clone();
+      url.pathname = "/teacher";
+      url.search = "";
+      return NextResponse.redirect(url);
+    }
+  }
+
+  // 注意：pathname.startsWith("/teacher/") 不匹配裸路径 "/teacher"，
+  // 需要显式检查裸路径。
+  if (
+    (pathname === "/teacher" || pathname.startsWith("/teacher/")) &&
+    pathname !== LOGIN_PATH &&
+    pathname !== "/teacher/register"
+  ) {
+    const token = readCookie(req, TEACHER_COOKIE);
+    const claims = await verifyCookie(token ?? "", secret);
+    if (!claims || claims.role !== "teacher") {
+      const url = req.nextUrl.clone();
+      url.pathname = LOGIN_PATH;
+      url.searchParams.set("redirect", pathname);
+      return NextResponse.redirect(url);
+    }
+  }
+
+  // /student 裸路径是学生入口页（输入邀请码），公开访问；
+  // 仅 /student/* 子路径（classroom、ai-learning）需要学生身份。
+  if (pathname.startsWith("/student/")) {
+    if (
+      pathname === "/student/register" ||
+      pathname === "/student/login" ||
+      pathname === "/student/reset-password"
+    ) {
+      return next();
+    }
+    const token = readCookie(req, STUDENT_COOKIE);
+    const claims = await verifyCookie(token ?? "", secret);
+    if (!claims || claims.role !== "student") {
+      const url = req.nextUrl.clone();
+      url.pathname = "/student/login";
+      url.searchParams.set("redirect", pathname);
+      return NextResponse.redirect(url);
+    }
+  }
+
+  // ---------- API guards ----------
+  if (pathname.startsWith("/api/")) {
+    const teacherToken = readCookie(req, TEACHER_COOKIE);
+    const studentToken = readCookie(req, STUDENT_COOKIE);
+    const teacherClaims = await verifyCookie(teacherToken ?? "", secret);
+    const studentClaims = await verifyCookie(studentToken ?? "", secret);
+
+    const isTeacher = !!teacherClaims && teacherClaims.role === "teacher";
+    const isStudent = !!studentClaims && studentClaims.role === "student";
+    const publicApi =
+      pathname === "/api/auth/login" ||
+      pathname === "/api/auth/join" ||
+      pathname === "/api/auth/logout" ||
+      pathname === "/api/auth/me" ||
+      pathname === "/api/auth/register" ||
+      pathname === "/api/platform/auth/invite" ||
+      pathname === "/api/platform/auth/register" ||
+      pathname === "/api/platform/auth/login" ||
+      pathname === "/api/platform/auth/teacher-login" ||
+      pathname === "/api/platform/auth/teacher-register" ||
+      pathname === "/api/platform/auth/reset-password" ||
+      pathname === "/api/platform/auth/password-reset-request" ||
+      pathname === "/api/health/live" ||
+      // Sandboxed srcdoc iframes have an opaque origin and cannot reliably
+      // attach the teacher/student cookie to runtime subresource requests.
+      // This endpoint exposes only allowlisted, version-pinned static assets.
+      pathname.startsWith("/api/openmaic/interactive-runtime/");
+    const internallyProtectedApi =
+      pathname === "/api/health/ready" ||
+      pathname === "/api/metrics" ||
+      pathname.startsWith("/api/load-test/");
+    if (!publicApi && !internallyProtectedApi && !isTeacher && !isStudent) {
+      return NextResponse.json(
+        { code: "UNAUTHORIZED", message: "Authentication required." },
+        { status: 401 },
+      );
+    }
+
+    // Teacher-only APIs
+    if (
+      pathname.startsWith("/api/teacher-directives") ||
+      pathname.startsWith("/api/openmaic/provider-config")
+    ) {
+      if (!isTeacher) {
+        return NextResponse.json(
+          { error: "UNAUTHORIZED", message: "需要教师身份" },
+          { status: 401 },
+        );
+      }
+    }
+
+    // Course APIs allow either authenticated role. Route handlers enforce the
+    // course, group, and resource-level authorization boundaries.
+    if (pathname === "/api/courses" || pathname.startsWith("/api/courses/")) {
+      if (!isTeacher && !isStudent) {
+        return NextResponse.json(
+          { error: "UNAUTHORIZED", message: "请先登录" },
+          { status: 401 },
+        );
+      }
+    }
+
+    // Learning events require a known teacher or student identity.
+    if (pathname.startsWith("/api/learning-events")) {
+      if (!isTeacher && !isStudent) {
+        return NextResponse.json(
+          { error: "UNAUTHORIZED", message: "请先登录" },
+          { status: 401 },
+        );
+      }
+    }
+
+    // Uploads: POST requires auth, GET (download) allowed for sharing
+    if (pathname.startsWith("/api/uploads") && req.method !== "GET") {
+      if (!isTeacher && !isStudent) {
+        return NextResponse.json(
+          { error: "UNAUTHORIZED", message: "请先登录" },
+          { status: 401 },
+        );
+      }
+    }
+  }
+
+  return next();
+}
+
+export async function proxy(req: NextRequest) {
+  const diagnosticHeaders = isHttpEntryTimingRequest(req.method, req.nextUrl.pathname)
+    ? new Headers(req.headers)
+    : undefined;
+  if (diagnosticHeaders) {
+    // Never trust a client-supplied clock: even an unauthenticated request's
+    // fields are overwritten before the unchanged optimistic auth gate runs.
+    diagnosticHeaders.set(ACTION_PROXY_STARTED_HEADER, String(Date.now()));
+    diagnosticHeaders.delete(ACTION_PROXY_ENDED_HEADER);
+  }
+  const response = await authProxy(req, diagnosticHeaders);
+  const origin = requestCspOrigin(req.url, req.headers.get("host"), req.headers.get("x-forwarded-proto"));
+  response.headers.set("Content-Security-Policy", contentSecurityPolicy(origin));
+  return response;
+}

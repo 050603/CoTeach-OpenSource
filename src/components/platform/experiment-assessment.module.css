@@ -1,0 +1,76 @@
+.assessment { width: 100%; max-width: 1120px; margin: 16px auto 0; }
+.full { max-width: none; margin-top: 0; }
+.header { position: sticky; top: 0; z-index: 40; padding: 14px 0 12px; border-bottom: 1px solid var(--pbl-border); background: var(--pbl-surface); }
+.headerInner, .body { max-width: 1120px; margin-inline: auto; }
+.full .headerInner, .full .body { width: calc(100% - 2 * var(--assessment-gutter, 16px)); }
+.heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.heading h2 { font-size: 28px; font-weight: 700; }
+.status { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--pbl-student); }
+.status[data-conflict=true] { color: var(--pbl-danger); }
+.progress { display: flex; align-items: center; gap: 12px; margin-top: 10px; font-size: 12px; color: var(--pbl-text-muted); }
+.progressTrack { flex: 1; height: 6px; overflow: hidden; border-radius: 5px; background: var(--pbl-border); }
+.progressFill { height: 100%; border-radius: inherit; background: var(--pbl-student); }
+.introduction { margin: 20px 0; padding: 4px 0 4px 14px; border-left: 3px solid var(--pbl-student); font-size: 14px; line-height: 1.8; color: var(--pbl-text-strong); }
+.introduction h3 { margin-bottom: 6px; font-size: 15px; font-weight: 700; color: var(--pbl-student); }
+.introduction p { white-space: pre-wrap; overflow-wrap: anywhere; }
+.duration { margin-top: 4px; font-size: 12px; color: var(--pbl-text-muted); }
+.content, .assessment :global(fieldset[id]) { scroll-margin-top: calc(var(--assessment-header-height, 96px) + 12px); }
+.content { margin-top: 16px; }
+.pageHeading { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 16px; margin-bottom: 10px; font-size: 12px; color: var(--pbl-text-muted); }
+.questionList { display: grid; gap: 12px; }
+.questionGroup { min-width: 0; overflow: hidden; border: 1px solid var(--pbl-student-border); border-radius: 12px; background: white; }
+.groupHeader { padding: 12px 20px; border-bottom: 1px solid var(--pbl-border); }
+.groupTitle { font-size: 15px; font-weight: 700; line-height: 1.6; overflow-wrap: anywhere; }
+.instruction { display: grid; gap: 4px; margin-top: 6px; font-size: 13px; line-height: 1.65; color: var(--pbl-text-muted); white-space: pre-wrap; overflow-wrap: anywhere; }
+.reference { margin-top: 8px; padding: 8px 12px; border-left: 3px solid #fb923c; background: #fff7ed; color: #7c2d12; }
+.referenceHeading { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 4px 12px; font-size: 12px; font-weight: 700; }
+.referenceHeading button { min-height: 44px; text-decoration: underline; text-underline-offset: 3px; }
+.reference p { font-size: 13px; line-height: 1.7; white-space: pre-wrap; overflow-wrap: anywhere; }
+.scaleGuide, .scaleRow { display: grid; grid-template-columns: minmax(0, 1fr) minmax(260px, 340px); column-gap: 20px; }
+.scaleGuide { align-items: end; margin-top: 8px; }
+.scaleGuideHint { font-size: 12px; line-height: 1.5; color: var(--pbl-text-muted); }
+.scoreLabels, .scoreOptions { display: grid; grid-template-columns: repeat(var(--score-columns), minmax(44px, 1fr)); gap: 6px; }
+.scoreLabels { align-items: end; }
+.scoreCaption { display: grid; justify-items: center; gap: 4px; min-width: 0; font-size: 12px; line-height: 16px; text-align: center; color: var(--pbl-text-muted); }
+.scoreMeaning { display: flex; align-items: end; justify-content: center; min-height: 32px; overflow-wrap: anywhere; text-wrap: balance; }
+.scaleRow { align-items: center; row-gap: 8px; min-width: 0; padding: 10px 20px; border-bottom: 1px solid var(--pbl-border); background: white; scroll-margin-top: 12px; }
+.scaleRow:last-child { border-bottom: 0; }
+.scaleStandalone { border: 1px solid var(--pbl-border); border-radius: 12px; }
+.scalePrompt { display: flex; align-items: baseline; gap: 10px; min-width: 0; font-size: 15px; line-height: 1.6; color: var(--pbl-text-strong); }
+.number { flex-shrink: 0; font-size: 12px; font-weight: 600; font-variant-numeric: tabular-nums; color: var(--pbl-text-muted); }
+.scalePrompt p { white-space: pre-wrap; overflow-wrap: anywhere; }
+.scaleAnswer { display: grid; gap: 8px; min-width: 0; }
+.score { position: relative; display: flex; align-items: center; justify-content: center; min-width: 44px; min-height: 44px; border: 1px solid var(--pbl-border); border-radius: 8px; background: var(--pbl-bg); color: var(--pbl-text); font-size: 15px; font-weight: 600; cursor: pointer; }
+.score:hover { border-color: var(--pbl-student); background: var(--pbl-student-soft); }
+.score:has(input:checked) { border-color: var(--pbl-student); background: var(--pbl-student); color: white; }
+.score:has(input:focus-visible) { outline: 2px solid var(--pbl-student); outline-offset: 3px; }
+.score:has(input:disabled) { cursor: default; }
+.rowDetails { grid-column: 1 / -1; }
+.clearScore { min-height: 44px; font-size: 12px; color: var(--pbl-student); text-decoration: underline; text-underline-offset: 3px; }
+.invalid { border: 2px solid var(--pbl-danger); }
+.compactCard { padding-top: 16px; padding-bottom: 16px; }
+.compactCard > div:last-child { margin-top: 12px; padding-top: 12px; }
+.footer { position: fixed; inset: auto 0 0; z-index: 90; pointer-events: none; padding: 8px 12px max(8px, env(safe-area-inset-bottom)); }
+.footerInner { display: flex; align-items: center; justify-content: space-between; gap: 8px 16px; max-width: 1120px; margin: auto; padding: 10px 16px; border: 1px solid var(--pbl-border); border-radius: 12px; background: rgb(255 255 255 / .97); box-shadow: 0 4px 24px rgb(15 23 42 / .08); pointer-events: auto; }
+.footerInfo { font-size: 12px; color: var(--pbl-text-muted); }
+.footerActions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
+.footerActions button { min-height: 44px; }
+@media (max-width: 767px) {
+  .header { padding: 12px 0; }
+  .heading h2 { font-size: 24px; }
+  .progress { gap: 8px; }
+  .groupHeader { padding: 10px 14px; }
+  .scaleRow, .scaleGuide { grid-template-columns: minmax(0, 1fr); }
+  .scaleGuideHint { display: none; }
+  .scaleRow { gap: 8px; padding: 10px 14px; }
+  .scalePrompt { font-size: 14px; }
+  .scoreOptions, .scoreLabels { gap: 5px; }
+  .footerInner { flex-wrap: wrap; padding: 8px 10px; }
+  .footerInfo { flex: 1 1 90px; }
+  .footerActions { gap: 6px; }
+  .footerActions button { padding-left: 12px; padding-right: 12px; }
+}
+@media (max-width: 359px) {
+  .footerInfo { flex-basis: 100%; }
+  .footerActions { width: 100%; }
+}

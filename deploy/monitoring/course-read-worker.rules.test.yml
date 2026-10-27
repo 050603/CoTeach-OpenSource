@@ -1,0 +1,249 @@
+# Run: promtool test rules course-read-worker.rules.test.yml
+rule_files:
+  - alerts.yml
+evaluation_interval: 15s
+tests:
+  - name: "enabled unhealthy or fewer ready workers fires after one minute, never as missing telemetry"
+    interval: 15s
+    input_series:
+      - series: "up{job=\"openpbl\",instance=\"unhealthy\"}"
+        values: "1+0x40"
+      - series: "openpbl_course_read_worker_state{job=\"openpbl\",instance=\"unhealthy\",state=\"enabled\"}"
+        values: "1+0x40"
+      - series: "openpbl_course_read_worker_state{job=\"openpbl\",instance=\"unhealthy\",state=\"healthy\"}"
+        values: "0+0x40"
+      - series: "openpbl_course_read_worker_state{job=\"openpbl\",instance=\"unhealthy\",state=\"target\"}"
+        values: "2+0x40"
+      - series: "openpbl_course_read_worker_state{job=\"openpbl\",instance=\"unhealthy\",state=\"ready\"}"
+        values: "1+0x40"
+      - series: "up{job=\"openpbl\",instance=\"not-ready\"}"
+        values: "1+0x40"
+      - series: "openpbl_course_read_worker_state{job=\"openpbl\",instance=\"not-ready\",state=\"enabled\"}"
+        values: "1+0x40"
+      - series: "openpbl_course_read_worker_state{job=\"openpbl\",instance=\"not-ready\",state=\"healthy\"}"
+        values: "1+0x40"
+      - series: "openpbl_course_read_worker_state{job=\"openpbl\",instance=\"not-ready\",state=\"target\"}"
+        values: "2+0x40"
+      - series: "openpbl_course_read_worker_state{job=\"openpbl\",instance=\"not-ready\",state=\"ready\"}"
+        values: "1+0x40"
+    alert_rule_test:
+      - eval_time: 45s
+        alertname: OpenPblCourseReadWorkersUnavailable
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: OpenPblCourseReadWorkersUnavailable
+        exp_alerts:
+          - exp_labels:
+              job: "openpbl"
+              instance: "unhealthy"
+              severity: "critical"
+            exp_annotations:
+              summary: "Enabled course read workers are unhealthy or not ready"
+          - exp_labels:
+              job: "openpbl"
+              instance: "not-ready"
+              severity: "critical"
+            exp_annotations:
+              summary: "Enabled course read workers are unhealthy or not ready"
+      - eval_time: 10m
+        alertname: OpenPblCourseReadTelemetryUnknown
+        exp_alerts: []
+  - name: "disabled is explicit and healthy workers remain clear"
+    interval: 15s
+    input_series:
+      - series: "up{job=\"openpbl\",instance=\"disabled\"}"
+        values: "1+0x40"
+      - series: "openpbl_course_read_worker_state{job=\"openpbl\",instance=\"disabled\",state=\"enabled\"}"
+        values: "0+0x40"
+      - series: "up{job=\"openpbl\",instance=\"healthy\"}"
+        values: "1+0x40"
+      - series: "openpbl_course_read_worker_state{job=\"openpbl\",instance=\"healthy\",state=\"enabled\"}"
+        values: "1+0x40"
+      - series: "openpbl_course_read_worker_state{job=\"openpbl\",instance=\"healthy\",state=\"healthy\"}"
+        values: "1+0x40"
+      - series: "openpbl_course_read_worker_state{job=\"openpbl\",instance=\"healthy\",state=\"target\"}"
+        values: "2+0x40"
+      - series: "openpbl_course_read_worker_state{job=\"openpbl\",instance=\"healthy\",state=\"ready\"}"
+        values: "2+0x40"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: OpenPblCourseReadWorkersUnavailable
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: OpenPblCourseReadTelemetryUnknown
+        exp_alerts: []
+  - name: "missing opt-in state, missing readiness, and NaN are unknown rather than healthy or disabled"
+    interval: 15s
+    input_series:
+      - series: "up{job=\"openpbl\",instance=\"missing\"}"
+        values: "1+0x40"
+      - series: "up{job=\"openpbl\",instance=\"missing-ready\"}"
+        values: "1+0x40"
+      - series: "openpbl_course_read_worker_state{job=\"openpbl\",instance=\"missing-ready\",state=\"enabled\"}"
+        values: "1+0x40"
+      - series: "openpbl_course_read_worker_state{job=\"openpbl\",instance=\"missing-ready\",state=\"healthy\"}"
+        values: "1+0x40"
+      - series: "openpbl_course_read_worker_state{job=\"openpbl\",instance=\"missing-ready\",state=\"target\"}"
+        values: "2+0x40"
+      - series: "up{job=\"openpbl\",instance=\"nan-healthy\"}"
+        values: "1+0x40"
+      - series: "openpbl_course_read_worker_state{job=\"openpbl\",instance=\"nan-healthy\",state=\"enabled\"}"
+        values: "1+0x40"
+      - series: "openpbl_course_read_worker_state{job=\"openpbl\",instance=\"nan-healthy\",state=\"healthy\"}"
+        values: "NaN+0x40"
+      - series: "openpbl_course_read_worker_state{job=\"openpbl\",instance=\"nan-healthy\",state=\"target\"}"
+        values: "2+0x40"
+      - series: "openpbl_course_read_worker_state{job=\"openpbl\",instance=\"nan-healthy\",state=\"ready\"}"
+        values: "2+0x40"
+      - series: "up{job=\"openpbl\",instance=\"nan-ready\"}"
+        values: "1+0x40"
+      - series: "openpbl_course_read_worker_state{job=\"openpbl\",instance=\"nan-ready\",state=\"enabled\"}"
+        values: "1+0x40"
+      - series: "openpbl_course_read_worker_state{job=\"openpbl\",instance=\"nan-ready\",state=\"healthy\"}"
+        values: "1+0x40"
+      - series: "openpbl_course_read_worker_state{job=\"openpbl\",instance=\"nan-ready\",state=\"target\"}"
+        values: "2+0x40"
+      - series: "openpbl_course_read_worker_state{job=\"openpbl\",instance=\"nan-ready\",state=\"ready\"}"
+        values: "NaN+0x40"
+      - series: "up{job=\"openpbl\",instance=\"nan-target\"}"
+        values: "1+0x40"
+      - series: "openpbl_course_read_worker_state{job=\"openpbl\",instance=\"nan-target\",state=\"enabled\"}"
+        values: "1+0x40"
+      - series: "openpbl_course_read_worker_state{job=\"openpbl\",instance=\"nan-target\",state=\"healthy\"}"
+        values: "1+0x40"
+      - series: "openpbl_course_read_worker_state{job=\"openpbl\",instance=\"nan-target\",state=\"target\"}"
+        values: "NaN+0x40"
+      - series: "openpbl_course_read_worker_state{job=\"openpbl\",instance=\"nan-target\",state=\"ready\"}"
+        values: "2+0x40"
+      - series: "up{job=\"openpbl\",instance=\"nan-enabled\"}"
+        values: "1+0x40"
+      - series: "openpbl_course_read_worker_state{job=\"openpbl\",instance=\"nan-enabled\",state=\"enabled\"}"
+        values: "NaN+0x40"
+      - series: "openpbl_course_read_worker_state{job=\"openpbl\",instance=\"nan-enabled\",state=\"healthy\"}"
+        values: "1+0x40"
+      - series: "openpbl_course_read_worker_state{job=\"openpbl\",instance=\"nan-enabled\",state=\"target\"}"
+        values: "2+0x40"
+      - series: "openpbl_course_read_worker_state{job=\"openpbl\",instance=\"nan-enabled\",state=\"ready\"}"
+        values: "2+0x40"
+    alert_rule_test:
+      - eval_time: 1m45s
+        alertname: OpenPblCourseReadTelemetryUnknown
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: OpenPblCourseReadTelemetryUnknown
+        exp_alerts:
+          - exp_labels:
+              job: "openpbl"
+              instance: "missing"
+              severity: "warning"
+            exp_annotations:
+              summary: "Course read worker readiness telemetry is missing or invalid"
+          - exp_labels:
+              job: "openpbl"
+              instance: "missing-ready"
+              severity: "warning"
+            exp_annotations:
+              summary: "Course read worker readiness telemetry is missing or invalid"
+          - exp_labels:
+              job: "openpbl"
+              instance: "nan-healthy"
+              severity: "warning"
+            exp_annotations:
+              summary: "Course read worker readiness telemetry is missing or invalid"
+          - exp_labels:
+              job: "openpbl"
+              instance: "nan-ready"
+              severity: "warning"
+            exp_annotations:
+              summary: "Course read worker readiness telemetry is missing or invalid"
+          - exp_labels:
+              job: "openpbl"
+              instance: "nan-target"
+              severity: "warning"
+            exp_annotations:
+              summary: "Course read worker readiness telemetry is missing or invalid"
+          - exp_labels:
+              job: "openpbl"
+              instance: "nan-enabled"
+              severity: "warning"
+            exp_annotations:
+              summary: "Course read worker readiness telemetry is missing or invalid"
+      - eval_time: 10m
+        alertname: OpenPblCourseReadWorkersUnavailable
+        exp_alerts: []
+  - name: "one worker restart and CPU counter reset do not sustain readiness or unknown alerts"
+    interval: 15s
+    input_series:
+      - series: "up{job=\"openpbl\",instance=\"restart\"}"
+        values: "1+0x40"
+      - series: "openpbl_course_read_worker_state{job=\"openpbl\",instance=\"restart\",state=\"enabled\"}"
+        values: "1+0x40"
+      - series: "openpbl_course_read_worker_state{job=\"openpbl\",instance=\"restart\",state=\"healthy\"}"
+        values: "1+0x4 0+0x1 1+0x33"
+      - series: "openpbl_course_read_worker_state{job=\"openpbl\",instance=\"restart\",state=\"target\"}"
+        values: "2+0x40"
+      - series: "openpbl_course_read_worker_state{job=\"openpbl\",instance=\"restart\",state=\"ready\"}"
+        values: "2+0x4 1+0x1 2+0x33"
+      - series: "openpbl_course_read_worker_generation{job=\"openpbl\",instance=\"restart\",slot=\"0\"}"
+        values: "1+0x4 2+0x35"
+      - series: "openpbl_course_read_worker_cpu_microseconds{job=\"openpbl\",instance=\"restart\",slot=\"0\",kind=\"user\"}"
+        values: "100+100x4 0+100x35"
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: OpenPblCourseReadWorkersUnavailable
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: OpenPblCourseReadTelemetryUnknown
+        exp_alerts: []
+  - name: "a prolonged restart unknown gap alerts then clears when new readiness is measured"
+    interval: 15s
+    input_series:
+      - series: "up{job=\"openpbl\",instance=\"restart-gap\"}"
+        values: "1+0x40"
+      - series: "openpbl_course_read_worker_state{job=\"openpbl\",instance=\"restart-gap\",state=\"enabled\"}"
+        values: "1+0x4 NaN+0x9 1+0x25"
+      - series: "openpbl_course_read_worker_state{job=\"openpbl\",instance=\"restart-gap\",state=\"healthy\"}"
+        values: "1+0x4 NaN+0x9 1+0x25"
+      - series: "openpbl_course_read_worker_state{job=\"openpbl\",instance=\"restart-gap\",state=\"target\"}"
+        values: "2+0x4 NaN+0x9 2+0x25"
+      - series: "openpbl_course_read_worker_state{job=\"openpbl\",instance=\"restart-gap\",state=\"ready\"}"
+        values: "2+0x4 NaN+0x9 2+0x25"
+    alert_rule_test:
+      - eval_time: 1m15s
+        alertname: OpenPblCourseReadTelemetryUnknown
+        exp_alerts: []
+      - eval_time: 3m15s
+        alertname: OpenPblCourseReadTelemetryUnknown
+        exp_alerts:
+          - exp_labels:
+              job: "openpbl"
+              instance: "restart-gap"
+              severity: "warning"
+            exp_annotations:
+              summary: "Course read worker readiness telemetry is missing or invalid"
+      - eval_time: 3m15s
+        alertname: OpenPblCourseReadWorkersUnavailable
+        exp_alerts: []
+      - eval_time: 4m
+        alertname: OpenPblCourseReadTelemetryUnknown
+        exp_alerts: []
+  - name: "stopped application is handled by process availability alerts rather than fake worker observations"
+    interval: 15s
+    input_series:
+      - series: "up{job=\"openpbl\",instance=\"down\"}"
+        values: "0+0x40"
+      - series: "openpbl_course_read_worker_state{job=\"openpbl\",instance=\"down\",state=\"enabled\"}"
+        values: "1+0x40"
+      - series: "openpbl_course_read_worker_state{job=\"openpbl\",instance=\"down\",state=\"healthy\"}"
+        values: "0+0x40"
+      - series: "openpbl_course_read_worker_state{job=\"openpbl\",instance=\"down\",state=\"target\"}"
+        values: "2+0x40"
+      - series: "openpbl_course_read_worker_state{job=\"openpbl\",instance=\"down\",state=\"ready\"}"
+        values: "0+0x40"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: OpenPblCourseReadWorkersUnavailable
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: OpenPblCourseReadTelemetryUnknown
+        exp_alerts: []

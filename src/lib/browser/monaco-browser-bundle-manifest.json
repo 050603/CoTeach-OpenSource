@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "version": "0.56.0",
+  "originalSourceTreeSha256": "cd69222f4d006ec80376a2a29f75cf5afcab1866abbc56ca32e00bc46d8a2a50",
+  "algorithm": "named-amd-topological-concat-v1",
+  "moduleListSha256": "605119989d171e9def45e27eab13519a615b8856eb34bcf490b045eff5d2325e",
+  "moduleCount": 104,
+  "bundleSha256": "309b976075a29139a2efeb77c13dcb8053341104b24628d26dae11643df34b74",
+  "bytes": 4618435,
+  "entry": "vs/editor/editor.main",
+  "file": "editor.main.js"
+}

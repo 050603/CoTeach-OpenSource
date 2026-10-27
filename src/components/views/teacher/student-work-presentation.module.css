@@ -1,0 +1,44 @@
+.root { display: grid; grid-template-columns: clamp(190px, 18vw, 280px) minmax(0, 1fr); gap: 12px; min-height: 0; height: 100%; }
+.sidebar, .preview { min-width: 0; min-height: 0; overflow: hidden; border: 1px solid #d8dfe6; border-radius: 8px; background: #fff; }
+.sidebar { display: flex; flex-direction: column; background: #f9fafb; }
+.rosterHeading { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex: none; padding: 14px 12px 8px; }
+.rosterHeading h2 { margin: 0; font-size: 17px; font-weight: 700; }
+.rosterHeading > span { color: #64748b; font-size: 13px; white-space: nowrap; }
+.search { display: flex; align-items: center; gap: 6px; flex: none; margin: 0 10px 8px; padding-inline: 8px; border: 1px solid #d8dfe6; border-radius: 6px; background: #fff; color: #64748b; }
+.search input { width: 100%; min-width: 0; min-height: 44px; border: 0; outline: 0; background: transparent; color: #1f2933; font-size: 14px; }
+.search:focus-within { outline: 2px solid #344a6a; outline-offset: -2px; }
+.roster { flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain; margin: 0; padding: 0 8px 8px; list-style: none; }
+.roster li + li { margin-top: 5px; }
+.student { display: flex; flex-direction: column; align-items: stretch; gap: 7px; width: 100%; min-height: 68px; padding: 11px 10px; border: 1px solid transparent; border-radius: 6px; background: transparent; text-align: left; cursor: pointer; }
+.student:hover { background: #edf1f6; }
+.student[aria-pressed="true"] { border-color: #b9c9df; background: #eaf0f9; }
+.student strong { color: #263c5a; font-size: clamp(15px, 1vw, 19px); font-weight: 600; overflow-wrap: anywhere; }
+.student > span { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 3px 8px; color: #64748b; font-size: 12px; }
+.rosterEmpty { padding: 16px 8px; color: #64748b; font-size: 14px; line-height: 1.7; }
+.preview { display: flex; flex-direction: column; }
+.previewHeading { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex: none; padding: 12px 20px; border-bottom: 1px solid #e2e8f0; }
+.previewHeading > div { min-width: 0; }
+.previewHeading h2 { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; margin: 0; color: #263c5a; font-size: clamp(17px, 1.2vw, 23px); font-weight: 600; line-height: 1.4; overflow-wrap: anywhere; }
+.previewHeading p { margin: 4px 0 0; color: #64748b; font-size: 12px; }
+.previewHeading > span { flex: none; color: #2f6f65; font-size: 12px; }
+.content { flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain; padding: clamp(16px, 1.8vw, 32px); }
+.document { min-height: 100%; }
+.document > div { font-size: clamp(16px, 1.2vw, 22px); line-height: 1.8; }
+.document img { max-width: 100%; height: auto; }
+.code { display: grid; gap: 16px; }
+.code section { min-width: 0; overflow: hidden; border-radius: 6px; background: #111827; color: #e2e8f0; }
+.code h3 { margin: 0; padding: 10px 16px; border-bottom: 1px solid #334155; font-family: monospace; font-size: 14px; }
+.code pre { overflow: auto; margin: 0; padding: 16px; font-size: clamp(14px, 1vw, 18px); line-height: 1.7; }
+.empty { display: flex; flex: 1; min-height: 0; flex-direction: column; align-items: center; justify-content: center; gap: 10px; margin: 0; padding: 24px; color: #64748b; text-align: center; line-height: 1.7; }
+.empty h2 { margin: 0; color: #344a6a; font-size: 22px; font-weight: 600; }
+.empty p { margin: 0; font-size: 16px; }
+.versions { margin-top: 20px; border-top: 1px solid #e2e8f0; font-size: 14px; }
+.versions summary { min-height: 44px; padding-block: 12px; color: #344a6a; cursor: pointer; }
+.versions ul { margin: 0; padding: 0; list-style: none; }
+.versions li { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 6px 0; border-top: 1px solid #f1f5f9; }
+.versions li > span { min-width: 0; overflow-wrap: anywhere; }
+.versions a { display: inline-flex; align-items: center; gap: 6px; flex: none; min-height: 44px; color: #365fca; }
+@media (max-width: 600px) { .root { grid-template-columns: 160px minmax(0, 1fr); gap: 8px; } .previewHeading { flex-wrap: wrap; padding: 10px 12px; } .content { padding: 12px; } .empty { padding: 16px; } }
+@media (max-height: 500px) { .rosterHeading { padding-top: 8px; } .previewHeading { padding-block: 8px; } }
+
+.root[hidden] { display: none; }

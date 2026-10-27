@@ -1,0 +1,77 @@
+import { describe, expect, it } from 'vitest';
+import type { SceneOutline } from '@openmaic/lib/types/generation';
+import { buildTtsTimingPlan } from '@openmaic/lib/audio/tts-timing';
+import { allocateTeachingStageTiming } from './teaching-stage-timing-plan';
+
+function page(id: string, content: string, overrides: Partial<SceneOutline> = {}): SceneOutline {
+  return {
+    id, title: id, description: content, keyPoints: [content], type: 'slide', order: 0,
+    stageKey: 'ai-learning', audience: 'student', targetDurationSec: 100, estimatedDuration: 100,
+    timingPlan: buildTtsTimingPlan({ targetDurationSec: 80, activityTargetDurationSec: 100, language: 'zh-CN', videoSec: 10, transitionSec: 3, studentActivitySec: 7, readingThinkingSec: 7 }),
+    ...overrides,
+  };
+}
+
+describe('teaching stage timing', () => {
+  it('keeps quiz and interactive allocations independent of lecture wording', () => {
+    const quiz = page('quiz', '详尽的考查描述'.repeat(40), { type: 'quiz', targetDurationSec: 300, estimatedDuration: 300,
+      timingPlan: buildTtsTimingPlan({ targetDurationSec: 21, activityTargetDurationSec: 300, pageKind: 'quiz', studentActivitySec: 271, readingThinkingSec: 263, operationSec: 8, transitionSec: 8, feedbackSec: 13 }),
+    });
+    const interactive = page('interactive', '操控变量'.repeat(30), { type: 'interactive' });
+    const result = allocateTeachingStageTiming([page('lecture', '简单解释'), quiz, interactive]);
+    expect(result[0].timingPlan!.targetDurationSec).toBe(80);
+    expect(result[1].timingPlan).toEqual(quiz.timingPlan);
+    expect(result[1].targetDurationSec).toBe(300);
+    expect(result[2].timingPlan).toEqual(interactive.timingPlan);
+    expect(result.reduce((sum, row) => sum + row.targetDurationSec!, 0)).toBe(500);
+  });
+
+  it('preserves an approved breakdown alongside pages that lack blueprint timing', () => {
+    const fixed = page('approved', '复杂解释'.repeat(40), { plannedTiming: { narrationSec: 80, learnerActivitySec: 17, transitionSec: 3, role: 'teaching' } });
+    const result = allocateTeachingStageTiming([fixed, page('legacy', '简短解释')]);
+    expect(result[0].timingPlan).toEqual(fixed.timingPlan);
+    expect(result[0].plannedTiming).toEqual(fixed.plannedTiming);
+    expect(result[0].targetDurationSec).toBe(100);
+    expect(result[1].targetDurationSec).toBe(100);
+  });
+
+  it('gives denser teaching content more narration while preserving the stage total and silent/video time', () => {
+    const result = allocateTeachingStageTiming([
+      page('brief', '给出定义。'),
+      page('detailed', '说明能量守恒的适用条件，利用电路的例子解释输入与输出，再通过两组实际测量数据说明系统边界的重要性。'),
+    ]);
+    expect(result[1].timingPlan!.targetDurationSec).toBeGreaterThan(result[0].timingPlan!.targetDurationSec);
+    expect(result.reduce((sum, row) => sum + row.targetDurationSec!, 0)).toBe(200);
+    expect(result.reduce((sum, row) => sum + row.timingPlan!.targetDurationSec, 0)).toBe(160);
+    for (const row of result) {
+      expect(row.teachingStageTiming).toMatchObject({ targetDurationSec: 200, minDurationSec: 180, maxDurationSec: 220, narrationTargetDurationSec: 160, reservedDurationSec: 40, acceptance: 'stage-total-only' });
+      expect(row.timingPlan).toMatchObject({ videoSec: 10, transitionSec: 3, studentActivitySec: 7 });
+      expect(row.timingPlan!.paragraphBudgets!.reduce((sum, part) => sum + part.targetDurationSec, 0)).toBe(row.timingPlan!.targetDurationSec);
+      expect(row.timingPlan!.timingRationale).toContain('按教学内容量分配讲稿；时长仅供参考，优先讲清必要内容，必要超时允许，不作为质量通过或失败的条件。');
+      expect(row.timingPlan!.timingRationale!.join()).not.toContain('±10% 验收');
+    }
+  });
+
+  it('keeps a previously prepared outline and its saved rationale without rewriting or reallocating it', () => {
+    const prepared = allocateTeachingStageTiming([page('saved', '保存的完整解释')])[0]!;
+    prepared.timingPlan!.timingRationale = ['旧保存的讲授分配说明'];
+    expect(allocateTeachingStageTiming([prepared])).toEqual([prepared]);
+  });
+
+  it('counts student activities without narration but never borrows time from teacher resources or other stages', () => {
+    const teacher = page('teacher', '教师资料', { audience: 'teacher' });
+    const project = page('project', '项目实践', { stageKey: 'implementation' });
+    const result = allocateTeachingStageTiming([page('lesson', '定义'), page('silent', '阅读任务', { timingPlan: undefined, ttsPolicy: 'none', targetDurationSec: 30, estimatedDuration: 30 }), teacher, project]);
+    expect(result[0].teachingStageTiming).toMatchObject({ targetDurationSec: 130, narrationTargetDurationSec: 80, reservedDurationSec: 50, pageCount: 2 });
+    expect(result[1].targetDurationSec).toBe(30);
+    expect(result[2]).toBe(teacher);
+    expect(result[3]).toBe(project);
+  });
+
+  it('keeps integer totals and prepared allocations across repeated preparation', () => {
+    const result = allocateTeachingStageTiming([page('one', '能量'), page('two', '能量守恒'), page('three', '用实例说明能量守恒')]);
+    expect(result.reduce((sum, row) => sum + row.targetDurationSec!, 0)).toBe(300);
+    expect(result.every((row) => Number.isInteger(row.targetDurationSec))).toBe(true);
+    expect(allocateTeachingStageTiming(result)).toEqual(result);
+  });
+});

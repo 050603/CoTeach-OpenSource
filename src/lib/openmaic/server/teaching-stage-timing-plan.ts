@@ -1,0 +1,100 @@
+import type { SceneOutline } from '@openmaic/lib/types/generation';
+import { buildTtsTimingPlan, estimateSpeechDurationSec } from '@openmaic/lib/audio/tts-timing';
+
+export interface TeachingStageTimingBudget {
+  schemaVersion: 1;
+  stageKey: string;
+  targetDurationSec: number;
+  minDurationSec: number;
+  maxDurationSec: number;
+  narrationTargetDurationSec: number;
+  reservedDurationSec: number;
+  pageCount: number;
+  allocation: 'content-weighted';
+  acceptance: 'stage-total-only';
+}
+
+/** Pre-authoring allocation only. Completed narration is never checked or rewritten here. */
+export function allocateTeachingStageTiming(outlines: SceneOutline[]): SceneOutline[] {
+  const groups = new Map<string, SceneOutline[]>();
+  for (const outline of outlines) {
+    if (outline.audience === 'teacher' || (outline.stageKey && outline.stageKey !== 'ai-learning')) continue;
+    const key = outline.stageKey ?? 'course-narration';
+    groups.set(key, [...(groups.get(key) ?? []), outline]);
+  }
+  const updates = new Map<string, SceneOutline>();
+  for (const [stageKey, members] of groups) {
+    // Prepared checkpoints retain their allocation, even when the estimator evolves.
+    if (members.some((outline) => outline.teachingStageTiming)) continue;
+    if (members.every((outline) => outline.plannedTiming)) {
+      const target = members.reduce((sum, outline) => sum + (outline.targetDurationSec ?? outline.estimatedDuration ?? 60), 0);
+      const narrationTarget = members.reduce((sum, outline) => sum + outline.plannedTiming!.narrationSec, 0);
+      const stageBudget: TeachingStageTimingBudget = {
+        schemaVersion: 1,
+        stageKey,
+        targetDurationSec: target,
+        minDurationSec: Math.round(target * 900) / 1000,
+        maxDurationSec: Math.round(target * 1100) / 1000,
+        narrationTargetDurationSec: narrationTarget,
+        reservedDurationSec: target - narrationTarget,
+        pageCount: members.length,
+        allocation: 'content-weighted',
+        acceptance: 'stage-total-only',
+      };
+      for (const outline of members) updates.set(outline.id, { ...outline, teachingStageTiming: stageBudget });
+      continue;
+    }
+    const narrated = members.filter((outline) => outline.timingPlan);
+    if (!narrated.length) continue;
+    const target = members.reduce((sum, outline) => sum + (outline.targetDurationSec ?? outline.estimatedDuration ?? 60), 0);
+    const narrationTarget = narrated.reduce((sum, outline) => sum + outline.timingPlan!.targetDurationSec, 0);
+    // Assessments and interactive work own task-dependent silent/speech
+    // allocations. Never blend those with lecture text weights. Preserve each
+    // explicitly approved blueprint allocation even in mixed legacy input.
+    const weighted = narrated.filter((outline) => outline.type === 'slide' && !outline.plannedTiming);
+    const weightedNarrationTarget = weighted.reduce((sum, outline) => sum + outline.timingPlan!.targetDurationSec, 0);
+    const weights = weighted.map((outline) => {
+      const plan = outline.timingPlan!;
+      const content = outline.keyPoints.length ? outline.keyPoints.join('。') : outline.description || outline.title;
+      const contentSeconds = estimateSpeechDurationSec(content, plan);
+      // Temper outline length with the planner's allocation: long wording alone
+      // must not consume the whole stage. This is an explicit planning heuristic.
+      return Math.sqrt(Math.max(1, contentSeconds) * Math.max(1, plan.targetDurationSec));
+    });
+    const weightSum = weights.reduce((sum, weight) => sum + weight, 0);
+    const exact = weights.map((weight) => 1 + Math.max(0, weightedNarrationTarget - weighted.length) * weight / weightSum);
+    const seconds = exact.map(Math.floor);
+    let remainder = Math.round(weightedNarrationTarget - seconds.reduce((sum, value) => sum + value, 0));
+    for (const index of exact.map((value, index) => ({ index, fraction: value - Math.floor(value) })).sort((a, b) => b.fraction - a.fraction || a.index - b.index)) {
+      if (remainder-- <= 0) break;
+      seconds[index.index]++;
+    }
+    const stageBudget: TeachingStageTimingBudget = {
+      schemaVersion: 1, stageKey, targetDurationSec: target,
+      minDurationSec: Math.round(target * 900) / 1000, maxDurationSec: Math.round(target * 1100) / 1000,
+      narrationTargetDurationSec: narrationTarget, reservedDurationSec: target - narrationTarget,
+      pageCount: members.length, allocation: 'content-weighted', acceptance: 'stage-total-only',
+    };
+    weighted.forEach((outline, index) => {
+      const plan = outline.timingPlan!;
+      const reserved = (plan.activityTargetDurationSec ?? outline.targetDurationSec ?? outline.estimatedDuration ?? plan.targetDurationSec) - plan.targetDurationSec;
+      const activityTarget = reserved + seconds[index];
+      updates.set(outline.id, {
+        ...outline, targetDurationSec: activityTarget, estimatedDuration: activityTarget,
+        teachingStageTiming: stageBudget,
+        timingPlan: buildTtsTimingPlan({
+          ...plan, targetDurationSec: seconds[index], activityTargetDurationSec: activityTarget,
+          feedbackSec: Math.min(plan.feedbackSec ?? 0, seconds[index]),
+          paragraphRoleWeights: {
+            introduction: plan.paragraphBudgets?.find((part) => part.role === 'introduction')?.targetDurationSec ?? 0,
+            explanation: plan.paragraphBudgets?.find((part) => part.role === 'explanation')?.targetDurationSec ?? 0,
+            example: plan.paragraphBudgets?.find((part) => part.role === 'example')?.targetDurationSec ?? 0,
+          },
+          timingRationale: [...(plan.timingRationale ?? []), '按教学内容量分配讲稿；时长仅供参考，优先讲清必要内容，必要超时允许，不作为质量通过或失败的条件。'],
+        }),
+      });
+    });
+    for (const outline of members) if (!updates.has(outline.id)) updates.set(outline.id, { ...outline, teachingStageTiming: stageBudget });
+  }
+  return outlines.map((outline) => updates.get(outline.id) ?? outline);
+}

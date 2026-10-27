@@ -1,0 +1,51 @@
+name: Public source content
+
+on:
+  pull_request:
+    branches: [master, main]
+  push:
+    branches: [master, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  content:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check source boundaries
+        run: |
+          python3 tests/test_public_content.py
+          python3 scripts/check-public-content.py
+
+      - name: Install checksum-pinned Gitleaks
+        shell: bash
+        run: |
+          scanner_dir="$RUNNER_TEMP/coteach-gitleaks"
+          mkdir -p "$scanner_dir"
+          curl --fail --silent --show-error --location --retry 3 \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
+            --output "$scanner_dir/gitleaks.tar.gz"
+          printf '%s  %s\n' \
+            551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb \
+            "$scanner_dir/gitleaks.tar.gz" | sha256sum --check
+          tar -xzf "$scanner_dir/gitleaks.tar.gz" -C "$scanner_dir" gitleaks
+          echo "$scanner_dir" >> "$GITHUB_PATH"
+
+      - name: Scan checked-out source and fetched history
+        shell: bash
+        run: |
+          snapshot_dir=$(mktemp -d "$RUNNER_TEMP/coteach-source.XXXXXX")
+          trap 'rm -rf "$snapshot_dir"' EXIT
+          git checkout-index --all --prefix="$snapshot_dir/"
+          gitleaks dir "$snapshot_dir" --config .gitleaks.toml --redact=100 --no-banner
+          gitleaks git . --config .gitleaks.toml --redact=100 --no-banner --log-opts="--all --full-history"
+          # This covers checkout's fetched refs. Historical PR refs, GitHub
+          # attachments, Actions logs and artifacts require docs/open-source.md.

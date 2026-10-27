@@ -1,0 +1,118 @@
+name: Validate application
+description: Shared locked setup and application checks for CI and deployment verification.
+runs:
+  using: composite
+  steps:
+    - uses: pnpm/action-setup@v4
+      with:
+        version: 10.4.1
+
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 22
+        cache: pnpm
+
+    - name: Install locked dependencies
+      shell: bash
+      run: pnpm install --frozen-lockfile
+
+    - name: Validate Prisma schema
+      shell: bash
+      env:
+        DATABASE_URL: postgresql://openpbl:validation-only@127.0.0.1:5432/openpbl
+      run: pnpm exec prisma validate
+
+    - name: Check Prisma formatting
+      shell: bash
+      run: |
+        # Prisma 6 has no format --check; compare a formatted temporary copy.
+        schema_check_dir=$(mktemp -d)
+        trap 'rm -rf "$schema_check_dir"' EXIT
+        cp prisma/schema.prisma "$schema_check_dir/schema.prisma"
+        pnpm exec prisma format --schema "$schema_check_dir/schema.prisma"
+        diff -u prisma/schema.prisma "$schema_check_dir/schema.prisma"
+
+    - name: Type check application
+      shell: bash
+      env:
+        NODE_OPTIONS: --max-old-space-size=4096
+      run: pnpm typecheck
+
+    - name: Lint without warnings
+      shell: bash
+      run: pnpm lint:ci
+
+    - name: Install layout test browser
+      shell: bash
+      run: pnpm exec playwright install --with-deps chromium
+
+    - name: Application unit and integration tests
+      shell: bash
+      env:
+        NEXT_TELEMETRY_DISABLED: "1"
+        OPENPBL_LAYOUT_AUDIT_URL: http://127.0.0.1:3037/internal/slide-layout-audit
+      run: |
+        mkdir -p test-results
+        free --mebi
+        DATABASE_URL= PROVIDER_CONFIG_DATABASE_URL= OPENPBL_COURSE_READ_WORKERS=0 \
+          NEXT_DIST_DIR=.next-ci-layout NODE_OPTIONS=--max-old-space-size=4096 \
+          setsid pnpm dev --turbopack --hostname 127.0.0.1 --port 3037 > test-results/ci-layout-renderer.log 2>&1 &
+        export CI_LAYOUT_RENDERER_PID=$!
+        trap 'kill -- -"$CI_LAYOUT_RENDERER_PID" 2>/dev/null || true' EXIT
+        node --input-type=module <<'NODE'
+        import { chromium } from 'playwright';
+        const browser = await chromium.launch();
+        let readinessTimer;
+        try {
+          const page = await browser.newPage();
+          const deadline = Date.now() + 180_000;
+          for (;;) {
+            process.kill(Number(process.env.CI_LAYOUT_RENDERER_PID), 0);
+            try {
+              const response = await page.goto(process.env.OPENPBL_LAYOUT_AUDIT_URL, {
+                waitUntil: 'domcontentloaded', timeout: 20_000,
+              });
+              if (response?.ok()) break;
+            } catch { /* Retry only while the owned server is starting. */ }
+            if (Date.now() >= deadline) throw new Error('CI layout renderer did not become ready; see test-results/ci-layout-renderer.log');
+            await new Promise(resolve => setTimeout(resolve, 1_000));
+          }
+          process.kill(Number(process.env.CI_LAYOUT_RENDERER_PID), 0);
+          await page.waitForFunction(() => typeof window.__openPblAuditSlide === 'function', undefined, { timeout: 60_000 });
+          await Promise.race([
+            page.evaluate(async () => {
+              await document.fonts.load('400 22px "Noto Sans SC"', '课堂布局');
+              await window.__openPblAuditSlide({ outlineId: 'ci-readiness', content: { elements: [] } });
+            }),
+            new Promise((_, reject) => {
+              readinessTimer = setTimeout(() => reject(new Error('CI layout renderer font or audit readiness timed out')), 60_000);
+            }),
+          ]);
+        } finally {
+          clearTimeout(readinessTimer);
+          await browser.close();
+        }
+        NODE
+        free --mebi
+        pnpm test:ci
+
+    - name: OpenMAIC package tests and types
+      shell: bash
+      run: |
+        pnpm --filter @openmaic/dsl test
+        pnpm --filter @openmaic/dsl typecheck
+        pnpm --filter @openmaic/importer test
+        pnpm --dir packages/@openmaic/importer exec tsc --noEmit
+        pnpm --dir packages/@openmaic/renderer exec vitest run
+        pnpm --filter @openmaic/renderer typecheck
+
+    - name: Deployment failure boundaries
+      shell: bash
+      run: |
+        node --test scripts/run-production-task.test.mjs scripts/lib/document-browser-release.test.mjs scripts/lib/production-runtime-release.test.mjs scripts/monaco-static-runtime.test.mjs scripts/lib/nginx-static-cache.test.mjs scripts/lib/nginx-template-render.test.mjs
+        python3 tests/deploy/test_systemd_deploy.py
+        python3 tests/deploy/test_local_backup.py
+
+    - name: Production dependency audit
+      shell: bash
+      run: pnpm audit:prod
