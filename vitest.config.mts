@@ -5,6 +5,8 @@ export default defineConfig({
   plugins: [react()],
   resolve: {
     tsconfigPaths: true,
+    // Cross-workspace component tests must share the root React render tree.
+    dedupe: ["react", "react-dom"],
   },
   test: {
     environment: "jsdom",
